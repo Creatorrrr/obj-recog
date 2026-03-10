@@ -286,3 +286,150 @@ def test_query_service_returns_right_side_objects_and_last_seen_direction() -> N
     )
     query = SceneGraphQueryService(snapshot)
     assert query.last_seen_direction("bottle") == "front-right"
+
+
+def test_snapshot_prioritizes_recent_near_confident_nodes_and_limits_to_64() -> None:
+    from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphMemory
+
+    memory = SceneGraphMemory(graph_max_visible_nodes=4)
+    memory._graph.clear()
+    memory._graph.add_node(  # type: ignore[attr-defined]
+        "ego",
+        data=GraphNode(
+            id="ego",
+            type="ego",
+            label="camera",
+            state="visible",
+            confidence=1.0,
+            world_centroid=np.zeros(3, dtype=np.float32),
+            last_seen_frame=10,
+            last_seen_direction="front",
+            source_track_id=None,
+        ),
+    )
+    memory._graph.add_node(  # type: ignore[attr-defined]
+        "obj_recent_far",
+        data=GraphNode(
+            id="obj_recent_far",
+            type="object",
+            label="recent_far",
+            state="visible",
+            confidence=0.90,
+            world_centroid=np.array([0.0, 0.0, 3.0], dtype=np.float32),
+            last_seen_frame=9,
+            last_seen_direction="front",
+            source_track_id=1,
+        ),
+    )
+    memory._graph.add_node(  # type: ignore[attr-defined]
+        "obj_recent_near_low",
+        data=GraphNode(
+            id="obj_recent_near_low",
+            type="object",
+            label="recent_near_low",
+            state="visible",
+            confidence=0.40,
+            world_centroid=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            last_seen_frame=9,
+            last_seen_direction="front",
+            source_track_id=2,
+        ),
+    )
+    memory._graph.add_node(  # type: ignore[attr-defined]
+        "obj_recent_near_high",
+        data=GraphNode(
+            id="obj_recent_near_high",
+            type="object",
+            label="recent_near_high",
+            state="visible",
+            confidence=0.95,
+            world_centroid=np.array([0.1, 0.0, 1.1], dtype=np.float32),
+            last_seen_frame=9,
+            last_seen_direction="front-right",
+            source_track_id=3,
+        ),
+    )
+    memory._graph.add_node(  # type: ignore[attr-defined]
+        "obj_old_near",
+        data=GraphNode(
+            id="obj_old_near",
+            type="object",
+            label="old_near",
+            state="visible",
+            confidence=0.99,
+            world_centroid=np.array([0.0, 0.0, 0.8], dtype=np.float32),
+            last_seen_frame=4,
+            last_seen_direction="front",
+            source_track_id=4,
+        ),
+    )
+    memory._graph.add_edge(  # type: ignore[attr-defined]
+        "ego",
+        "obj_recent_far",
+        key="front",
+        data=GraphEdge(
+            source="ego",
+            target="obj_recent_far",
+            relation="front",
+            confidence=0.9,
+            last_updated_frame=9,
+            distance_bucket="mid",
+            source_kind="detection",
+        ),
+    )
+    memory._graph.add_edge(  # type: ignore[attr-defined]
+        "ego",
+        "obj_recent_near_low",
+        key="front",
+        data=GraphEdge(
+            source="ego",
+            target="obj_recent_near_low",
+            relation="front",
+            confidence=0.7,
+            last_updated_frame=9,
+            distance_bucket="near",
+            source_kind="detection",
+        ),
+    )
+    memory._graph.add_edge(  # type: ignore[attr-defined]
+        "ego",
+        "obj_recent_near_high",
+        key="front-right",
+        data=GraphEdge(
+            source="ego",
+            target="obj_recent_near_high",
+            relation="front-right",
+            confidence=0.95,
+            last_updated_frame=9,
+            distance_bucket="near",
+            source_kind="detection",
+        ),
+    )
+    memory._graph.add_edge(  # type: ignore[attr-defined]
+        "ego",
+        "obj_old_near",
+        key="front",
+        data=GraphEdge(
+            source="ego",
+            target="obj_old_near",
+            relation="front",
+            confidence=0.8,
+            last_updated_frame=4,
+            distance_bucket="near",
+            source_kind="detection",
+        ),
+    )
+
+    snapshot = memory.snapshot(camera_pose_world=_pose_world(), frame_index=10)
+
+    assert snapshot.visible_node_ids == (
+        "ego",
+        "obj_recent_near_low",
+        "obj_recent_near_high",
+        "obj_recent_far",
+    )
+    assert {edge.target for edge in snapshot.visible_edges} == {
+        "obj_recent_near_high",
+        "obj_recent_near_low",
+        "obj_recent_far",
+    }

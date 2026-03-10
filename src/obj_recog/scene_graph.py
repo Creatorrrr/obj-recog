@@ -231,6 +231,22 @@ def _detection_world_centroid(
     )
 
 
+def _node_camera_distance(node: GraphNode, camera_pose_world: np.ndarray) -> float:
+    if node.world_centroid is None:
+        return float("inf")
+    camera_xyz = _camera_point(node.world_centroid, camera_pose_world)
+    return float(np.linalg.norm(camera_xyz))
+
+
+def _visible_node_priority(node: GraphNode, camera_pose_world: np.ndarray) -> tuple[float, ...]:
+    return (
+        -float(node.last_seen_frame),
+        _node_camera_distance(node, camera_pose_world),
+        -float(node.confidence),
+        0.0 if node.type == "object" else 1.0,
+    )
+
+
 def _segment_world_centroid(
     segment: PanopticSegment,
     *,
@@ -627,18 +643,32 @@ class SceneGraphMemory:
                 key=lambda edge: (edge.source, edge.target, edge.relation),
             )
         )
-        visible_nodes = [node.id for node in nodes if node.state == "visible"]
+        visible_node_candidates = [node for node in nodes if node.state == "visible"]
+        ego_nodes = [node for node in visible_node_candidates if node.id == "ego"]
+        non_ego_nodes = [node for node in visible_node_candidates if node.id != "ego"]
+        prioritized_non_ego = sorted(
+            non_ego_nodes,
+            key=lambda node: (
+                *_visible_node_priority(node, camera_pose_world),
+                node.label,
+                node.id,
+            ),
+        )
+        visible_nodes = [node.id for node in ego_nodes]
+        remaining_slots = max(0, self._graph_max_visible_nodes - len(visible_nodes))
+        visible_nodes.extend(node.id for node in prioritized_non_ego[:remaining_slots])
+        visible_node_id_set = set(visible_nodes)
         visible_edges = [
             (edge.source, edge.target, edge.relation)
             for edge in edges
-            if edge.source in visible_nodes and edge.target in visible_nodes
+            if edge.source in visible_node_id_set and edge.target in visible_node_id_set
         ]
         return SceneGraphSnapshot(
             frame_index=frame_index,
             camera_pose_world=np.asarray(camera_pose_world, dtype=np.float32).copy(),
             nodes=nodes,
             edges=edges,
-            visible_node_ids=tuple(visible_nodes[: self._graph_max_visible_nodes]),
+            visible_node_ids=tuple(visible_nodes),
             visible_edge_keys=tuple(visible_edges),
         )
 

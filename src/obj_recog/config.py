@@ -54,7 +54,7 @@ class AppConfig:
     disable_slam_calibration: bool = False
     calibration_cache_dir: str | None = None
     graph_enabled: bool = True
-    graph_max_visible_nodes: int = 32
+    graph_max_visible_nodes: int = 64
     graph_relation_smoothing_frames: int = 15
     graph_occlusion_ttl_frames: int = 15
 
