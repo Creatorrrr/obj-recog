@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import json
+import struct
+import subprocess
+
+import numpy as np
+import pytest
+
+from obj_recog.slam_bridge import (
+    KeyframeObservation,
+    SlamFrameResult,
+    OrbSlam3Bridge,
+    decode_slam_response,
+    encode_frame_packet,
+)
+
+
+def test_encode_frame_packet_prefixes_header_and_payload() -> None:
+    frame_gray = np.arange(12, dtype=np.uint8).reshape(3, 4)
+
+    packet = encode_frame_packet(frame_gray, timestamp=12.5)
+
+    assert packet[:4] == b"SLAM"
+    assert len(packet) == 4 + 8 + 4 + 4 + 12
+    assert struct.unpack(">Q", packet[4:12])[0] == 12_500_000
+    assert struct.unpack(">I", packet[12:16])[0] == 4
+    assert struct.unpack(">I", packet[16:20])[0] == 3
+
+
+def test_decode_slam_response_restores_pose_arrays_and_sparse_points() -> None:
+    payload = json.dumps(
+        {
+            "tracking_state": "TRACKING",
+            "pose_world": [
+                1.0,
+                0.0,
+                0.0,
+                0.1,
+                0.0,
+                1.0,
+                0.0,
+                0.2,
+                0.0,
+                0.0,
+                1.0,
+                0.3,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            "keyframe_inserted": True,
+            "keyframe_id": 7,
+            "optimized_keyframe_poses": {
+                "7": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.1,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.2,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.3,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                ]
+            },
+            "sparse_map_points": [[0.0, 0.1, 1.0], [0.2, -0.1, 1.5]],
+            "loop_closure_applied": True,
+            "tracked_feature_count": 142,
+            "median_reprojection_error": 1.35,
+            "map_points_changed": True,
+            "keyframe_observations": [
+                {
+                    "keyframe_id": 7,
+                    "point_id": 101,
+                    "u": 123.4,
+                    "v": 98.7,
+                    "x": 0.2,
+                    "y": -0.1,
+                    "z": 1.5,
+                },
+                {
+                    "keyframe_id": 8,
+                    "point_id": 101,
+                    "u": 120.0,
+                    "v": 97.5,
+                    "x": 0.2,
+                    "y": -0.1,
+                    "z": 1.5,
+                },
+            ],
+        }
+    )
+
+    result = decode_slam_response(payload)
+
+    assert isinstance(result, SlamFrameResult)
+    assert result.tracking_state == "TRACKING"
+    assert result.pose_world.shape == (4, 4)
+    assert result.keyframe_inserted is True
+    assert result.keyframe_id == 7
+    assert sorted(result.optimized_keyframe_poses) == [7]
+    assert result.sparse_map_points_xyz.shape == (2, 3)
+    assert result.loop_closure_applied is True
+    assert result.tracked_feature_count == 142
+    assert result.median_reprojection_error == pytest.approx(1.35)
+    assert result.map_points_changed is True
+    assert len(result.keyframe_observations) == 2
+    assert all(isinstance(item, KeyframeObservation) for item in result.keyframe_observations)
+    assert result.keyframe_observations[0].keyframe_id == 7
+    assert result.keyframe_observations[0].point_id == 101
+    assert result.keyframe_observations[0].x == pytest.approx(0.2)
+
+
+def test_decode_slam_response_accepts_map_changed_alias_for_map_points_changed() -> None:
+    payload = json.dumps(
+        {
+            "tracking_state": "TRACKING",
+            "pose_world": np.eye(4, dtype=np.float32).reshape(-1).tolist(),
+            "keyframe_inserted": False,
+            "keyframe_id": None,
+            "optimized_keyframe_poses": {},
+            "sparse_map_points": [],
+            "tracked_feature_count": 9,
+            "median_reprojection_error": None,
+            "keyframe_observations": [],
+            "map_changed": True,
+        }
+    )
+
+    result = decode_slam_response(payload)
+
+    assert result.map_points_changed is True
+    assert result.loop_closure_applied is True
+
+
+class _FakePipeWriter:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    def write(self, payload: bytes) -> int:
+        self.writes.append(payload)
+        return len(payload)
+
+    def flush(self) -> None:
+        return None
+
+
+class _FakePipeReader:
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = list(lines)
+
+    def readline(self) -> bytes:
+        if not self._lines:
+            return b""
+        return self._lines.pop(0)
+
+
+class _FakeProcess:
+    def __init__(self, stdout_lines: list[bytes], stderr_lines: list[bytes] | None = None) -> None:
+        self.stdin = _FakePipeWriter()
+        self.stdout = _FakePipeReader(stdout_lines)
+        self.stderr = _FakePipeReader(stderr_lines or [])
+        self._returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+    def terminate(self) -> None:
+        self._returncode = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._returncode = 0
+        return 0
+
+    def kill(self) -> None:
+        self._returncode = -9
+
+
+def test_orbslam3_bridge_track_skips_non_json_stdout_lines(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    vocab = tmp_path / "ORBvoc.txt"
+    settings = tmp_path / "camera.yaml"
+    bridge_binary = tmp_path / "orbslam3_bridge"
+    vocab.write_text("", encoding="utf-8")
+    settings.write_text("", encoding="utf-8")
+    bridge_binary.write_text("", encoding="utf-8")
+    fake_process = _FakeProcess(
+        stdout_lines=[
+            b"Loading ORB-SLAM3 vocabulary\n",
+            json.dumps(
+                {
+                    "tracking_state": "TRACKING",
+                    "pose_world": np.eye(4, dtype=np.float32).reshape(-1).tolist(),
+                    "keyframe_inserted": False,
+                    "keyframe_id": None,
+                    "optimized_keyframe_poses": {},
+                    "sparse_map_points": [],
+                    "loop_closure_applied": False,
+                }
+            ).encode("utf-8")
+            + b"\n",
+        ]
+    )
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: fake_process)
+
+    bridge = OrbSlam3Bridge(
+        vocabulary_path=str(vocab),
+        settings_path=str(settings),
+        frame_width=4,
+        frame_height=3,
+        binary_path=str(bridge_binary),
+    )
+
+    result = bridge.track(np.zeros((3, 4), dtype=np.uint8), timestamp=0.25)
+
+    assert result.tracking_state == "TRACKING"
+    assert len(fake_process.stdin.writes) == 1

@@ -1,0 +1,27 @@
+.DS_Store
+
+# Python environment and caches
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local calibration outputs
+config/*.yaml
+
+# Downloaded model weights
+yolo26n.pt
+yolov8n.pt
+
+# Native build outputs
+native/orbslam3_bridge/build/
+third_party/ORB_SLAM3/build/
+third_party/ORB_SLAM3/lib/
+third_party/ORB_SLAM3/Thirdparty/DBoW2/build/
+third_party/ORB_SLAM3/Thirdparty/Sophus/build/
+third_party/ORB_SLAM3/Thirdparty/g2o/build/
+
+# Nested vendor git metadata and archives
+third_party/ORB_SLAM3/.git/
+third_party/ORB_SLAM3/Vocabulary/ORBvoc.txt
