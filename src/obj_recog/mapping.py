@@ -190,7 +190,7 @@ class TsdfMeshMapBuilder:
         max_mesh_triangles: int,
         sdf_trunc_multiplier: float = 4.0,
         depth_scale: float = 1000.0,
-        depth_trunc: float = 3.0,
+        depth_trunc: float = 6.0,
         volume_unit_resolution: int = 16,
         depth_sampling_stride: int = 6,
         o3d_module=None,

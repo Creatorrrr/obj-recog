@@ -14,6 +14,22 @@ class Detection:
     color: tuple[int, int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class PanopticSegment:
+    segment_id: int
+    label_id: int
+    label: str
+    color_rgb: tuple[int, int, int]
+    mask: np.ndarray
+    area_pixels: int
+
+
+@dataclass(slots=True)
+class SegmentationResult:
+    overlay_bgr: np.ndarray
+    segments: list[PanopticSegment]
+
+
 @dataclass(slots=True)
 class FrameArtifacts:
     frame_bgr: np.ndarray
@@ -35,3 +51,5 @@ class FrameArtifacts:
     keyframe_id: int | None
     sparse_map_points_xyz: np.ndarray
     loop_closure_applied: bool
+    segmentation_overlay_bgr: np.ndarray
+    segments: list[PanopticSegment]

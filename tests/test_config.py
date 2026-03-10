@@ -26,11 +26,16 @@ def test_parse_config_uses_expected_defaults() -> None:
     assert config.map_voxel_size == pytest.approx(0.05)
     assert config.max_map_points == 200_000
     assert config.max_mesh_triangles == 10_000
+    assert config.segmentation_mode == "panoptic"
+    assert config.segmentation_alpha == pytest.approx(0.35)
+    assert config.segmentation_interval == 6
+    assert config.segmentation_input_size == 512
     assert config.camera_calibration is None
     assert config.slam_vocabulary is None
     assert config.slam_width == 640
     assert config.slam_height == 360
     assert config.recalibrate is False
+    assert config.disable_slam_calibration is False
     assert config.calibration_cache_dir is None
 
 
@@ -55,6 +60,12 @@ def test_parse_config_accepts_custom_values() -> None:
             "5000",
             "--camera-calibration",
             "/tmp/camera.yaml",
+            "--segmentation-mode",
+            "off",
+            "--segmentation-alpha",
+            "0.5",
+            "--segmentation-interval",
+            "9",
             "--slam-vocabulary",
             "/tmp/ORBvoc.txt",
             "--slam-width",
@@ -62,6 +73,7 @@ def test_parse_config_accepts_custom_values() -> None:
             "--slam-height",
             "288",
             "--recalibrate",
+            "--disable-slam-calibration",
             "--calibration-cache-dir",
             "/tmp/calibration-cache",
         ]
@@ -76,10 +88,15 @@ def test_parse_config_accepts_custom_values() -> None:
     assert config.point_stride == 8
     assert config.max_points == 5000
     assert config.camera_calibration == "/tmp/camera.yaml"
+    assert config.segmentation_mode == "off"
+    assert config.segmentation_alpha == pytest.approx(0.5)
+    assert config.segmentation_interval == 9
+    assert config.segmentation_input_size == 512
     assert config.slam_vocabulary == "/tmp/ORBvoc.txt"
     assert config.slam_width == 512
     assert config.slam_height == 288
     assert config.recalibrate is True
+    assert config.disable_slam_calibration is True
     assert config.calibration_cache_dir == "/tmp/calibration-cache"
     assert config.list_cameras is False
     assert config.orb_features == 1200
@@ -92,6 +109,9 @@ def test_parser_rejects_invalid_choices() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--device", "cuda"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--segmentation-mode", "semantic"])
 
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:

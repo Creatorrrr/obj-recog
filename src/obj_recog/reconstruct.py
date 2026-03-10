@@ -30,7 +30,7 @@ def depth_to_point_cloud(
     stride: int,
     max_points: int,
     min_depth: float = 0.3,
-    max_depth: float = 3.0,
+    max_depth: float = 6.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if frame_bgr.ndim != 3 or frame_bgr.shape[:2] != depth_map.shape:
         raise ValueError("frame and depth map must share the same height and width")

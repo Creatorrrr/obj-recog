@@ -15,9 +15,10 @@ from obj_recog.detector import ObjectDetector
 from obj_recog.mapping import LocalMapBuilder, TsdfMeshMapBuilder
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.reconstruct import depth_to_point_cloud, intrinsics_for_frame
+from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
 from obj_recog.slam_bridge import OrbSlam3Bridge, SlamFrameResult
 from obj_recog.tracking import PoseTracker
-from obj_recog.types import Detection, FrameArtifacts
+from obj_recog.types import Detection, FrameArtifacts, SegmentationResult
 from obj_recog.visualization import (
     Open3DMeshViewer,
     draw_detections,
@@ -246,6 +247,8 @@ def process_frame(
         keyframe_id=getattr(map_update, "keyframe_id", slam_result.keyframe_id),
         sparse_map_points_xyz=getattr(map_update, "sparse_map_points_xyz", slam_result.sparse_map_points_xyz),
         loop_closure_applied=bool(getattr(map_update, "loop_closure_applied", slam_result.loop_closure_applied)),
+        segmentation_overlay_bgr=np.zeros_like(frame_bgr),
+        segments=[],
     )
     return artifacts, list(detections)
 
@@ -281,6 +284,8 @@ def run(
     tracker_factory=PoseTracker,
     map_builder_factory=LocalMapBuilder,
     slam_bridge_factory=None,
+    segmenter_factory=PanopticSegmenter,
+    segmentation_worker_factory=SegmentationWorker,
     viewer_factory=Open3DMeshViewer,
     open_camera_fn=open_camera,
     camera_lister=list_available_cameras,
@@ -294,6 +299,7 @@ def run(
     camera_session: CameraSession | None = None
     viewer = None
     slam_bridge = None
+    segmentation_worker = None
     calibration = None
     runtime_settings_path = config.camera_calibration
 
@@ -312,9 +318,10 @@ def run(
             calibration = load_orbslam3_settings(config.camera_calibration)
 
     cached_detections: list[Detection] = []
+    cached_segmentation: SegmentationResult | None = None
     frame_index = 0
-    last_frame_time = time_source()
-    slam_time_origin = time_source() if use_slam_bridge else None
+    last_frame_time = 0.0
+    slam_time_origin = None
     object_window_has_been_visible = False
 
     try:
@@ -338,7 +345,7 @@ def run(
             debug_log(
                 f"runtime calibration ready (source={runtime_calibration.source}, settings={runtime_settings_path})"
             )
-            if getattr(runtime_calibration, "source", None) != "explicit":
+            if getattr(runtime_calibration, "source", None) in {"auto", "cache"}:
                 close_calibration_window(cv2)
                 _show_runtime_loading_preview(
                     cv2,
@@ -352,6 +359,18 @@ def run(
         debug_log("depth init start")
         depth_estimator = depth_estimator_factory(device=effective_device)
         debug_log("depth init done")
+        if config.segmentation_mode != "off":
+            try:
+                debug_log("segmentation init start")
+                segmentation_worker = segmentation_worker_factory(
+                    segmenter=segmenter_factory(
+                        device=effective_device,
+                        input_size=config.segmentation_input_size,
+                    )
+                )
+                debug_log("segmentation init done")
+            except Exception as exc:
+                debug_log(f"segmentation disabled ({exc})")
         tracker = None
         if use_slam_bridge:
             slam_bridge = getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
@@ -382,6 +401,9 @@ def run(
             )
         viewer = viewer_factory()
         debug_log("viewer init done")
+        last_frame_time = time_source()
+        if use_slam_bridge:
+            slam_time_origin = time_source()
 
         while True:
             ok, frame_bgr = read_camera_frame(camera_session.capture, timeout_sec=1.0)
@@ -440,6 +462,23 @@ def run(
             if frame_index == 0:
                 debug_log("first runtime frame processed")
 
+            if segmentation_worker is not None:
+                if frame_index % config.segmentation_interval == 0 and segmentation_worker.is_idle():
+                    segmentation_worker.submit(artifacts.frame_bgr)
+                try:
+                    segmentation_result = segmentation_worker.poll()
+                except RuntimeError as exc:
+                    debug_log(str(exc))
+                    segmentation_worker.close()
+                    segmentation_worker = None
+                    segmentation_result = None
+                if segmentation_result is not None:
+                    cached_segmentation = segmentation_result
+
+            if cached_segmentation is not None:
+                artifacts.segmentation_overlay_bgr = cached_segmentation.overlay_bgr
+                artifacts.segments = list(cached_segmentation.segments)
+
             now = time_source()
             fps = 1.0 / max(now - last_frame_time, 1e-6)
             last_frame_time = now
@@ -448,6 +487,13 @@ def run(
                 artifacts.frame_bgr,
                 artifacts.detections,
                 fps,
+                segmentation_overlay_bgr=artifacts.segmentation_overlay_bgr,
+                segments=artifacts.segments,
+                segmentation_alpha=config.segmentation_alpha,
+                slam_tracking_state=artifacts.slam_tracking_state,
+                keyframe_id=artifacts.keyframe_id,
+                mesh_triangle_count=int(artifacts.mesh_triangles.shape[0]),
+                mesh_vertex_count=int(artifacts.mesh_vertices_xyz.shape[0]),
             )
             cv2.imshow("Object Recognition", overlay)
             viewer_active = _update_viewer(viewer, artifacts)
@@ -470,6 +516,7 @@ def run(
                     slam_time_origin = time_source()
                 map_builder.reset()
                 cached_detections = []
+                cached_segmentation = None
                 frame_index += 1
                 continue
 
@@ -482,6 +529,8 @@ def run(
             camera_session.capture.release()
         if slam_bridge is not None:
             slam_bridge.close()
+        if segmentation_worker is not None:
+            segmentation_worker.close()
         if viewer is not None:
             viewer.close()
         cv2.destroyAllWindows()

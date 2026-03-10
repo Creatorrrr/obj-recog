@@ -45,7 +45,7 @@ def test_depth_to_point_cloud_applies_stride_and_max_points() -> None:
 
 def test_depth_to_point_cloud_clips_depth_range() -> None:
     frame_bgr = np.zeros((2, 2, 3), dtype=np.uint8)
-    depth_map = np.array([[0.1, 0.5], [2.5, 4.5]], dtype=np.float32)
+    depth_map = np.array([[0.1, 0.5], [2.5, 8.5]], dtype=np.float32)
     intrinsics = CameraIntrinsics(fx=1.8, fy=1.8, cx=1.0, cy=1.0)
 
     points_xyz, _, _ = depth_to_point_cloud(
@@ -55,11 +55,11 @@ def test_depth_to_point_cloud_clips_depth_range() -> None:
         stride=1,
         max_points=8,
         min_depth=0.3,
-        max_depth=3.0,
+        max_depth=6.0,
     )
 
     assert np.isclose(points_xyz[:, 2].min(), 0.3)
-    assert np.isclose(points_xyz[:, 2].max(), 3.0)
+    assert np.isclose(points_xyz[:, 2].max(), 6.0)
 
 
 def test_transform_points_applies_camera_pose_world() -> None:

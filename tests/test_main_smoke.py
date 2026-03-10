@@ -9,7 +9,7 @@ from obj_recog.camera import CameraDevice, CameraSession, open_camera
 from obj_recog.config import AppConfig
 from obj_recog.slam_bridge import SlamFrameResult
 from obj_recog.main import process_frame, run
-from obj_recog.types import Detection
+from obj_recog.types import Detection, PanopticSegment, SegmentationResult
 
 
 class FakeDetector:
@@ -309,6 +309,27 @@ class FakeViewer:
         self.updates.append(mesh_vertices_xyz.shape[0])
         self.last_triangles = mesh_triangles.copy()
         return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeSegmentationWorker:
+    def __init__(self, results: list[SegmentationResult | None] | None = None) -> None:
+        self.results = list(results or [])
+        self.submissions: list[np.ndarray] = []
+        self.closed = False
+
+    def is_idle(self) -> bool:
+        return True
+
+    def submit(self, frame_bgr: np.ndarray) -> None:
+        self.submissions.append(frame_bgr.copy())
+
+    def poll(self) -> SegmentationResult | None:
+        if self.results:
+            return self.results.pop(0)
+        return None
 
     def close(self) -> None:
         self.closed = True
@@ -729,6 +750,76 @@ def test_run_emits_startup_logs_around_runtime_transition(tmp_path: Path) -> Non
     assert any("detector init done" in message.lower() for message in messages)
     assert any("depth init start" in message.lower() for message in messages)
     assert any("depth init done" in message.lower() for message in messages)
+
+
+def test_run_skips_calibration_loading_preview_when_self_calibration_is_disabled(tmp_path: Path) -> None:
+    from obj_recog.calibration import load_orbslam3_settings
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    generated_path = tmp_path / "generated-camera.yaml"
+    generated_path.write_text(
+        "Camera.width: 640\nCamera.height: 360\nCamera.fx: 400.0\nCamera.fy: 400.0\nCamera.cx: 320.0\nCamera.cy: 180.0\nCamera.k1: 0.0\nCamera.k2: 0.0\nCamera.p1: 0.0\nCamera.p2: 0.0\nCamera.k3: 0.0\n",
+        encoding="utf-8",
+    )
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
+    viewer = FakeViewer()
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    slam_bridge = FakeSlamBridge()
+
+    def _detector_factory(**_kwargs):
+        assert fake_cv2.destroy_window_calls == []
+        assert fake_cv2.imshow_calls == 0
+        return FakeDetector()
+
+    def _resolver(config, camera_session, **_kwargs):
+        return type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": str(generated_path),
+                "calibration": load_orbslam3_settings(generated_path),
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": slam_bridge,
+            },
+        )()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=_detector_factory,
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: map_builder,
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: viewer,
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=_resolver,
+    )
 
 
 class FakeClock:
@@ -1218,7 +1309,11 @@ def test_run_falls_back_to_default_camera_after_named_camera_disconnects() -> No
     assert opener.calls == [("iPhone", False), ("iPhone", True)]
     assert tracker.reset_calls == 1
     assert map_builder.reset_calls == 1
-    assert overlay_calls[-1] == {}
+    assert overlay_calls[-1]["segmentation_alpha"] == pytest.approx(0.35)
+    assert overlay_calls[-1]["segmentation_overlay_bgr"].shape == (16, 16, 3)
+    assert overlay_calls[-1]["slam_tracking_state"] == "TRACKING"
+    assert overlay_calls[-1]["mesh_triangle_count"] == 0
+    assert overlay_calls[-1]["mesh_vertex_count"] >= 1
 
 
 def test_run_passes_timeout_to_named_capture_reads() -> None:
@@ -1264,3 +1359,118 @@ def test_run_passes_timeout_to_named_capture_reads() -> None:
     )
 
     assert capture.timeout_args == [1.0]
+
+
+def test_run_submits_segmentation_frames_on_interval_and_reuses_last_result() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        segmentation_mode="panoptic",
+        segmentation_alpha=0.35,
+        segmentation_interval=2,
+    )
+    fake_cv2 = FakeCV2(key_sequence=[-1, -1, ord("q")])
+    frames = [np.full((16, 16, 3), value, dtype=np.uint8) for value in (10, 20, 30)]
+    capture = FakeCapture(width=16, height=16, frames=frames)
+    viewer = FakeViewer()
+    tracker = FakeTracker(
+        results=[
+            FakeTrackingResult(did_reset=True),
+            FakeTrackingResult(did_reset=False),
+            FakeTrackingResult(did_reset=False),
+        ]
+    )
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeSegmentationWorker(
+        results=[
+            SegmentationResult(
+                overlay_bgr=np.full((16, 16, 3), 25, dtype=np.uint8),
+                segments=[
+                    PanopticSegment(
+                        segment_id=1,
+                        label_id=4,
+                        label="chair",
+                        color_rgb=(1, 2, 3),
+                        mask=np.ones((16, 16), dtype=bool),
+                        area_pixels=256,
+                    )
+                ],
+            ),
+            None,
+            None,
+        ]
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+        segmenter_factory=lambda **_: object(),
+        segmentation_worker_factory=lambda **_: worker,
+    )
+
+    assert len(worker.submissions) == 2
+    assert [submission[0, 0, 0] for submission in worker.submissions] == [10, 30]
+    assert overlay_calls[0]["segmentation_overlay_bgr"].shape == (16, 16, 3)
+    assert overlay_calls[1]["segmentation_overlay_bgr"].shape == (16, 16, 3)
+    assert overlay_calls[2]["segmentation_overlay_bgr"].shape == (16, 16, 3)
+
+
+def test_run_skips_segmentation_worker_when_mode_is_off() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        segmentation_mode="off",
+    )
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 10, dtype=np.uint8)])
+    viewer = FakeViewer()
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        segmentation_worker_factory=lambda **_: (_ for _ in ()).throw(AssertionError("segmentation worker should not start")),
+    )

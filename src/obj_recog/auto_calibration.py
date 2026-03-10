@@ -772,6 +772,23 @@ def ensure_runtime_calibration(
 
     cache_dir = Path(config.calibration_cache_dir) if config.calibration_cache_dir else default_calibration_cache_dir()
     fingerprint = build_camera_fingerprint(camera_session, config)
+    if config.disable_slam_calibration:
+        approx_calibration = create_approximate_calibration(
+            image_width=config.slam_width,
+            image_height=config.slam_height,
+        )
+        disabled_settings_path = _warmup_settings_path(cache_dir, fingerprint, "disabled")
+        _write_settings_yaml(disabled_settings_path, approx_calibration, fps=30.0)
+        debug_log(f"runtime calibration using approximate settings with self-calibration disabled ({disabled_settings_path})")
+        return RuntimeCalibrationState(
+            source="disabled",
+            settings_path=str(disabled_settings_path),
+            calibration=approx_calibration,
+            cache_entry=None,
+            warmup_restarted=False,
+            promoted_bridge=None,
+        )
+
     if not config.recalibrate:
         cached_entry = load_cached_calibration_entry(cache_dir, fingerprint)
         if cached_entry is not None and not cached_entry.stale:

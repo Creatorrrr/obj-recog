@@ -14,6 +14,7 @@ dependencies = [
   "scipy",
   "timm",
   "torch",
+  "transformers",
   "torchvision",
   "ultralytics",
 ]

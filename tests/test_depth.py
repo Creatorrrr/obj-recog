@@ -37,3 +37,14 @@ def test_running_percentile_normalizer_uses_ema_bounds() -> None:
     assert first.shape == (2, 2)
     assert second.shape == (2, 2)
     assert second.max() < first.max()
+
+
+def test_running_percentile_normalizer_defaults_to_six_meter_range() -> None:
+    normalizer = RunningPercentileNormalizer(alpha=1.0)
+
+    depth_map = normalizer.normalize(
+        np.array([[0.0, 5.0], [10.0, 15.0]], dtype=np.float32),
+    )
+
+    assert depth_map.min() == pytest.approx(0.3)
+    assert depth_map.max() == pytest.approx(6.0)

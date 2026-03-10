@@ -2,7 +2,101 @@ from __future__ import annotations
 
 import numpy as np
 
-from obj_recog.types import Detection
+from obj_recog.types import Detection, PanopticSegment
+
+
+def _measure_text(cv2, text: str, font: int, scale: float, thickness: int) -> tuple[int, int]:
+    get_text_size = getattr(cv2, "getTextSize", None)
+    if callable(get_text_size):
+        (width, height), _baseline = get_text_size(text, font, scale, thickness)
+        return int(width), int(height)
+    return max(1, int(round(len(text) * 7 * scale))), max(1, int(round(14 * scale)))
+
+
+def _draw_segmentation_legend(cv2, canvas: np.ndarray, segments: list[PanopticSegment]) -> None:
+    if not segments:
+        return
+
+    unique_segments: dict[int, PanopticSegment] = {}
+    for segment in sorted(segments, key=lambda item: int(item.area_pixels), reverse=True):
+        unique_segments.setdefault(int(segment.label_id), segment)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    text_thickness = 1
+    chip_size = 10
+    row_height = 18
+    top_padding = 12
+    right_padding = 12
+    text_gap = 6
+    max_entries = 6
+
+    entries = list(unique_segments.values())[:max_entries]
+    for index, segment in enumerate(entries):
+        label = str(segment.label)
+        text_width, text_height = _measure_text(cv2, label, font, font_scale, text_thickness)
+        total_width = chip_size + text_gap + text_width
+        x_right = canvas.shape[1] - right_padding
+        x_left = max(0, x_right - total_width)
+        y_top = top_padding + (index * row_height)
+        y_baseline = y_top + max(text_height, chip_size)
+        chip_y = y_top + max(0, (text_height - chip_size) // 2)
+        chip_color_bgr = tuple(int(channel) for channel in segment.color_rgb[::-1])
+
+        cv2.rectangle(
+            canvas,
+            (x_left, chip_y),
+            (x_left + chip_size, chip_y + chip_size),
+            chip_color_bgr,
+            -1,
+        )
+        cv2.putText(
+            canvas,
+            label,
+            (x_left + chip_size + text_gap, y_baseline),
+            font,
+            font_scale,
+            (255, 255, 255),
+            text_thickness,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_runtime_status(
+    cv2,
+    canvas: np.ndarray,
+    *,
+    slam_tracking_state: str | None,
+    keyframe_id: int | None,
+    mesh_triangle_count: int | None,
+    mesh_vertex_count: int | None,
+) -> None:
+    if (
+        slam_tracking_state is None
+        and keyframe_id is None
+        and mesh_triangle_count is None
+        and mesh_vertex_count is None
+    ):
+        return
+
+    lines = [
+        f"SLAM {slam_tracking_state or '-'}",
+        f"KF {keyframe_id if keyframe_id is not None else '-'}",
+        f"Mesh {int(mesh_triangle_count or 0)}t / {int(mesh_vertex_count or 0)}v",
+    ]
+    x = 12
+    y = max(20, canvas.shape[0] - 48)
+    for index, line in enumerate(lines):
+        cv2.putText(
+            canvas,
+            line,
+            (x, y + (index * 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def draw_detections(
@@ -10,6 +104,9 @@ def draw_detections(
     detections: list[Detection],
     fps: float,
     *,
+    segmentation_overlay_bgr: np.ndarray | None = None,
+    segments: list[PanopticSegment] | None = None,
+    segmentation_alpha: float = 0.35,
     tracking_ok: bool | None = None,
     is_keyframe: bool | None = None,
     segment_id: int | None = None,
@@ -17,11 +114,29 @@ def draw_detections(
     camera_fallback_active: bool = False,
     slam_tracking_state: str | None = None,
     keyframe_id: int | None = None,
+    mesh_triangle_count: int | None = None,
+    mesh_vertex_count: int | None = None,
     loop_closure_applied: bool = False,
 ) -> np.ndarray:
     import cv2
 
     canvas = frame_bgr.copy()
+    if (
+        segmentation_overlay_bgr is not None
+        and segmentation_overlay_bgr.shape == canvas.shape
+        and segmentation_alpha > 0.0
+    ):
+        overlay = np.asarray(segmentation_overlay_bgr, dtype=np.uint8)
+        active_mask = np.any(overlay != 0, axis=2)
+        if np.any(active_mask):
+            blended = canvas.astype(np.float32, copy=True)
+            overlay_float = overlay.astype(np.float32, copy=False)
+            blended[active_mask] = (
+                blended[active_mask] * (1.0 - segmentation_alpha)
+                + overlay_float[active_mask] * segmentation_alpha
+            )
+            canvas = blended.astype(np.uint8)
+
     for detection in detections:
         x1, y1, x2, y2 = detection.xyxy
         color_bgr = tuple(int(channel) for channel in detection.color[::-1])
@@ -37,6 +152,18 @@ def draw_detections(
             2,
             cv2.LINE_AA,
         )
+
+    _draw_runtime_status(
+        cv2,
+        canvas,
+        slam_tracking_state=slam_tracking_state,
+        keyframe_id=keyframe_id,
+        mesh_triangle_count=mesh_triangle_count,
+        mesh_vertex_count=mesh_vertex_count,
+    )
+
+    if segments:
+        _draw_segmentation_legend(cv2, canvas, list(segments))
     return canvas
 
 

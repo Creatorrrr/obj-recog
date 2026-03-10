@@ -10,7 +10,7 @@ class RunningPercentileNormalizer:
         low_percentile: float = 5.0,
         high_percentile: float = 95.0,
         min_depth: float = 0.3,
-        max_depth: float = 3.0,
+        max_depth: float = 6.0,
     ) -> None:
         self._alpha = alpha
         self._low_percentile = low_percentile
@@ -44,7 +44,7 @@ class RunningPercentileNormalizer:
 def normalize_inverse_depth(
     raw_depth: np.ndarray,
     min_depth: float = 0.3,
-    max_depth: float = 3.0,
+    max_depth: float = 6.0,
 ) -> np.ndarray:
     return RunningPercentileNormalizer(
         alpha=1.0,

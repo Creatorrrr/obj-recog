@@ -40,6 +40,10 @@ class AppConfig:
     map_voxel_size: float = 0.05
     max_map_points: int = 200_000
     max_mesh_triangles: int = 10_000
+    segmentation_mode: str = "panoptic"
+    segmentation_alpha: float = 0.35
+    segmentation_interval: int = 6
+    segmentation_input_size: int = 512
     camera_name: str | None = None
     list_cameras: bool = False
     camera_calibration: str | None = None
@@ -47,6 +51,7 @@ class AppConfig:
     slam_width: int = 640
     slam_height: int = 360
     recalibrate: bool = False
+    disable_slam_calibration: bool = False
     calibration_cache_dir: str | None = None
 
 
@@ -59,6 +64,10 @@ DEFAULT_MAPPING_WINDOW_KEYFRAMES = 12
 DEFAULT_MAP_VOXEL_SIZE = 0.05
 DEFAULT_MAX_MAP_POINTS = 200_000
 DEFAULT_MAX_MESH_TRIANGLES = 10_000
+DEFAULT_SEGMENTATION_MODE = "panoptic"
+DEFAULT_SEGMENTATION_ALPHA = 0.35
+DEFAULT_SEGMENTATION_INTERVAL = 6
+DEFAULT_SEGMENTATION_INPUT_SIZE = 512
 DEFAULT_SLAM_WIDTH = 640
 DEFAULT_SLAM_HEIGHT = 360
 
@@ -89,8 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conf-threshold", type=_confidence, default=0.35)
     parser.add_argument("--point-stride", type=_positive_int, default=4)
     parser.add_argument("--max-points", type=_positive_int, default=60_000)
+    parser.add_argument("--segmentation-mode", choices=("panoptic", "off"), default=DEFAULT_SEGMENTATION_MODE)
+    parser.add_argument("--segmentation-alpha", type=_confidence, default=DEFAULT_SEGMENTATION_ALPHA)
+    parser.add_argument("--segmentation-interval", type=_positive_int, default=DEFAULT_SEGMENTATION_INTERVAL)
     parser.add_argument("--camera-calibration", type=str, default=None)
     parser.add_argument("--recalibrate", action="store_true")
+    parser.add_argument("--disable-slam-calibration", action="store_true")
     parser.add_argument("--calibration-cache-dir", type=str, default=None)
     parser.add_argument("--slam-vocabulary", type=str, default=None)
     parser.add_argument("--slam-width", type=_positive_int, default=DEFAULT_SLAM_WIDTH)
@@ -109,9 +122,14 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         conf_threshold=args.conf_threshold,
         point_stride=args.point_stride,
         max_points=args.max_points,
+        segmentation_mode=args.segmentation_mode,
+        segmentation_alpha=args.segmentation_alpha,
+        segmentation_interval=args.segmentation_interval,
+        segmentation_input_size=DEFAULT_SEGMENTATION_INPUT_SIZE,
         camera_name=args.camera_name,
         camera_calibration=args.camera_calibration,
         recalibrate=args.recalibrate,
+        disable_slam_calibration=args.disable_slam_calibration,
         calibration_cache_dir=args.calibration_cache_dir,
         slam_vocabulary=args.slam_vocabulary,
         slam_width=args.slam_width,

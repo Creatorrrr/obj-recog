@@ -405,6 +405,31 @@ def test_ensure_runtime_calibration_prefers_explicit_path(tmp_path: Path) -> Non
     assert state.promoted_bridge is None
 
 
+def test_ensure_runtime_calibration_allows_disabling_self_calibration(tmp_path: Path) -> None:
+    session = _session()
+    config = _config(
+        calibration_cache_dir=str(tmp_path),
+        disable_slam_calibration=True,
+    )
+
+    state = ensure_runtime_calibration(
+        config,
+        session,
+        slam_bridge_factory=lambda **_: (_ for _ in ()).throw(AssertionError("bridge should not start")),
+        validator_runner=lambda **_: (_ for _ in ()).throw(AssertionError("validator should not run")),
+        warmup_runner=lambda **_: (_ for _ in ()).throw(AssertionError("warmup should not run")),
+    )
+
+    assert state.source == "disabled"
+    assert Path(state.settings_path).is_file()
+    assert state.settings_path.endswith("-disabled.yaml")
+    assert state.calibration.image_width == config.slam_width
+    assert state.calibration.image_height == config.slam_height
+    assert state.cache_entry is None
+    assert state.warmup_restarted is False
+    assert state.promoted_bridge is None
+
+
 def test_ensure_runtime_calibration_reuses_validated_cache_with_promoted_bridge(tmp_path: Path) -> None:
     calibration = create_approximate_calibration(image_width=640, image_height=360)
     session = _session()

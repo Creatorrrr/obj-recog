@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from obj_recog.types import Detection
+from obj_recog.types import Detection, PanopticSegment
 from obj_recog.visualization import Open3DMeshViewer, draw_detections, highlight_detected_points
 
 
@@ -167,7 +167,153 @@ def test_draw_detections_renders_only_detection_labels() -> None:
         else:
             sys.modules["cv2"] = previous_cv2
 
-    assert fake_cv2.text_calls == ["person 0.91"]
+    assert fake_cv2.text_calls == [
+        "person 0.91",
+        "SLAM TRACKING",
+        "KF 7",
+        "Mesh 0t / 0v",
+    ]
+
+
+def test_draw_detections_renders_small_runtime_status_lines() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((24, 24, 3), dtype=np.uint8)
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=7,
+            mesh_triangle_count=123,
+            mesh_vertex_count=88,
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert fake_cv2.text_calls == [
+        "SLAM TRACKING",
+        "KF 7",
+        "Mesh 123t / 88v",
+    ]
+
+
+def test_draw_detections_blends_segmentation_overlay_before_boxes() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        overlay = np.full((2, 2, 3), (20, 40, 80), dtype=np.uint8)
+        blended = draw_detections(
+            frame,
+            [],
+            24.0,
+            segmentation_overlay_bgr=overlay,
+            segmentation_alpha=0.5,
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert np.array_equal(blended[0, 0], np.array([10, 20, 40], dtype=np.uint8))
+
+
+def test_draw_detections_renders_segmentation_legend_in_top_right() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[tuple[str, tuple[int, int]]] = []
+            self.rectangle_calls: list[tuple[tuple[int, int], tuple[int, int], tuple[int, int], int]] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            self.rectangle_calls.append((pt1, pt2, color, thickness))
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append((text, org))
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((80, 160, 3), dtype=np.uint8)
+        segments = [
+            PanopticSegment(
+                segment_id=1,
+                label_id=7,
+                label="wall",
+                color_rgb=(64, 196, 255),
+                mask=np.ones((80, 160), dtype=bool),
+                area_pixels=6000,
+            ),
+            PanopticSegment(
+                segment_id=2,
+                label_id=4,
+                label="chair",
+                color_rgb=(255, 99, 71),
+                mask=np.ones((80, 160), dtype=bool),
+                area_pixels=3000,
+            ),
+        ]
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            segments=segments,
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert [text for text, _org in fake_cv2.text_calls] == ["wall", "chair"]
+    assert all(org[0] >= 100 for _text, org in fake_cv2.text_calls)
+    assert len(fake_cv2.rectangle_calls) >= 2
 
 
 def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:
