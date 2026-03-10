@@ -148,6 +148,10 @@ class FakeMapBuilder:
         self.last_frame_points_xyz: np.ndarray | None = None
         self.last_frame_points_rgb: np.ndarray | None = None
         self.last_slam_result = None
+        self.segmentation_observations: list[dict[str, object]] = []
+        self._mesh_vertices_xyz = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        self._mesh_triangles = np.empty((0, 3), dtype=np.int32)
+        self._mesh_vertex_colors = np.array([[0.2, 0.3, 0.4]], dtype=np.float32)
 
     def update(
         self,
@@ -168,11 +172,41 @@ class FakeMapBuilder:
             keyframe_id=slam_result.keyframe_id,
             sparse_map_points_xyz=slam_result.sparse_map_points_xyz,
             loop_closure_applied=slam_result.loop_closure_applied,
+            mesh_vertices_xyz=self._mesh_vertices_xyz,
+            mesh_triangles=self._mesh_triangles,
+            mesh_vertex_colors=self._mesh_vertex_colors,
             segment_id=2 if slam_result.loop_closure_applied and self.calls > 1 else 1,
         )
 
     def reset(self) -> None:
         self.reset_calls += 1
+
+    def ingest_segmentation_observation(
+        self,
+        *,
+        frame_index: int,
+        camera_pose_world: np.ndarray,
+        intrinsics,
+        segment_id_map: np.ndarray,
+        segments,
+    ) -> None:
+        self.segmentation_observations.append(
+            {
+                "frame_index": frame_index,
+                "camera_pose_world": np.asarray(camera_pose_world, dtype=np.float32),
+                "intrinsics": intrinsics,
+                "segment_id_map": np.asarray(segment_id_map, dtype=np.int32),
+                "segments": list(segments),
+            }
+        )
+        self._mesh_vertex_colors = np.array([[0.8, 0.1, 0.2]], dtype=np.float32)
+
+    def current_mesh_state(self):
+        return (
+            self._mesh_vertices_xyz.copy(),
+            self._mesh_triangles.copy(),
+            self._mesh_vertex_colors.copy(),
+        )
 
 
 class FakeCapture:
@@ -299,6 +333,7 @@ class FakeViewer:
         self.closed = False
         self.updates: list[int] = []
         self.last_triangles: np.ndarray | None = None
+        self.last_colors: np.ndarray | None = None
         self.last_scene_graph_snapshot: SceneGraphSnapshot | None = None
 
     def update(
@@ -310,6 +345,7 @@ class FakeViewer:
     ) -> bool:
         self.updates.append(mesh_vertices_xyz.shape[0])
         self.last_triangles = mesh_triangles.copy()
+        self.last_colors = mesh_vertex_colors.copy()
         if args:
             self.last_scene_graph_snapshot = args[0]
         return True
@@ -319,18 +355,18 @@ class FakeViewer:
 
 
 class FakeSegmentationWorker:
-    def __init__(self, results: list[SegmentationResult | None] | None = None) -> None:
+    def __init__(self, results: list[tuple[int, SegmentationResult] | None] | None = None) -> None:
         self.results = list(results or [])
-        self.submissions: list[np.ndarray] = []
+        self.submissions: list[tuple[int, np.ndarray]] = []
         self.closed = False
 
     def is_idle(self) -> bool:
         return True
 
-    def submit(self, frame_bgr: np.ndarray) -> None:
-        self.submissions.append(frame_bgr.copy())
+    def submit(self, frame_index: int, frame_bgr: np.ndarray) -> None:
+        self.submissions.append((frame_index, frame_bgr.copy()))
 
-    def poll(self) -> SegmentationResult | None:
+    def poll(self) -> tuple[int, SegmentationResult] | None:
         if self.results:
             return self.results.pop(0)
         return None
@@ -633,6 +669,9 @@ def test_run_uses_promoted_bridge_from_runtime_calibration_resolver(tmp_path: Pa
     capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
     viewer = FakeViewer()
     map_builder = FakeMapBuilder()
+    map_builder._mesh_vertices_xyz = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+    map_builder._mesh_triangles = np.array([[0, 0, 0]], dtype=np.int32)
+    map_builder._mesh_vertex_colors = np.array([[0.2, 0.3, 0.4]], dtype=np.float32)
     camera_session = CameraSession(
         capture=capture,
         active_index=0,
@@ -1467,18 +1506,22 @@ def test_run_submits_segmentation_frames_on_interval_and_reuses_last_result() ->
     )
     worker = FakeSegmentationWorker(
         results=[
-            SegmentationResult(
-                overlay_bgr=np.full((16, 16, 3), 25, dtype=np.uint8),
-                segments=[
-                    PanopticSegment(
-                        segment_id=1,
-                        label_id=4,
-                        label="chair",
-                        color_rgb=(1, 2, 3),
-                        mask=np.ones((16, 16), dtype=bool),
-                        area_pixels=256,
-                    )
-                ],
+            (
+                0,
+                SegmentationResult(
+                    overlay_bgr=np.full((16, 16, 3), 25, dtype=np.uint8),
+                    segment_id_map=np.full((16, 16), 1, dtype=np.int32),
+                    segments=[
+                        PanopticSegment(
+                            segment_id=1,
+                            label_id=4,
+                            label="chair",
+                            color_rgb=(1, 2, 3),
+                            mask=np.ones((16, 16), dtype=bool),
+                            area_pixels=256,
+                        )
+                    ],
+                ),
             ),
             None,
             None,
@@ -1501,10 +1544,90 @@ def test_run_submits_segmentation_frames_on_interval_and_reuses_last_result() ->
     )
 
     assert len(worker.submissions) == 2
-    assert [submission[0, 0, 0] for submission in worker.submissions] == [10, 30]
+    assert [submission[0] for submission in worker.submissions] == [0, 2]
+    assert [submission[1][0, 0, 0] for submission in worker.submissions] == [10, 30]
     assert overlay_calls[0]["segmentation_overlay_bgr"].shape == (16, 16, 3)
     assert overlay_calls[1]["segmentation_overlay_bgr"].shape == (16, 16, 3)
     assert overlay_calls[2]["segmentation_overlay_bgr"].shape == (16, 16, 3)
+
+
+def test_run_matches_segmentation_results_back_to_source_frame_and_refreshes_mesh_colors() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        segmentation_mode="panoptic",
+        segmentation_interval=1,
+    )
+    fake_cv2 = FakeCV2(key_sequence=[-1, ord("q")])
+    frames = [np.full((16, 16, 3), value, dtype=np.uint8) for value in (10, 20)]
+    capture = FakeCapture(width=16, height=16, frames=frames)
+    viewer = FakeViewer()
+    tracker = FakeTracker(
+        results=[
+            FakeTrackingResult(did_reset=True),
+            FakeTrackingResult(did_reset=False),
+        ]
+    )
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeSegmentationWorker(
+        results=[
+            (
+                0,
+                SegmentationResult(
+                    overlay_bgr=np.full((16, 16, 3), 42, dtype=np.uint8),
+                    segment_id_map=np.full((16, 16), 7, dtype=np.int32),
+                    segments=[
+                        PanopticSegment(
+                            segment_id=7,
+                            label_id=4,
+                            label="chair",
+                            color_rgb=(1, 2, 3),
+                            mask=np.ones((16, 16), dtype=bool),
+                            area_pixels=256,
+                        )
+                    ],
+                ),
+            ),
+            None,
+        ]
+    )
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        segmenter_factory=lambda **_: object(),
+        segmentation_worker_factory=lambda **_: worker,
+    )
+
+    assert len(map_builder.segmentation_observations) == 1
+    observation = map_builder.segmentation_observations[0]
+    assert observation["frame_index"] == 0
+    np.testing.assert_array_equal(
+        observation["segment_id_map"],
+        np.full((16, 16), 7, dtype=np.int32),
+    )
+    np.testing.assert_allclose(viewer.last_colors, np.array([[0.8, 0.1, 0.2]], dtype=np.float32))
 
 
 def test_run_skips_segmentation_worker_when_mode_is_off() -> None:

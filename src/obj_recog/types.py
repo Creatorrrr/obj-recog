@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    from obj_recog.reconstruct import CameraIntrinsics
     from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 
 
@@ -31,12 +32,14 @@ class PanopticSegment:
 @dataclass(slots=True)
 class SegmentationResult:
     overlay_bgr: np.ndarray
+    segment_id_map: np.ndarray
     segments: list[PanopticSegment]
 
 
 @dataclass(slots=True)
 class FrameArtifacts:
     frame_bgr: np.ndarray
+    intrinsics: CameraIntrinsics
     detections: list[Detection]
     depth_map: np.ndarray
     points_xyz: np.ndarray

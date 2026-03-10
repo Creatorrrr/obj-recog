@@ -7,6 +7,7 @@ import numpy as np
 
 from obj_recog.reconstruct import CameraIntrinsics, transform_points
 from obj_recog.slam_bridge import SlamFrameResult
+from obj_recog.types import PanopticSegment
 
 
 @dataclass(slots=True)
@@ -55,6 +56,15 @@ class _TsdfKeyframe:
     frame_bgr: np.ndarray
     depth_map: np.ndarray
     intrinsics: CameraIntrinsics
+
+
+@dataclass(slots=True)
+class _SegmentationObservation:
+    frame_index: int
+    camera_pose_world: np.ndarray
+    intrinsics: CameraIntrinsics
+    segment_id_map: np.ndarray
+    segment_colors_rgb: dict[int, np.ndarray]
 
 
 @dataclass(slots=True)
@@ -229,9 +239,11 @@ class TsdfMeshMapBuilder:
         self._keyframes: OrderedDict[int, _TsdfKeyframe] = OrderedDict()
         self._optimized_poses: dict[int, np.ndarray] = {}
         self._trajectory: list[np.ndarray] = []
+        self._segmentation_observations: deque[_SegmentationObservation] = deque(maxlen=8)
         self._volume = self._create_volume()
         self._cached_vertices = np.empty((0, 3), dtype=np.float32)
         self._cached_triangles = np.empty((0, 3), dtype=np.int32)
+        self._cached_base_vertex_colors = np.empty((0, 3), dtype=np.float32)
         self._cached_vertex_colors = np.empty((0, 3), dtype=np.float32)
 
     def _trim_window(self) -> bool:
@@ -283,6 +295,73 @@ class TsdfMeshMapBuilder:
             vertex_colors = np.zeros((vertices.shape[0], 3), dtype=np.float32)
         return vertices, triangles, vertex_colors
 
+    def _set_cached_mesh(
+        self,
+        vertices: np.ndarray,
+        triangles: np.ndarray,
+        vertex_colors: np.ndarray,
+    ) -> None:
+        self._cached_vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+        self._cached_triangles = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+        self._cached_base_vertex_colors = np.asarray(vertex_colors, dtype=np.float32).reshape(-1, 3)
+        self._recolor_cached_mesh()
+
+    def _world_to_camera(self, points_xyz: np.ndarray, camera_pose_world: np.ndarray) -> np.ndarray:
+        points_xyz = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+        if points_xyz.size == 0:
+            return points_xyz.copy()
+        pose_inv = np.linalg.inv(np.asarray(camera_pose_world, dtype=np.float32))
+        homogeneous = np.concatenate(
+            (points_xyz, np.ones((points_xyz.shape[0], 1), dtype=np.float32)),
+            axis=1,
+        )
+        return (pose_inv @ homogeneous.T).T[:, :3].astype(np.float32, copy=False)
+
+    def _recolor_cached_mesh(self) -> None:
+        if self._cached_vertices.size == 0 or self._cached_base_vertex_colors.size == 0:
+            self._cached_vertex_colors = self._cached_base_vertex_colors.copy()
+            return
+        base_colors = self._cached_base_vertex_colors.astype(np.float32, copy=True)
+        if not self._segmentation_observations:
+            self._cached_vertex_colors = base_colors
+            return
+
+        weighted_colors = np.zeros_like(base_colors, dtype=np.float32)
+        weights = np.zeros((base_colors.shape[0],), dtype=np.float32)
+
+        for age_index, observation in enumerate(reversed(self._segmentation_observations)):
+            weight = 1.0 / float(1 + age_index)
+            local_points = self._world_to_camera(self._cached_vertices, observation.camera_pose_world)
+            depth = local_points[:, 2]
+            valid = depth > 1e-4
+            if not np.any(valid):
+                continue
+
+            xs = (local_points[:, 0] * observation.intrinsics.fx / depth) + observation.intrinsics.cx
+            ys = (local_points[:, 1] * observation.intrinsics.fy / depth) + observation.intrinsics.cy
+            pixel_x = np.rint(xs).astype(np.int32, copy=False)
+            pixel_y = np.rint(ys).astype(np.int32, copy=False)
+            height, width = observation.segment_id_map.shape
+            valid &= (pixel_x >= 0) & (pixel_x < width) & (pixel_y >= 0) & (pixel_y < height)
+            if not np.any(valid):
+                continue
+
+            visible_indices = np.nonzero(valid)[0]
+            sampled_segment_ids = observation.segment_id_map[pixel_y[valid], pixel_x[valid]]
+            for segment_id, color_rgb in observation.segment_colors_rgb.items():
+                hit_mask = sampled_segment_ids == int(segment_id)
+                if not np.any(hit_mask):
+                    continue
+                target_indices = visible_indices[hit_mask]
+                weighted_colors[target_indices] += color_rgb[None, :] * weight
+                weights[target_indices] += weight
+
+        colored_mask = weights > 0.0
+        if np.any(colored_mask):
+            overlay_colors = weighted_colors[colored_mask] / weights[colored_mask, None]
+            base_colors[colored_mask] = (base_colors[colored_mask] * 0.55) + (overlay_colors * 0.45)
+        self._cached_vertex_colors = np.clip(base_colors, 0.0, 1.0)
+
     def _integrate_keyframe(self, keyframe: _TsdfKeyframe, pose_world: np.ndarray) -> None:
         rgbd = self._to_rgbd(keyframe.frame_bgr, keyframe.depth_map)
         intrinsic = self._to_intrinsic(
@@ -300,11 +379,40 @@ class TsdfMeshMapBuilder:
             if pose_world is None:
                 continue
             self._integrate_keyframe(keyframe, pose_world)
-        (
-            self._cached_vertices,
-            self._cached_triangles,
-            self._cached_vertex_colors,
-        ) = self._extract_mesh_arrays()
+        self._set_cached_mesh(*self._extract_mesh_arrays())
+
+    def ingest_segmentation_observation(
+        self,
+        *,
+        frame_index: int,
+        camera_pose_world: np.ndarray,
+        intrinsics: CameraIntrinsics,
+        segment_id_map: np.ndarray,
+        segments: list[PanopticSegment],
+    ) -> None:
+        segment_colors_rgb = {
+            int(segment.segment_id): np.asarray(segment.color_rgb, dtype=np.float32) / 255.0
+            for segment in segments
+        }
+        if not segment_colors_rgb:
+            return
+        self._segmentation_observations.append(
+            _SegmentationObservation(
+                frame_index=int(frame_index),
+                camera_pose_world=np.asarray(camera_pose_world, dtype=np.float32).copy(),
+                intrinsics=intrinsics,
+                segment_id_map=np.asarray(segment_id_map, dtype=np.int32).copy(),
+                segment_colors_rgb=segment_colors_rgb,
+            )
+        )
+        self._recolor_cached_mesh()
+
+    def current_mesh_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return (
+            self._cached_vertices.copy(),
+            self._cached_triangles.copy(),
+            self._cached_vertex_colors.copy(),
+        )
 
     def update(
         self,
@@ -336,11 +444,7 @@ class TsdfMeshMapBuilder:
             else:
                 current_pose = self._optimized_poses.get(inserted_keyframe_id, pose_world)
                 self._integrate_keyframe(inserted_keyframe, current_pose)
-                (
-                    self._cached_vertices,
-                    self._cached_triangles,
-                    self._cached_vertex_colors,
-                ) = self._extract_mesh_arrays()
+                self._set_cached_mesh(*self._extract_mesh_arrays())
         elif slam_result.loop_closure_applied:
             self._rebuild_volume()
 

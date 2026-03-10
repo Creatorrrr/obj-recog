@@ -6,6 +6,7 @@ import pytest
 from obj_recog.mapping import TsdfMeshMapBuilder
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.slam_bridge import SlamFrameResult
+from obj_recog.types import PanopticSegment
 
 
 def _pose(tx: float = 0.0) -> np.ndarray:
@@ -258,3 +259,122 @@ def test_tsdf_mesh_map_builder_skips_append_when_tracking_is_lost() -> None:
     assert update.is_keyframe is False
     assert update.keyframe_id is None
     assert update.mesh_triangles.shape == (2, 3)
+
+
+def test_tsdf_mesh_map_builder_recolors_vertices_from_segmentation_observation() -> None:
+    _FakeO3D.pipelines.integration.created_volumes.clear()
+    builder = TsdfMeshMapBuilder(
+        window_keyframes=30,
+        voxel_size=0.03,
+        max_mesh_triangles=4,
+        o3d_module=_FakeO3D,
+    )
+    frame = np.full((4, 4, 3), 127, dtype=np.uint8)
+    depth = np.full((4, 4), 1.0, dtype=np.float32)
+    intrinsics = CameraIntrinsics(fx=4.0, fy=4.0, cx=2.0, cy=2.0)
+
+    builder.update(
+        slam_result=_slam_result(
+            pose_world=_pose(0.0),
+            keyframe_inserted=True,
+            keyframe_id=1,
+            optimized_keyframe_poses={1: _pose(0.0)},
+        ),
+        frame_bgr=frame,
+        depth_map=depth,
+        intrinsics=intrinsics,
+    )
+
+    segment_id_map = np.full((4, 4), -1, dtype=np.int32)
+    segment_id_map[2:4, 2:4] = 9
+    builder.ingest_segmentation_observation(
+        frame_index=0,
+        camera_pose_world=_pose(0.0),
+        intrinsics=intrinsics,
+        segment_id_map=segment_id_map,
+        segments=[
+            PanopticSegment(
+                segment_id=9,
+                label_id=11,
+                label="table",
+                color_rgb=(0, 0, 255),
+                mask=segment_id_map == 9,
+                area_pixels=4,
+            )
+        ],
+    )
+
+    mesh_vertices_xyz, mesh_triangles, mesh_vertex_colors = builder.current_mesh_state()
+
+    assert mesh_vertices_xyz.shape == (3, 3)
+    assert mesh_triangles.shape == (2, 3)
+    np.testing.assert_allclose(
+        mesh_vertex_colors[0],
+        np.array([0.55, 0.0, 0.45], dtype=np.float32),
+        atol=1e-5,
+    )
+
+
+def test_tsdf_mesh_map_builder_prefers_recent_segmentation_colors() -> None:
+    _FakeO3D.pipelines.integration.created_volumes.clear()
+    builder = TsdfMeshMapBuilder(
+        window_keyframes=30,
+        voxel_size=0.03,
+        max_mesh_triangles=4,
+        o3d_module=_FakeO3D,
+    )
+    frame = np.full((4, 4, 3), 127, dtype=np.uint8)
+    depth = np.full((4, 4), 1.0, dtype=np.float32)
+    intrinsics = CameraIntrinsics(fx=4.0, fy=4.0, cx=2.0, cy=2.0)
+
+    builder.update(
+        slam_result=_slam_result(
+            pose_world=_pose(0.0),
+            keyframe_inserted=True,
+            keyframe_id=1,
+            optimized_keyframe_poses={1: _pose(0.0)},
+        ),
+        frame_bgr=frame,
+        depth_map=depth,
+        intrinsics=intrinsics,
+    )
+
+    segment_id_map = np.full((4, 4), -1, dtype=np.int32)
+    segment_id_map[2:4, 2:4] = 3
+    builder.ingest_segmentation_observation(
+        frame_index=0,
+        camera_pose_world=_pose(0.0),
+        intrinsics=intrinsics,
+        segment_id_map=segment_id_map,
+        segments=[
+            PanopticSegment(
+                segment_id=3,
+                label_id=1,
+                label="old",
+                color_rgb=(0, 0, 255),
+                mask=segment_id_map == 3,
+                area_pixels=4,
+            )
+        ],
+    )
+    builder.ingest_segmentation_observation(
+        frame_index=1,
+        camera_pose_world=_pose(0.0),
+        intrinsics=intrinsics,
+        segment_id_map=segment_id_map,
+        segments=[
+            PanopticSegment(
+                segment_id=3,
+                label_id=2,
+                label="new",
+                color_rgb=(255, 0, 0),
+                mask=segment_id_map == 3,
+                area_pixels=4,
+            )
+        ],
+    )
+
+    _mesh_vertices_xyz, _mesh_triangles, mesh_vertex_colors = builder.current_mesh_state()
+    expected_overlay = np.array([2.0 / 3.0, 0.0, 1.0 / 3.0], dtype=np.float32)
+    expected = (np.array([1.0, 0.0, 0.0], dtype=np.float32) * 0.55) + (expected_overlay * 0.45)
+    np.testing.assert_allclose(mesh_vertex_colors[0], expected, atol=1e-5)

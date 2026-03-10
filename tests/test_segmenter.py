@@ -74,11 +74,16 @@ def test_panoptic_segmenter_converts_result_and_filters_tiny_segments() -> None:
     result = segmenter.segment(frame_bgr)
 
     assert result.overlay_bgr.shape == frame_bgr.shape
+    assert result.segment_id_map.shape == frame_bgr.shape[:2]
+    assert result.segment_id_map.dtype == np.int32
     assert [segment.label for segment in result.segments] == ["chair", "wall"]
     assert [segment.area_pixels for segment in result.segments] == [8, 7]
     assert np.all(result.overlay_bgr[0, 0] == np.array(color_for_label(4)[::-1], dtype=np.uint8))
     assert np.all(result.overlay_bgr[0, 3] == np.array(color_for_label(7)[::-1], dtype=np.uint8))
     assert np.all(result.overlay_bgr[3, 3] == np.array([0, 0, 0], dtype=np.uint8))
+    assert result.segment_id_map[0, 0] == 1
+    assert result.segment_id_map[0, 3] == 2
+    assert result.segment_id_map[3, 3] == -1
 
 
 def test_color_for_label_is_stable() -> None:

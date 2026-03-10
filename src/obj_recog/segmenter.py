@@ -103,6 +103,7 @@ class PanopticSegmenter:
         segmentation = np.asarray(segmentation, dtype=np.int32)
 
         overlay_bgr = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+        segment_id_map = np.full((frame_height, frame_width), -1, dtype=np.int32)
         min_area_pixels = max(1, int(round(frame_height * frame_width * self._min_area_ratio)))
         segments: list[PanopticSegment] = []
 
@@ -116,6 +117,7 @@ class PanopticSegmenter:
 
             color_rgb = color_for_label(label_id)
             overlay_bgr[mask] = np.asarray(color_rgb[::-1], dtype=np.uint8)
+            segment_id_map[mask] = segment_id
             segments.append(
                 PanopticSegment(
                     segment_id=segment_id,
@@ -129,14 +131,16 @@ class PanopticSegmenter:
 
         return SegmentationResult(
             overlay_bgr=overlay_bgr,
+            segment_id_map=segment_id_map,
             segments=segments,
         )
 
 
 @dataclass(slots=True)
 class _WorkerState:
+    pending_frame_index: int | None = None
     pending_frame_bgr: np.ndarray | None = None
-    latest_result: SegmentationResult | None = None
+    latest_result: tuple[int, SegmentationResult] | None = None
     idle: bool = True
     error: Exception | None = None
 
@@ -155,13 +159,14 @@ class SegmentationWorker:
         with self._lock:
             return self._state.idle
 
-    def submit(self, frame_bgr: np.ndarray) -> None:
+    def submit(self, frame_index: int, frame_bgr: np.ndarray) -> None:
         with self._lock:
+            self._state.pending_frame_index = int(frame_index)
             self._state.pending_frame_bgr = np.asarray(frame_bgr, dtype=np.uint8).copy()
             self._state.idle = False
         self._event.set()
 
-    def poll(self) -> SegmentationResult | None:
+    def poll(self) -> tuple[int, SegmentationResult] | None:
         with self._lock:
             if self._state.error is not None:
                 error = self._state.error
@@ -179,10 +184,12 @@ class SegmentationWorker:
                 return
 
             with self._lock:
+                frame_index = self._state.pending_frame_index
+                self._state.pending_frame_index = None
                 frame_bgr = self._state.pending_frame_bgr
                 self._state.pending_frame_bgr = None
 
-            if frame_bgr is None:
+            if frame_bgr is None or frame_index is None:
                 continue
 
             try:
@@ -194,7 +201,7 @@ class SegmentationWorker:
                 continue
 
             with self._lock:
-                self._state.latest_result = result
+                self._state.latest_result = (int(frame_index), result)
                 if self._state.pending_frame_bgr is None:
                     self._state.idle = True
                 else:

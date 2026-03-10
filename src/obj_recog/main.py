@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import time
 from pathlib import Path
 import sys
@@ -225,6 +226,7 @@ def process_frame(
 
     artifacts = FrameArtifacts(
         frame_bgr=frame_bgr,
+        intrinsics=intrinsics,
         detections=list(detections),
         depth_map=depth_map,
         points_xyz=mesh_vertices_xyz,
@@ -323,6 +325,7 @@ def run(
 
     cached_detections: list[Detection] = []
     cached_segmentation: SegmentationResult | None = None
+    segmentation_frame_metadata: OrderedDict[int, dict[str, object]] = OrderedDict()
     frame_index = 0
     last_frame_time = 0.0
     slam_time_origin = None
@@ -474,16 +477,46 @@ def run(
 
             if segmentation_worker is not None:
                 if frame_index % config.segmentation_interval == 0 and segmentation_worker.is_idle():
-                    segmentation_worker.submit(artifacts.frame_bgr)
+                    segmentation_worker.submit(frame_index, artifacts.frame_bgr)
+                    segmentation_frame_metadata[frame_index] = {
+                        "camera_pose_world": artifacts.camera_pose_world.copy(),
+                        "intrinsics": artifacts.intrinsics,
+                        "tracking_ok": bool(artifacts.slam_tracking_state in {"TRACKING", "RELOCALIZED"}),
+                    }
+                    while len(segmentation_frame_metadata) > 16:
+                        segmentation_frame_metadata.popitem(last=False)
                 try:
-                    segmentation_result = segmentation_worker.poll()
+                    segmentation_poll_result = segmentation_worker.poll()
                 except RuntimeError as exc:
                     debug_log(str(exc))
                     segmentation_worker.close()
                     segmentation_worker = None
-                    segmentation_result = None
-                if segmentation_result is not None:
+                    segmentation_poll_result = None
+                if segmentation_poll_result is not None:
+                    segmentation_result_frame_index, segmentation_result = segmentation_poll_result
                     cached_segmentation = segmentation_result
+                    metadata = segmentation_frame_metadata.pop(segmentation_result_frame_index, None)
+                    if (
+                        metadata is not None
+                        and bool(metadata.get("tracking_ok", False))
+                        and hasattr(map_builder, "ingest_segmentation_observation")
+                    ):
+                        map_builder.ingest_segmentation_observation(
+                            frame_index=segmentation_result_frame_index,
+                            camera_pose_world=np.asarray(metadata["camera_pose_world"], dtype=np.float32),
+                            intrinsics=metadata["intrinsics"],
+                            segment_id_map=segmentation_result.segment_id_map,
+                            segments=list(segmentation_result.segments),
+                        )
+                        if hasattr(map_builder, "current_mesh_state"):
+                            mesh_vertices_xyz, mesh_triangles, mesh_vertex_colors = map_builder.current_mesh_state()
+                            artifacts.mesh_vertices_xyz = np.asarray(mesh_vertices_xyz, dtype=np.float32).reshape(-1, 3)
+                            artifacts.mesh_triangles = np.asarray(mesh_triangles, dtype=np.int32).reshape(-1, 3)
+                            artifacts.mesh_vertex_colors = np.asarray(mesh_vertex_colors, dtype=np.float32).reshape(-1, 3)
+                            artifacts.points_xyz = artifacts.mesh_vertices_xyz
+                            artifacts.points_rgb = artifacts.mesh_vertex_colors
+                            artifacts.dense_map_points_xyz = artifacts.mesh_vertices_xyz
+                            artifacts.dense_map_points_rgb = artifacts.mesh_vertex_colors
 
             if cached_segmentation is not None:
                 artifacts.segmentation_overlay_bgr = cached_segmentation.overlay_bgr
