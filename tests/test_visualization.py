@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.types import Detection, PanopticSegment
-from obj_recog.visualization import Open3DMeshViewer, draw_detections, highlight_detected_points
+from obj_recog.visualization import (
+    Open3DMeshViewer,
+    _display_points_for_view,
+    draw_detections,
+    highlight_detected_points,
+)
 
 
 def test_highlight_detected_points_recolors_only_points_inside_detection() -> None:
@@ -51,6 +57,13 @@ class _FakePointCloud:
         self.colors = None
 
 
+class _FakeLineSet:
+    def __init__(self) -> None:
+        self.points = None
+        self.lines = None
+        self.colors = None
+
+
 class _FakeTriangleMesh:
     def __init__(self) -> None:
         self.vertices = None
@@ -66,6 +79,7 @@ class _FakeRenderOption:
     def __init__(self) -> None:
         self.background_color = None
         self.point_size = None
+        self.mesh_show_back_face = None
 
 
 class _FakeVisualizer:
@@ -107,6 +121,8 @@ class _FakeO3D:
 
     class geometry:
         TriangleMesh = _FakeTriangleMesh
+        PointCloud = _FakePointCloud
+        LineSet = _FakeLineSet
 
     class utility:
         @staticmethod
@@ -115,6 +131,10 @@ class _FakeO3D:
 
         @staticmethod
         def Vector3iVector(data: np.ndarray) -> _FakeVector3dVector:
+            return _FakeVector3dVector(data)
+
+        @staticmethod
+        def Vector2iVector(data: np.ndarray) -> _FakeVector3dVector:
             return _FakeVector3dVector(data)
 
 
@@ -316,6 +336,219 @@ def test_draw_detections_renders_segmentation_legend_in_top_right() -> None:
     assert len(fake_cv2.rectangle_calls) >= 2
 
 
+def test_draw_detections_renders_scene_graph_summary_in_top_right() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[tuple[str, tuple[int, int]]] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append((text, org))
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((80, 200, 3), dtype=np.uint8)
+        snapshot = SceneGraphSnapshot(
+            frame_index=2,
+            camera_pose_world=np.eye(4, dtype=np.float32),
+            nodes=(
+                GraphNode(
+                    id="ego",
+                    type="ego",
+                    label="camera",
+                    state="visible",
+                    confidence=1.0,
+                    world_centroid=np.zeros(3, dtype=np.float32),
+                    last_seen_frame=2,
+                    last_seen_direction="front",
+                    source_track_id=None,
+                ),
+                GraphNode(
+                    id="obj_table_1",
+                    type="object",
+                    label="table",
+                    state="visible",
+                    confidence=0.91,
+                    world_centroid=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+                    last_seen_frame=2,
+                    last_seen_direction="front",
+                    source_track_id=1,
+                ),
+                GraphNode(
+                    id="obj_cup_2",
+                    type="object",
+                    label="cup",
+                    state="visible",
+                    confidence=0.88,
+                    world_centroid=np.array([0.5, 0.0, 2.2], dtype=np.float32),
+                    last_seen_frame=2,
+                    last_seen_direction="front-right",
+                    source_track_id=2,
+                ),
+            ),
+            edges=(
+                GraphEdge(
+                    source="ego",
+                    target="obj_table_1",
+                    relation="front",
+                    confidence=0.9,
+                    last_updated_frame=2,
+                    distance_bucket="mid",
+                    source_kind="detection",
+                ),
+                GraphEdge(
+                    source="ego",
+                    target="obj_cup_2",
+                    relation="front-right",
+                    confidence=0.8,
+                    last_updated_frame=2,
+                    distance_bucket="mid",
+                    source_kind="detection",
+                ),
+            ),
+            visible_node_ids=("ego", "obj_table_1", "obj_cup_2"),
+            visible_edge_keys=(
+                ("ego", "obj_table_1", "front"),
+                ("ego", "obj_cup_2", "front-right"),
+            ),
+        )
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            scene_graph_snapshot=snapshot,
+            visible_graph_nodes=list(snapshot.visible_nodes),
+            visible_graph_edges=list(snapshot.visible_edges),
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert [text for text, _org in fake_cv2.text_calls] == [
+        "front table (mid)",
+        "front-right cup (mid)",
+    ]
+    assert all(org[0] >= 20 for _text, org in fake_cv2.text_calls)
+
+
+def test_draw_detections_renders_scene_graph_debug_counts_in_runtime_status() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        snapshot = SceneGraphSnapshot(
+            frame_index=4,
+            camera_pose_world=np.eye(4, dtype=np.float32),
+            nodes=(
+                GraphNode(
+                    id="ego",
+                    type="ego",
+                    label="camera",
+                    state="visible",
+                    confidence=1.0,
+                    world_centroid=np.zeros(3, dtype=np.float32),
+                    last_seen_frame=4,
+                    last_seen_direction="front",
+                    source_track_id=None,
+                ),
+                GraphNode(
+                    id="obj_cup_1",
+                    type="object",
+                    label="cup",
+                    state="visible",
+                    confidence=0.9,
+                    world_centroid=np.array([0.2, 0.0, 1.5], dtype=np.float32),
+                    last_seen_frame=4,
+                    last_seen_direction="front-right",
+                    source_track_id=1,
+                ),
+                GraphNode(
+                    id="seg_wall_2",
+                    type="segment",
+                    label="wall",
+                    state="visible",
+                    confidence=0.8,
+                    world_centroid=None,
+                    last_seen_frame=4,
+                    last_seen_direction="left",
+                    source_track_id=2,
+                ),
+            ),
+            edges=(
+                GraphEdge(
+                    source="ego",
+                    target="obj_cup_1",
+                    relation="front-right",
+                    confidence=0.85,
+                    last_updated_frame=4,
+                    distance_bucket="near",
+                    source_kind="detection",
+                ),
+            ),
+            visible_node_ids=("ego", "obj_cup_1", "seg_wall_2"),
+            visible_edge_keys=(("ego", "obj_cup_1", "front-right"),),
+        )
+        draw_detections(
+            frame,
+            [],
+            30.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=9,
+            mesh_triangle_count=20,
+            mesh_vertex_count=15,
+            scene_graph_snapshot=snapshot,
+            visible_graph_nodes=list(snapshot.visible_nodes),
+            visible_graph_edges=list(snapshot.visible_edges),
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert fake_cv2.text_calls == [
+        "SLAM TRACKING",
+        "KF 9",
+        "Mesh 20t / 15v",
+        "Graph nodes 2",
+        "Graph edges 1",
+        "Localized 1",
+        "front-right cup (near)",
+    ]
+
+
 def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:
     viewer = Open3DMeshViewer(o3d_module=_FakeO3D())
     vertices = np.array([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0], [0.0, 0.1, 1.0]], dtype=np.float32)
@@ -326,4 +559,119 @@ def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:
     viewer.update(vertices, triangles, colors)
 
     assert viewer._vis.reset_calls == [True]
-    assert len(viewer._vis.geometry) == 1
+    assert len(viewer._vis.geometry) == 4
+
+
+def test_display_points_for_view_flips_y_and_z_axes() -> None:
+    points = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [-4.0, -5.0, 6.0],
+        ],
+        dtype=np.float32,
+    )
+
+    transformed = _display_points_for_view(points)
+
+    assert np.allclose(
+        transformed,
+        np.array(
+            [
+                [1.0, -2.0, -3.0],
+                [-4.0, 5.0, -6.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_open3d_viewer_applies_display_axis_transform_to_mesh_vertices() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D())
+    vertices = np.array([[1.0, 2.0, 3.0], [-1.0, -2.0, 4.0], [0.0, 1.0, 2.0]], dtype=np.float32)
+    triangles = np.array([[0, 1, 2]], dtype=np.int32)
+    colors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    viewer.update(vertices, triangles, colors)
+
+    assert np.allclose(
+        viewer._mesh.vertices.data,
+        np.array([[1.0, -2.0, -3.0], [-1.0, 2.0, -4.0], [0.0, -1.0, -2.0]], dtype=np.float32),
+    )
+
+
+def test_open3d_viewer_updates_graph_geometries_with_snapshot() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D())
+    vertices = np.array([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0], [0.0, 0.1, 1.0]], dtype=np.float32)
+    triangles = np.array([[0, 1, 2]], dtype=np.int32)
+    colors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    snapshot = SceneGraphSnapshot(
+        frame_index=3,
+        camera_pose_world=np.eye(4, dtype=np.float32),
+        nodes=(
+            GraphNode(
+                id="ego",
+                type="ego",
+                label="camera",
+                state="visible",
+                confidence=1.0,
+                world_centroid=np.zeros(3, dtype=np.float32),
+                last_seen_frame=3,
+                last_seen_direction="front",
+                source_track_id=None,
+            ),
+            GraphNode(
+                id="obj_table_1",
+                type="object",
+                label="table",
+                state="visible",
+                confidence=0.91,
+                world_centroid=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+                last_seen_frame=3,
+                last_seen_direction="front",
+                source_track_id=1,
+            ),
+            GraphNode(
+                id="seg_floor_1",
+                type="segment",
+                label="floor",
+                state="visible",
+                confidence=1.0,
+                world_centroid=np.array([0.0, 1.0, 2.0], dtype=np.float32),
+                last_seen_frame=3,
+                last_seen_direction="front",
+                source_track_id=1001,
+            ),
+        ),
+        edges=(
+            GraphEdge(
+                source="ego",
+                target="obj_table_1",
+                relation="front",
+                confidence=0.9,
+                last_updated_frame=3,
+                distance_bucket="mid",
+                source_kind="detection",
+            ),
+            GraphEdge(
+                source="obj_table_1",
+                target="seg_floor_1",
+                relation="on",
+                confidence=0.8,
+                last_updated_frame=3,
+                distance_bucket=None,
+                source_kind="segment",
+            ),
+        ),
+        visible_node_ids=("ego", "obj_table_1", "seg_floor_1"),
+        visible_edge_keys=(
+            ("ego", "obj_table_1", "front"),
+            ("obj_table_1", "seg_floor_1", "on"),
+        ),
+    )
+
+    viewer.update(vertices, triangles, colors, snapshot)
+
+    assert len(viewer._vis.geometry) == 4
+    assert viewer._graph_nodes.points is not None
+    assert viewer._graph_edges.lines is not None
+    assert viewer._ego_lines.lines is not None

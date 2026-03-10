@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,3 +57,6 @@ class FrameArtifacts:
     loop_closure_applied: bool
     segmentation_overlay_bgr: np.ndarray
     segments: list[PanopticSegment]
+    scene_graph_snapshot: SceneGraphSnapshot | None = None
+    visible_graph_nodes: list[GraphNode] = field(default_factory=list)
+    visible_graph_edges: list[GraphEdge] = field(default_factory=list)

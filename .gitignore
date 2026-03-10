@@ -3,6 +3,7 @@
 
 # Python environment and caches
 .venv/
+.venv*/
 .pytest_cache/
 __pycache__/
 *.py[cod]

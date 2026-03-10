@@ -15,6 +15,7 @@ from obj_recog.detector import ObjectDetector
 from obj_recog.mapping import LocalMapBuilder, TsdfMeshMapBuilder
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.reconstruct import depth_to_point_cloud, intrinsics_for_frame
+from obj_recog.scene_graph import SceneGraphMemory
 from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
 from obj_recog.slam_bridge import OrbSlam3Bridge, SlamFrameResult
 from obj_recog.tracking import PoseTracker
@@ -121,6 +122,7 @@ def _update_viewer(viewer, artifacts: FrameArtifacts) -> bool:
             artifacts.mesh_vertices_xyz,
             artifacts.mesh_triangles,
             artifacts.mesh_vertex_colors,
+            artifacts.scene_graph_snapshot,
         )
     except TypeError:
         return viewer.update(
@@ -291,6 +293,7 @@ def run(
     camera_lister=list_available_cameras,
     runtime_calibration_resolver=ensure_runtime_calibration,
     overlay_renderer=draw_detections,
+    scene_graph_memory_factory=SceneGraphMemory,
     time_source=time.perf_counter,
     debug_log=_default_debug_log,
 ) -> None:
@@ -300,6 +303,7 @@ def run(
     viewer = None
     slam_bridge = None
     segmentation_worker = None
+    scene_graph_memory = None
     calibration = None
     runtime_settings_path = config.camera_calibration
 
@@ -399,6 +403,12 @@ def run(
                 voxel_size=config.map_voxel_size,
                 max_map_points=config.max_map_points,
             )
+        if config.graph_enabled:
+            scene_graph_memory = scene_graph_memory_factory(
+                graph_max_visible_nodes=config.graph_max_visible_nodes,
+                graph_relation_smoothing_frames=config.graph_relation_smoothing_frames,
+                occlusion_ttl_frames=config.graph_occlusion_ttl_frames,
+            )
         viewer = viewer_factory()
         debug_log("viewer init done")
         last_frame_time = time_source()
@@ -479,6 +489,31 @@ def run(
                 artifacts.segmentation_overlay_bgr = cached_segmentation.overlay_bgr
                 artifacts.segments = list(cached_segmentation.segments)
 
+            if scene_graph_memory is not None:
+                if calibration is not None:
+                    graph_intrinsics = intrinsics_from_calibration(
+                        calibration,
+                        target_width=artifacts.frame_bgr.shape[1],
+                        target_height=artifacts.frame_bgr.shape[0],
+                    )
+                else:
+                    graph_intrinsics = intrinsics_for_frame(
+                        artifacts.frame_bgr.shape[1],
+                        artifacts.frame_bgr.shape[0],
+                    )
+                scene_graph_snapshot = scene_graph_memory.update(
+                    frame_index=frame_index,
+                    detections=artifacts.detections,
+                    segments=artifacts.segments,
+                    depth_map=artifacts.depth_map,
+                    intrinsics=graph_intrinsics,
+                    camera_pose_world=artifacts.camera_pose_world,
+                    slam_tracking_state=artifacts.slam_tracking_state,
+                )
+                artifacts.scene_graph_snapshot = scene_graph_snapshot
+                artifacts.visible_graph_nodes = list(scene_graph_snapshot.visible_nodes)
+                artifacts.visible_graph_edges = list(scene_graph_snapshot.visible_edges)
+
             now = time_source()
             fps = 1.0 / max(now - last_frame_time, 1e-6)
             last_frame_time = now
@@ -494,6 +529,9 @@ def run(
                 keyframe_id=artifacts.keyframe_id,
                 mesh_triangle_count=int(artifacts.mesh_triangles.shape[0]),
                 mesh_vertex_count=int(artifacts.mesh_vertices_xyz.shape[0]),
+                scene_graph_snapshot=artifacts.scene_graph_snapshot,
+                visible_graph_nodes=artifacts.visible_graph_nodes,
+                visible_graph_edges=artifacts.visible_graph_edges,
             )
             cv2.imshow("Object Recognition", overlay)
             viewer_active = _update_viewer(viewer, artifacts)

@@ -7,6 +7,7 @@ import pytest
 
 from obj_recog.camera import CameraDevice, CameraSession, open_camera
 from obj_recog.config import AppConfig
+from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
 from obj_recog.main import process_frame, run
 from obj_recog.types import Detection, PanopticSegment, SegmentationResult
@@ -298,6 +299,7 @@ class FakeViewer:
         self.closed = False
         self.updates: list[int] = []
         self.last_triangles: np.ndarray | None = None
+        self.last_scene_graph_snapshot: SceneGraphSnapshot | None = None
 
     def update(
         self,
@@ -308,6 +310,8 @@ class FakeViewer:
     ) -> bool:
         self.updates.append(mesh_vertices_xyz.shape[0])
         self.last_triangles = mesh_triangles.copy()
+        if args:
+            self.last_scene_graph_snapshot = args[0]
         return True
 
     def close(self) -> None:
@@ -333,6 +337,72 @@ class FakeSegmentationWorker:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeSceneGraphMemory:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def update(
+        self,
+        *,
+        frame_index: int,
+        detections,
+        segments,
+        depth_map,
+        intrinsics,
+        camera_pose_world,
+        slam_tracking_state: str,
+    ) -> SceneGraphSnapshot:
+        self.calls.append(
+            {
+                "frame_index": frame_index,
+                "detections": list(detections),
+                "segments": list(segments),
+                "slam_tracking_state": slam_tracking_state,
+            }
+        )
+        return SceneGraphSnapshot(
+            frame_index=frame_index,
+            camera_pose_world=np.asarray(camera_pose_world, dtype=np.float32),
+            nodes=(
+                GraphNode(
+                    id="ego",
+                    type="ego",
+                    label="camera",
+                    state="visible",
+                    confidence=1.0,
+                    world_centroid=np.zeros(3, dtype=np.float32),
+                    last_seen_frame=frame_index,
+                    last_seen_direction="front",
+                    source_track_id=None,
+                ),
+                GraphNode(
+                    id="obj_person_1",
+                    type="object",
+                    label="person",
+                    state="visible",
+                    confidence=0.88,
+                    world_centroid=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+                    last_seen_frame=frame_index,
+                    last_seen_direction="front",
+                    source_track_id=1,
+                ),
+            ),
+            edges=(
+                GraphEdge(
+                    source="ego",
+                    target="obj_person_1",
+                    relation="front",
+                    confidence=0.9,
+                    last_updated_frame=frame_index,
+                    distance_bucket="mid",
+                    source_kind="detection",
+                ),
+            ),
+            visible_node_ids=("ego", "obj_person_1"),
+            visible_edge_keys=(("ego", "obj_person_1", "front"),),
+        )
 
 
 class FakeOpenCamera:
@@ -1474,3 +1544,51 @@ def test_run_skips_segmentation_worker_when_mode_is_off() -> None:
         open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
         segmentation_worker_factory=lambda **_: (_ for _ in ()).throw(AssertionError("segmentation worker should not start")),
     )
+
+
+def test_run_updates_scene_graph_and_passes_snapshot_to_overlay_and_viewer() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        segmentation_mode="off",
+    )
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 20, dtype=np.uint8)])
+    viewer = FakeViewer()
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    scene_graph_memory = FakeSceneGraphMemory()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+        scene_graph_memory_factory=lambda **_: scene_graph_memory,
+    )
+
+    assert len(scene_graph_memory.calls) == 1
+    assert overlay_calls[-1]["scene_graph_snapshot"] is not None
+    assert len(overlay_calls[-1]["visible_graph_nodes"]) == 2
+    assert len(overlay_calls[-1]["visible_graph_edges"]) == 1
+    assert viewer.last_scene_graph_snapshot is not None
