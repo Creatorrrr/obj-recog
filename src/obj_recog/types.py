@@ -36,6 +36,20 @@ class SegmentationResult:
     segments: list[PanopticSegment]
 
 
+@dataclass(frozen=True, slots=True)
+class DepthDiagnostics:
+    calibration_source: str
+    profile: str
+    raw_percentiles: tuple[float, float, float]
+    normalizer_low_high: tuple[float, float]
+    normalized_distance_percentiles: tuple[float, float, float]
+    valid_depth_ratio: float
+    dense_z_span: float
+    mesh_z_span: float
+    intrinsics_summary: tuple[float, float, float, float]
+    hint: str
+
+
 @dataclass(slots=True)
 class FrameArtifacts:
     frame_bgr: np.ndarray
@@ -60,6 +74,7 @@ class FrameArtifacts:
     loop_closure_applied: bool
     segmentation_overlay_bgr: np.ndarray
     segments: list[PanopticSegment]
+    depth_diagnostics: DepthDiagnostics | None = None
     scene_graph_snapshot: SceneGraphSnapshot | None = None
     visible_graph_nodes: list[GraphNode] = field(default_factory=list)
     visible_graph_edges: list[GraphEdge] = field(default_factory=list)

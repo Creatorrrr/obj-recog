@@ -37,6 +37,13 @@ def test_parse_config_uses_expected_defaults() -> None:
     assert config.recalibrate is False
     assert config.disable_slam_calibration is False
     assert config.calibration_cache_dir is None
+    assert config.explanation_enabled is True
+    assert config.explanation_model == "gpt-5-mini"
+    assert config.explanation_timeout_sec == pytest.approx(8.0)
+    assert config.explanation_max_detections == 12
+    assert config.explanation_max_graph_nodes == 20
+    assert config.explanation_max_graph_edges == 20
+    assert config.depth_profile == "balanced"
 
 
 def test_parse_config_accepts_custom_values() -> None:
@@ -72,10 +79,16 @@ def test_parse_config_accepts_custom_values() -> None:
             "512",
             "--slam-height",
             "288",
+            "--depth-profile",
+            "depthy",
             "--recalibrate",
             "--disable-slam-calibration",
             "--calibration-cache-dir",
             "/tmp/calibration-cache",
+            "--explanation-mode",
+            "off",
+            "--explanation-model",
+            "gpt-4.1",
         ]
     )
 
@@ -95,9 +108,12 @@ def test_parse_config_accepts_custom_values() -> None:
     assert config.slam_vocabulary == "/tmp/ORBvoc.txt"
     assert config.slam_width == 512
     assert config.slam_height == 288
+    assert config.depth_profile == "depthy"
     assert config.recalibrate is True
     assert config.disable_slam_calibration is True
     assert config.calibration_cache_dir == "/tmp/calibration-cache"
+    assert config.explanation_enabled is False
+    assert config.explanation_model == "gpt-4.1"
     assert config.list_cameras is False
     assert config.orb_features == 1200
     assert config.max_map_points == 200_000
@@ -112,6 +128,9 @@ def test_parser_rejects_invalid_choices() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--segmentation-mode", "semantic"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--depth-profile", "extreme"])
 
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:

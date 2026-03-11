@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
+from obj_recog.opencv_runtime import load_cv2
 from obj_recog.scene_graph import SceneGraphSnapshot
-from obj_recog.types import Detection, PanopticSegment
+from obj_recog.situation_explainer import ExplanationStatus, wrap_explanation_text
+from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment
 
 
 def _display_points_for_view(points_xyz: np.ndarray) -> np.ndarray:
@@ -22,6 +26,190 @@ def _measure_text(cv2, text: str, font: int, scale: float, thickness: int) -> tu
         (width, height), _baseline = get_text_size(text, font, scale, thickness)
         return int(width), int(height)
     return max(1, int(round(len(text) * 7 * scale))), max(1, int(round(14 * scale)))
+
+
+def _draw_rectangle(cv2, canvas: np.ndarray, pt1: tuple[int, int], pt2: tuple[int, int], color, thickness: int) -> None:
+    rectangle = getattr(cv2, "rectangle", None)
+    if callable(rectangle):
+        rectangle(canvas, pt1, pt2, color, thickness)
+
+
+def _find_unicode_font_path() -> str | None:
+    candidates = [
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def render_multiline_unicode_text(
+    canvas: np.ndarray,
+    lines: list[str],
+    *,
+    origin: tuple[int, int],
+    line_height: int,
+    color: tuple[int, int, int],
+    font_size: int = 16,
+    image_module=None,
+    draw_module=None,
+    font_module=None,
+) -> np.ndarray:
+    if not lines:
+        return canvas
+
+    try:
+        if image_module is None or draw_module is None or font_module is None:
+            from PIL import Image as pil_image
+            from PIL import ImageDraw as pil_image_draw
+            from PIL import ImageFont as pil_image_font
+        else:
+            pil_image = image_module
+            pil_image_draw = draw_module
+            pil_image_font = font_module
+    except ImportError:
+        return canvas
+
+    font_path = _find_unicode_font_path()
+    if font_path is None:
+        return canvas
+
+    try:
+        font = pil_image_font.truetype(font_path, font_size)
+    except Exception:
+        return canvas
+
+    image = pil_image.fromarray(canvas[:, :, ::-1].copy())
+    draw = pil_image_draw.Draw(image)
+    x, y = origin
+    rgb_color = (int(color[2]), int(color[1]), int(color[0]))
+    for index, line in enumerate(lines):
+        draw.text((int(x), int(y + index * line_height)), str(line), fill=rgb_color, font=font)
+    rendered = np.asarray(image, dtype=np.uint8)
+    return rendered[:, :, ::-1].copy()
+
+
+def explanation_button_rect(
+    *,
+    frame_width: int,
+    frame_height: int,
+    button_width: int = 108,
+    button_height: int = 30,
+    margin: int = 12,
+) -> tuple[int, int, int, int]:
+    x2 = max(margin, int(frame_width) - margin)
+    y2 = max(margin, int(frame_height) - margin)
+    x1 = max(0, x2 - int(button_width))
+    y1 = max(0, y2 - int(button_height))
+    return x1, y1, x2, y2
+
+
+def point_in_rect(x: int, y: int, rect: tuple[int, int, int, int] | None) -> bool:
+    if rect is None:
+        return False
+    x1, y1, x2, y2 = rect
+    return x1 <= int(x) <= x2 and y1 <= int(y) <= y2
+
+
+def _draw_explanation_button(cv2, canvas: np.ndarray, *, status: str | None) -> None:
+    if status is None:
+        return
+
+    x1, y1, x2, y2 = explanation_button_rect(
+        frame_width=canvas.shape[1],
+        frame_height=canvas.shape[0],
+    )
+    if str(status) == ExplanationStatus.DISABLED:
+        fill = (60, 60, 60)
+        border = (120, 120, 120)
+        text_color = (190, 190, 190)
+    elif str(status) == ExplanationStatus.LOADING:
+        fill = (30, 95, 180)
+        border = (70, 140, 235)
+        text_color = (255, 255, 255)
+    elif str(status) == ExplanationStatus.READY:
+        fill = (40, 120, 60)
+        border = (90, 185, 110)
+        text_color = (255, 255, 255)
+    elif str(status) == ExplanationStatus.ERROR:
+        fill = (45, 45, 155)
+        border = (90, 90, 225)
+        text_color = (255, 255, 255)
+    else:
+        fill = (90, 65, 20)
+        border = (165, 130, 60)
+        text_color = (255, 255, 255)
+
+    _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), fill, -1)
+    _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), border, 1)
+
+    label = "Explain"
+    text_width, text_height = _measure_text(
+        cv2,
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        1,
+    )
+    text_x = max(x1 + 8, x1 + ((x2 - x1 - text_width) // 2))
+    text_y = y1 + ((y2 - y1 + text_height) // 2)
+    cv2.putText(
+        canvas,
+        label,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        text_color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def explanation_panel_scroll_button_rects(
+    *,
+    panel_width: int,
+    panel_height: int,
+    margin: int = 16,
+    button_width: int = 44,
+    button_height: int = 34,
+    top_y: int = 78,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    x2 = max(margin, int(panel_width) - margin)
+    x1 = max(0, x2 - int(button_width))
+    up_rect = (x1, int(top_y), x2, int(top_y) + int(button_height))
+    down_rect = (
+        x1,
+        max(int(top_y) + int(button_height) + margin, int(panel_height) - margin - int(button_height)),
+        x2,
+        max(int(top_y) + int(button_height) + margin, int(panel_height) - margin - int(button_height))
+        + int(button_height),
+    )
+    return up_rect, down_rect
+
+
+def _draw_panel_scroll_button(cv2, canvas: np.ndarray, rect: tuple[int, int, int, int], label: str) -> None:
+    x1, y1, x2, y2 = rect
+    _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), (45, 55, 75), -1)
+    _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), (100, 120, 165), 1)
+    text_width, text_height = _measure_text(cv2, label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    text_x = max(x1 + 6, x1 + ((x2 - x1 - text_width) // 2))
+    text_y = y1 + ((y2 - y1 + text_height) // 2)
+    cv2.putText(
+        canvas,
+        label,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (235, 240, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def _draw_segmentation_legend(cv2, canvas: np.ndarray, segments: list[PanopticSegment]) -> None:
@@ -54,7 +242,8 @@ def _draw_segmentation_legend(cv2, canvas: np.ndarray, segments: list[PanopticSe
         chip_y = y_top + max(0, (text_height - chip_size) // 2)
         chip_color_bgr = tuple(int(channel) for channel in segment.color_rgb[::-1])
 
-        cv2.rectangle(
+        _draw_rectangle(
+            cv2,
             canvas,
             (x_left, chip_y),
             (x_left + chip_size, chip_y + chip_size),
@@ -132,6 +321,9 @@ def _draw_runtime_status(
     graph_node_count: int | None = None,
     graph_edge_count: int | None = None,
     localized_node_count: int | None = None,
+    explanation_status: str | None = None,
+    depth_diagnostics: DepthDiagnostics | None = None,
+    depth_debug_level: str | None = None,
 ) -> None:
     if (
         slam_tracking_state is None
@@ -141,6 +333,8 @@ def _draw_runtime_status(
         and graph_node_count is None
         and graph_edge_count is None
         and localized_node_count is None
+        and explanation_status is None
+        and depth_diagnostics is None
     ):
         return
 
@@ -157,8 +351,34 @@ def _draw_runtime_status(
                 f"Localized {int(localized_node_count or 0)}",
             ]
         )
+    if explanation_status is not None:
+        lines.append(f"Explain: {explanation_status}")
+    if depth_diagnostics is not None and depth_debug_level in {"basic", "detailed"}:
+        p10, p50, p90 = depth_diagnostics.normalized_distance_percentiles
+        lines.extend(
+            [
+                f"Calib {depth_diagnostics.calibration_source}",
+                f"Depth {depth_diagnostics.profile}",
+                f"Dist {p10:.2f}/{p50:.2f}/{p90:.2f}m",
+                f"Mesh z {depth_diagnostics.mesh_z_span:.2f}m",
+                f"Hint {depth_diagnostics.hint}",
+            ]
+        )
+        if depth_debug_level == "detailed":
+            p05, raw_p50, p95 = depth_diagnostics.raw_percentiles
+            norm_low, norm_high = depth_diagnostics.normalizer_low_high
+            fx, fy, _cx, _cy = depth_diagnostics.intrinsics_summary
+            lines.extend(
+                [
+                    f"Raw {p05:.2f}/{raw_p50:.2f}/{p95:.2f}",
+                    f"Norm {norm_low:.2f}/{norm_high:.2f}",
+                    f"Dense/Mesh {depth_diagnostics.dense_z_span:.2f}/{depth_diagnostics.mesh_z_span:.2f}m",
+                    f"Valid {depth_diagnostics.valid_depth_ratio * 100.0:.1f}%",
+                    f"fx/fy {fx:.1f}/{fy:.1f}",
+                ]
+            )
     x = 12
-    y = max(20, canvas.shape[0] - 48)
+    y = max(20, canvas.shape[0] - 12 - ((len(lines) - 1) * 16))
     for index, line in enumerate(lines):
         cv2.putText(
             canvas,
@@ -193,6 +413,9 @@ def draw_detections(
     scene_graph_snapshot: SceneGraphSnapshot | None = None,
     visible_graph_nodes=None,
     visible_graph_edges=None,
+    explanation_status: str | None = None,
+    depth_diagnostics: DepthDiagnostics | None = None,
+    depth_debug_level: str | None = None,
 ) -> np.ndarray:
     import cv2
 
@@ -254,6 +477,9 @@ def draw_detections(
         graph_node_count=graph_node_count,
         graph_edge_count=graph_edge_count,
         localized_node_count=localized_node_count,
+        explanation_status=explanation_status,
+        depth_diagnostics=depth_diagnostics,
+        depth_debug_level=depth_debug_level,
     )
 
     if segments:
@@ -265,7 +491,136 @@ def draw_detections(
         visible_graph_nodes=graph_nodes,
         visible_graph_edges=graph_edges,
     )
+    _draw_explanation_button(cv2, canvas, status=explanation_status)
     return canvas
+
+
+def render_explanation_panel(
+    *,
+    status: str,
+    text: str,
+    model: str,
+    latency_ms: float | None,
+    timestamp_label: str,
+    width: int = 960,
+    height: int = 360,
+    scroll_offset: int = 0,
+    cv2_module=None,
+    unicode_text_renderer=render_multiline_unicode_text,
+    return_metadata: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, object]]:
+    cv2 = load_cv2(cv2_module)
+
+    canvas = np.zeros((max(320, height), max(720, width), 3), dtype=np.uint8)
+    header_lines = [
+        f"Status: {str(status).upper()} | {timestamp_label}",
+        f"Model: {model}",
+        f"Latency: {'-' if latency_ms is None else int(round(latency_ms))}ms",
+    ]
+    reserved_scroll_width = 84
+    wrap_width = max(56, int((canvas.shape[1] - reserved_scroll_width) / 13))
+    body_lines = wrap_explanation_text(text, width=wrap_width, max_lines=None)
+    if not body_lines:
+        if str(status) == ExplanationStatus.DISABLED:
+            body_lines = ["OPENAI_API_KEY가 없어 상황 설명 기능이 비활성화되었습니다."]
+        elif str(status) == ExplanationStatus.LOADING:
+            body_lines = ["현재 장면 설명을 생성하는 중입니다."]
+        elif str(status) == ExplanationStatus.CAPTURING:
+            body_lines = ["현재 프레임 스냅샷을 고정하는 중입니다."]
+        elif str(status) == ExplanationStatus.ERROR:
+            body_lines = ["설명 생성 중 오류가 발생했습니다."]
+        elif str(status) == ExplanationStatus.READY:
+            body_lines = ["모델이 비어 있는 설명을 반환했습니다. 다시 시도해 주세요."]
+        else:
+            body_lines = ["우하단 Explain 버튼을 클릭하거나 e 키를 눌러 현재 상황 설명을 요청하세요."]
+
+    y = 28
+    for line in header_lines:
+        cv2.putText(
+            canvas,
+            line,
+            (16, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (210, 230, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 20
+    y += 12
+
+    body_left = 16
+    body_top = y - 12
+    line_height = 22
+    body_bottom = canvas.shape[0] - 20
+    visible_line_count = max(4, int((body_bottom - body_top) // line_height))
+    max_scroll_offset = max(0, len(body_lines) - visible_line_count)
+    used_scroll_offset = min(max(0, int(scroll_offset)), max_scroll_offset)
+    visible_lines = body_lines[used_scroll_offset : used_scroll_offset + visible_line_count]
+
+    up_rect, down_rect = explanation_panel_scroll_button_rects(
+        panel_width=canvas.shape[1],
+        panel_height=canvas.shape[0],
+    )
+    if max_scroll_offset > 0:
+        _draw_panel_scroll_button(cv2, canvas, up_rect, "UP")
+        _draw_panel_scroll_button(cv2, canvas, down_rect, "DN")
+        scroll_text = (
+            f"Lines {used_scroll_offset + 1}-{used_scroll_offset + len(visible_lines)}/{len(body_lines)}"
+        )
+        cv2.putText(
+            canvas,
+            scroll_text,
+            (16, min(canvas.shape[0] - 10, body_bottom + 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (170, 185, 210),
+            1,
+            cv2.LINE_AA,
+        )
+    else:
+        up_rect = None
+        down_rect = None
+
+    body_origin = (body_left, body_top)
+    rendered = unicode_text_renderer(
+        canvas,
+        visible_lines,
+        origin=body_origin,
+        line_height=line_height,
+        color=(245, 245, 245),
+    )
+    if rendered is canvas:
+        for line in visible_lines:
+            cv2.putText(
+                canvas,
+                line,
+                (body_left, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (245, 245, 245),
+                1,
+                cv2.LINE_AA,
+            )
+            y += line_height
+        if return_metadata:
+            return canvas, {
+                "scroll_offset": used_scroll_offset,
+                "max_scroll_offset": max_scroll_offset,
+                "visible_line_count": visible_line_count,
+                "up_rect": up_rect,
+                "down_rect": down_rect,
+            }
+        return canvas
+    if return_metadata:
+        return rendered, {
+            "scroll_offset": used_scroll_offset,
+            "max_scroll_offset": max_scroll_offset,
+            "visible_line_count": visible_line_count,
+            "up_rect": up_rect,
+            "down_rect": down_rect,
+        }
+    return rendered
 
 
 def highlight_detected_points(

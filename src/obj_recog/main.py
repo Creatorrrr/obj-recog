@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import os
 import time
 from pathlib import Path
 import sys
@@ -10,7 +11,7 @@ import numpy as np
 from obj_recog.auto_calibration import close_calibration_window, ensure_runtime_calibration
 from obj_recog.calibration import CalibrationResult, intrinsics_from_calibration, load_orbslam3_settings
 from obj_recog.camera import CameraSession, list_available_cameras, open_camera, read_camera_frame
-from obj_recog.config import AppConfig, parse_config, resolve_device
+from obj_recog.config import AppConfig, parse_config, resolve_depth_profile, resolve_device
 from obj_recog.depth import DepthEstimator
 from obj_recog.detector import ObjectDetector
 from obj_recog.mapping import LocalMapBuilder, TsdfMeshMapBuilder
@@ -19,11 +20,21 @@ from obj_recog.reconstruct import depth_to_point_cloud, intrinsics_for_frame
 from obj_recog.scene_graph import SceneGraphMemory
 from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
 from obj_recog.slam_bridge import OrbSlam3Bridge, SlamFrameResult
+from obj_recog.situation_explainer import (
+    ExplanationResult,
+    ExplanationStatus,
+    OpenAISituationExplainer,
+    SituationExplanationWorker,
+    build_explanation_snapshot,
+)
 from obj_recog.tracking import PoseTracker
-from obj_recog.types import Detection, FrameArtifacts, SegmentationResult
+from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, SegmentationResult
 from obj_recog.visualization import (
     Open3DMeshViewer,
     draw_detections,
+    explanation_button_rect,
+    point_in_rect,
+    render_explanation_panel,
 )
 
 
@@ -143,6 +154,7 @@ def process_frame(
     timestamp_sec: float | None,
     cached_detections: list[Detection],
     calibration: CalibrationResult | None = None,
+    calibration_source: str = "disabled/approx",
     *,
     slam_bridge=None,
     tracker=None,
@@ -173,6 +185,7 @@ def process_frame(
         )
     else:
         intrinsics = intrinsics_for_frame(frame_bgr.shape[1], frame_bgr.shape[0])
+    depth_profile = resolve_depth_profile(config.depth_profile)
     if getattr(map_builder, "requires_point_cloud", True):
         points_xyz, point_colors, _point_pixels = depth_to_point_cloud(
             frame_bgr=frame_bgr,
@@ -180,6 +193,7 @@ def process_frame(
             intrinsics=intrinsics,
             stride=config.point_stride,
             max_points=config.max_points,
+            max_depth=depth_profile.max_depth,
         )
         map_point_colors = point_colors
     else:
@@ -223,6 +237,94 @@ def process_frame(
         getattr(map_update, "mesh_vertex_colors", getattr(map_update, "dense_map_points_rgb", np.empty((0, 3), dtype=np.float32))),
         dtype=np.float32,
     ).reshape(-1, 3)
+    dense_map_points_xyz = np.asarray(
+        getattr(map_update, "dense_map_points_xyz", mesh_vertices_xyz),
+        dtype=np.float32,
+    ).reshape(-1, 3)
+    dense_map_points_rgb = np.asarray(
+        getattr(map_update, "dense_map_points_rgb", mesh_vertex_colors),
+        dtype=np.float32,
+    ).reshape(-1, 3)
+    dense_z_span = _camera_space_z_span(dense_map_points_xyz, camera_pose_world)
+    mesh_z_span = _camera_space_z_span(mesh_vertices_xyz, camera_pose_world)
+
+    last_diagnostics_getter = getattr(depth_estimator, "last_diagnostics", None)
+    depth_diagnostics = last_diagnostics_getter() if callable(last_diagnostics_getter) else None
+    if depth_diagnostics is None:
+        valid = np.isfinite(depth_map) & (depth_map > 0.05)
+        if np.any(valid):
+            values = depth_map[valid]
+            raw_percentiles = (
+                float(np.percentile(values, 5.0)),
+                float(np.percentile(values, 50.0)),
+                float(np.percentile(values, 95.0)),
+            )
+            normalized_distance_percentiles = (
+                float(np.percentile(values, 10.0)),
+                float(np.percentile(values, 50.0)),
+                float(np.percentile(values, 90.0)),
+            )
+            normalizer_low_high = (
+                float(np.percentile(values, depth_profile.low_percentile)),
+                float(np.percentile(values, depth_profile.high_percentile)),
+            )
+            valid_depth_ratio = float(valid.mean())
+        else:
+            raw_percentiles = (0.0, 0.0, 0.0)
+            normalized_distance_percentiles = (
+                depth_profile.min_depth,
+                depth_profile.min_depth,
+                depth_profile.min_depth,
+            )
+            normalizer_low_high = (0.0, 0.0)
+            valid_depth_ratio = 0.0
+        depth_diagnostics = DepthDiagnostics(
+            calibration_source=calibration_source,
+            profile=depth_profile.name,
+            raw_percentiles=raw_percentiles,
+            normalizer_low_high=normalizer_low_high,
+            normalized_distance_percentiles=normalized_distance_percentiles,
+            valid_depth_ratio=valid_depth_ratio,
+            dense_z_span=dense_z_span,
+            mesh_z_span=mesh_z_span,
+            intrinsics_summary=(
+                float(intrinsics.fx),
+                float(intrinsics.fy),
+                float(intrinsics.cx),
+                float(intrinsics.cy),
+            ),
+            hint=_depth_hint(
+                calibration_source=calibration_source,
+                profile=depth_profile.name,
+                normalized_distance_percentiles=normalized_distance_percentiles,
+                dense_z_span=dense_z_span,
+                mesh_z_span=mesh_z_span,
+            ),
+        )
+    else:
+        depth_diagnostics = DepthDiagnostics(
+            calibration_source=calibration_source,
+            profile=depth_diagnostics.profile,
+            raw_percentiles=depth_diagnostics.raw_percentiles,
+            normalizer_low_high=depth_diagnostics.normalizer_low_high,
+            normalized_distance_percentiles=depth_diagnostics.normalized_distance_percentiles,
+            valid_depth_ratio=depth_diagnostics.valid_depth_ratio,
+            dense_z_span=dense_z_span,
+            mesh_z_span=mesh_z_span,
+            intrinsics_summary=(
+                float(intrinsics.fx),
+                float(intrinsics.fy),
+                float(intrinsics.cx),
+                float(intrinsics.cy),
+            ),
+            hint=_depth_hint(
+                calibration_source=calibration_source,
+                profile=depth_diagnostics.profile,
+                normalized_distance_percentiles=depth_diagnostics.normalized_distance_percentiles,
+                dense_z_span=dense_z_span,
+                mesh_z_span=mesh_z_span,
+            ),
+        )
 
     artifacts = FrameArtifacts(
         frame_bgr=frame_bgr,
@@ -231,14 +333,8 @@ def process_frame(
         depth_map=depth_map,
         points_xyz=mesh_vertices_xyz,
         points_rgb=mesh_vertex_colors,
-        dense_map_points_xyz=np.asarray(
-            getattr(map_update, "dense_map_points_xyz", mesh_vertices_xyz),
-            dtype=np.float32,
-        ).reshape(-1, 3),
-        dense_map_points_rgb=np.asarray(
-            getattr(map_update, "dense_map_points_rgb", mesh_vertex_colors),
-            dtype=np.float32,
-        ).reshape(-1, 3),
+        dense_map_points_xyz=dense_map_points_xyz,
+        dense_map_points_rgb=dense_map_points_rgb,
         mesh_vertices_xyz=mesh_vertices_xyz,
         mesh_triangles=mesh_triangles,
         mesh_vertex_colors=mesh_vertex_colors,
@@ -253,6 +349,7 @@ def process_frame(
         loop_closure_applied=bool(getattr(map_update, "loop_closure_applied", slam_result.loop_closure_applied)),
         segmentation_overlay_bgr=np.zeros_like(frame_bgr),
         segments=[],
+        depth_diagnostics=depth_diagnostics,
     )
     return artifacts, list(detections)
 
@@ -279,6 +376,75 @@ def _show_runtime_loading_preview(cv2_module, width: int, height: int, message: 
     cv2_module.waitKey(1)
 
 
+def _camera_space_z_span(points_xyz: np.ndarray, camera_pose_world: np.ndarray) -> float:
+    points_xyz = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+    if points_xyz.size == 0:
+        return 0.0
+    pose_inv = np.linalg.inv(np.asarray(camera_pose_world, dtype=np.float32))
+    homogeneous = np.concatenate(
+        (points_xyz, np.ones((points_xyz.shape[0], 1), dtype=np.float32)),
+        axis=1,
+    )
+    camera_points = (pose_inv @ homogeneous.T).T[:, :3]
+    camera_z = camera_points[:, 2]
+    valid = np.isfinite(camera_z) & (camera_z > 1e-4)
+    if not np.any(valid):
+        return 0.0
+    z_values = camera_z[valid]
+    if z_values.size == 1:
+        return float(z_values[0])
+    return float(np.percentile(z_values, 90.0) - np.percentile(z_values, 10.0))
+
+
+def _depth_hint(
+    *,
+    calibration_source: str,
+    profile: str,
+    normalized_distance_percentiles: tuple[float, float, float],
+    dense_z_span: float,
+    mesh_z_span: float,
+) -> str:
+    if calibration_source == "disabled/approx":
+        return "approx intrinsics in use"
+    if dense_z_span > 0.0 and mesh_z_span > 0.0 and mesh_z_span < (dense_z_span * 0.6) and profile == "fast":
+        return "mesh simplification likely flattening"
+    spread = float(normalized_distance_percentiles[2] - normalized_distance_percentiles[0])
+    if spread < 1.8:
+        return "depth normalization compression likely"
+    return "monocular pseudo-depth scale limited"
+
+
+def _normalize_calibration_source(raw_source: str | None) -> str:
+    source = str(raw_source or "").strip().lower()
+    if source == "explicit":
+        return "explicit"
+    if source in {"auto", "cache"}:
+        return "auto"
+    return "disabled/approx"
+
+
+def _load_app_dotenv() -> None:
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:  # pragma: no cover - dependency is optional at import time.
+        dotenv_path = Path.cwd() / ".env"
+        if not dotenv_path.is_file():
+            return
+        for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        return
+
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=False)
+    else:
+        load_dotenv(override=False)
+
+
 def run(
     config: AppConfig,
     *,
@@ -290,24 +456,117 @@ def run(
     slam_bridge_factory=None,
     segmenter_factory=PanopticSegmenter,
     segmentation_worker_factory=SegmentationWorker,
+    situation_explainer_factory=None,
+    explanation_worker_factory=SituationExplanationWorker,
     viewer_factory=Open3DMeshViewer,
     open_camera_fn=open_camera,
     camera_lister=list_available_cameras,
     runtime_calibration_resolver=ensure_runtime_calibration,
     overlay_renderer=draw_detections,
+    explanation_snapshot_builder=build_explanation_snapshot,
+    explanation_panel_renderer=render_explanation_panel,
     scene_graph_memory_factory=SceneGraphMemory,
     time_source=time.perf_counter,
     debug_log=_default_debug_log,
 ) -> None:
     cv2 = load_cv2(cv2_module)
+    _load_app_dotenv()
     effective_device = resolve_device(config.device)
+    depth_profile = resolve_depth_profile(config.depth_profile)
     camera_session: CameraSession | None = None
     viewer = None
     slam_bridge = None
     segmentation_worker = None
+    explanation_worker = None
     scene_graph_memory = None
     calibration = None
     runtime_settings_path = config.camera_calibration
+    explanation_status = (
+        ExplanationStatus.IDLE if config.explanation_enabled else None
+    )
+    explanation_result = ExplanationResult(
+        text="",
+        status=ExplanationStatus.IDLE,
+        latency_ms=None,
+        model=config.explanation_model,
+        error_message=None,
+    )
+    explanation_snapshot_id = 0
+    latest_explanation_request_id: int | None = None
+    latest_explanation_timestamp = "-"
+    explanation_button_state = {
+        "pending_click": False,
+        "rect": None,
+    }
+    explanation_panel_state = {
+        "scroll_offset": 0,
+        "pending_scroll": 0,
+        "up_rect": None,
+        "down_rect": None,
+    }
+    explanation_mouse_callback_registered = False
+    explanation_panel_mouse_callback_registered = False
+    depth_debug_level = "basic"
+    calibration_source = "disabled/approx"
+
+    def _handle_object_window_mouse(event, x, y, _flags, _param) -> None:
+        if event != getattr(cv2, "EVENT_LBUTTONDOWN", None):
+            return
+        if point_in_rect(int(x), int(y), explanation_button_state.get("rect")):
+            explanation_button_state["pending_click"] = True
+
+    def _handle_explanation_window_mouse(event, x, y, _flags, _param) -> None:
+        if event == getattr(cv2, "EVENT_LBUTTONDOWN", None):
+            if point_in_rect(int(x), int(y), explanation_panel_state.get("up_rect")):
+                explanation_panel_state["pending_scroll"] = int(explanation_panel_state["pending_scroll"]) - 1
+            elif point_in_rect(int(x), int(y), explanation_panel_state.get("down_rect")):
+                explanation_panel_state["pending_scroll"] = int(explanation_panel_state["pending_scroll"]) + 1
+            return
+        if event == getattr(cv2, "EVENT_MOUSEWHEEL", None):
+            get_mouse_wheel_delta = getattr(cv2, "getMouseWheelDelta", None)
+            try:
+                delta = int(get_mouse_wheel_delta(_flags)) if callable(get_mouse_wheel_delta) else int(_flags)
+            except Exception:
+                delta = 0
+            if delta == 0:
+                return
+            step_count = max(1, abs(int(delta)) // 120) if abs(int(delta)) >= 120 else 1
+            direction = -1 if delta > 0 else 1
+            explanation_panel_state["pending_scroll"] = int(explanation_panel_state["pending_scroll"]) + (
+                direction * step_count
+            )
+
+    def _submit_explanation_request(artifacts: FrameArtifacts) -> None:
+        nonlocal explanation_snapshot_id
+        nonlocal latest_explanation_request_id
+        nonlocal latest_explanation_timestamp
+        nonlocal explanation_status
+        nonlocal explanation_result
+        if not config.explanation_enabled or explanation_worker is None:
+            return
+        explanation_status = ExplanationStatus.CAPTURING
+        explanation_snapshot_id += 1
+        latest_explanation_request_id = explanation_snapshot_id
+        latest_explanation_timestamp = time.strftime("%H:%M:%S")
+        snapshot = explanation_snapshot_builder(
+            artifacts,
+            snapshot_id=explanation_snapshot_id,
+            max_detections=config.explanation_max_detections,
+            max_graph_nodes=config.explanation_max_graph_nodes,
+            max_graph_edges=config.explanation_max_graph_edges,
+            timestamp_label=latest_explanation_timestamp,
+        )
+        explanation_worker.submit(snapshot.snapshot_id, snapshot)
+        explanation_status = ExplanationStatus.LOADING
+        explanation_result = ExplanationResult(
+            text="",
+            status=ExplanationStatus.LOADING,
+            latency_ms=None,
+            model=config.explanation_model,
+            error_message=None,
+        )
+        explanation_panel_state["scroll_offset"] = 0
+        explanation_panel_state["pending_scroll"] = 0
 
     if config.list_cameras:
         for device in camera_lister():
@@ -349,6 +608,7 @@ def run(
             )
             calibration = runtime_calibration.calibration
             runtime_settings_path = runtime_calibration.settings_path
+            calibration_source = _normalize_calibration_source(getattr(runtime_calibration, "source", None))
             debug_log(
                 f"runtime calibration ready (source={runtime_calibration.source}, settings={runtime_settings_path})"
             )
@@ -364,7 +624,18 @@ def run(
         detector = detector_factory(conf_threshold=config.conf_threshold, device=effective_device)
         debug_log("detector init done")
         debug_log("depth init start")
-        depth_estimator = depth_estimator_factory(device=effective_device)
+        try:
+            depth_estimator = depth_estimator_factory(
+                device=effective_device,
+                profile=depth_profile.name,
+                low_percentile=depth_profile.low_percentile,
+                high_percentile=depth_profile.high_percentile,
+                min_depth=depth_profile.min_depth,
+                max_depth=depth_profile.max_depth,
+                gamma=depth_profile.gamma,
+            )
+        except TypeError:
+            depth_estimator = depth_estimator_factory(device=effective_device)
         debug_log("depth init done")
         if config.segmentation_mode != "off":
             try:
@@ -378,6 +649,32 @@ def run(
                 debug_log("segmentation init done")
             except Exception as exc:
                 debug_log(f"segmentation disabled ({exc})")
+        if config.explanation_enabled:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                explanation_status = ExplanationStatus.DISABLED
+            else:
+                try:
+                    debug_log("explanation init start")
+                    explainer_factory = situation_explainer_factory or OpenAISituationExplainer
+                    explainer = explainer_factory(
+                        model=config.explanation_model,
+                        timeout_sec=config.explanation_timeout_sec,
+                        api_key=api_key,
+                        cv2_module=cv2,
+                    )
+                    explanation_worker = explanation_worker_factory(explainer=explainer)
+                    debug_log("explanation init done")
+                except Exception as exc:
+                    explanation_status = ExplanationStatus.ERROR
+                    explanation_result = ExplanationResult(
+                        text="",
+                        status=ExplanationStatus.ERROR,
+                        latency_ms=None,
+                        model=config.explanation_model,
+                        error_message=str(exc),
+                    )
+                    debug_log(f"explanation disabled ({exc})")
         tracker = None
         if use_slam_bridge:
             slam_bridge = getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
@@ -393,8 +690,10 @@ def run(
                 debug_log("reusing promoted SLAM bridge from calibration")
             map_builder = map_builder_factory(
                 window_keyframes=config.mapping_window_keyframes,
-                voxel_size=config.map_voxel_size,
-                max_mesh_triangles=config.max_mesh_triangles,
+                voxel_size=depth_profile.voxel_size,
+                max_mesh_triangles=depth_profile.max_mesh_triangles,
+                depth_trunc=depth_profile.max_depth,
+                depth_sampling_stride=depth_profile.depth_sampling_stride,
             )
         else:
             tracker = tracker_factory(orb_features=config.orb_features)
@@ -442,6 +741,9 @@ def run(
                         )
                         calibration = runtime_calibration.calibration
                         runtime_settings_path = runtime_calibration.settings_path
+                        calibration_source = _normalize_calibration_source(
+                            getattr(runtime_calibration, "source", None)
+                        )
                         slam_bridge.close()
                         slam_bridge = getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
                         if slam_bridge is None:
@@ -453,7 +755,22 @@ def run(
                             )
                         slam_time_origin = time_source()
                     map_builder.reset()
-                    cached_detections = []
+                cached_detections = []
+                latest_explanation_request_id = None
+                explanation_button_state["pending_click"] = False
+                if config.explanation_enabled:
+                    explanation_result = ExplanationResult(
+                        text="",
+                        status=ExplanationStatus.IDLE,
+                        latency_ms=None,
+                        model=config.explanation_model,
+                        error_message=None,
+                    )
+                    explanation_status = (
+                        ExplanationStatus.DISABLED
+                        if explanation_status == ExplanationStatus.DISABLED
+                        else ExplanationStatus.IDLE
+                    )
                     continue
                 break
 
@@ -470,6 +787,7 @@ def run(
                 timestamp_sec=frame_timestamp_sec,
                 cached_detections=cached_detections,
                 calibration=calibration,
+                calibration_source=calibration_source,
                 cv2_module=cv2,
             )
             if frame_index == 0:
@@ -517,6 +835,29 @@ def run(
                             artifacts.points_rgb = artifacts.mesh_vertex_colors
                             artifacts.dense_map_points_xyz = artifacts.mesh_vertices_xyz
                             artifacts.dense_map_points_rgb = artifacts.mesh_vertex_colors
+                            if artifacts.depth_diagnostics is not None:
+                                mesh_z_span = _camera_space_z_span(
+                                    artifacts.mesh_vertices_xyz,
+                                    artifacts.camera_pose_world,
+                                )
+                                artifacts.depth_diagnostics = DepthDiagnostics(
+                                    calibration_source=artifacts.depth_diagnostics.calibration_source,
+                                    profile=artifacts.depth_diagnostics.profile,
+                                    raw_percentiles=artifacts.depth_diagnostics.raw_percentiles,
+                                    normalizer_low_high=artifacts.depth_diagnostics.normalizer_low_high,
+                                    normalized_distance_percentiles=artifacts.depth_diagnostics.normalized_distance_percentiles,
+                                    valid_depth_ratio=artifacts.depth_diagnostics.valid_depth_ratio,
+                                    dense_z_span=artifacts.depth_diagnostics.dense_z_span,
+                                    mesh_z_span=mesh_z_span,
+                                    intrinsics_summary=artifacts.depth_diagnostics.intrinsics_summary,
+                                    hint=_depth_hint(
+                                        calibration_source=artifacts.depth_diagnostics.calibration_source,
+                                        profile=artifacts.depth_diagnostics.profile,
+                                        normalized_distance_percentiles=artifacts.depth_diagnostics.normalized_distance_percentiles,
+                                        dense_z_span=artifacts.depth_diagnostics.dense_z_span,
+                                        mesh_z_span=mesh_z_span,
+                                    ),
+                                )
 
             if cached_segmentation is not None:
                 artifacts.segmentation_overlay_bgr = cached_segmentation.overlay_bgr
@@ -547,6 +888,16 @@ def run(
                 artifacts.visible_graph_nodes = list(scene_graph_snapshot.visible_nodes)
                 artifacts.visible_graph_edges = list(scene_graph_snapshot.visible_edges)
 
+            if explanation_worker is not None:
+                explanation_poll_result = explanation_worker.poll()
+                if explanation_poll_result is not None:
+                    result_snapshot_id, result = explanation_poll_result
+                    if latest_explanation_request_id is not None and result_snapshot_id == latest_explanation_request_id:
+                        explanation_result = result
+                        explanation_status = result.status
+                        explanation_panel_state["scroll_offset"] = 0
+                        explanation_panel_state["pending_scroll"] = 0
+
             now = time_source()
             fps = 1.0 / max(now - last_frame_time, 1e-6)
             last_frame_time = now
@@ -565,8 +916,71 @@ def run(
                 scene_graph_snapshot=artifacts.scene_graph_snapshot,
                 visible_graph_nodes=artifacts.visible_graph_nodes,
                 visible_graph_edges=artifacts.visible_graph_edges,
+                explanation_status=str(explanation_status) if explanation_status is not None else None,
+                depth_diagnostics=artifacts.depth_diagnostics,
+                depth_debug_level=depth_debug_level,
             )
             cv2.imshow("Object Recognition", overlay)
+            explanation_button_state["rect"] = (
+                explanation_button_rect(
+                    frame_width=overlay.shape[1],
+                    frame_height=overlay.shape[0],
+                )
+                if config.explanation_enabled
+                else None
+            )
+            if (
+                config.explanation_enabled
+                and not explanation_mouse_callback_registered
+                and callable(getattr(cv2, "setMouseCallback", None))
+            ):
+                cv2.setMouseCallback("Object Recognition", _handle_object_window_mouse)
+                explanation_mouse_callback_registered = True
+            if config.explanation_enabled:
+                if int(explanation_panel_state["pending_scroll"]) != 0:
+                    explanation_panel_state["scroll_offset"] = max(
+                        0,
+                        int(explanation_panel_state["scroll_offset"]) + int(explanation_panel_state["pending_scroll"]),
+                    )
+                    explanation_panel_state["pending_scroll"] = 0
+                try:
+                    panel_render_result = explanation_panel_renderer(
+                        status=str(explanation_status or ExplanationStatus.IDLE),
+                        text=explanation_result.text or (explanation_result.error_message or ""),
+                        model=explanation_result.model or config.explanation_model,
+                        latency_ms=explanation_result.latency_ms,
+                        timestamp_label=latest_explanation_timestamp,
+                        scroll_offset=int(explanation_panel_state["scroll_offset"]),
+                        cv2_module=cv2,
+                        return_metadata=True,
+                    )
+                except TypeError:
+                    panel_render_result = explanation_panel_renderer(
+                        status=str(explanation_status or ExplanationStatus.IDLE),
+                        text=explanation_result.text or (explanation_result.error_message or ""),
+                        model=explanation_result.model or config.explanation_model,
+                        latency_ms=explanation_result.latency_ms,
+                        timestamp_label=latest_explanation_timestamp,
+                        cv2_module=cv2,
+                    )
+                if isinstance(panel_render_result, tuple):
+                    panel, panel_metadata = panel_render_result
+                    explanation_panel_state["scroll_offset"] = int(
+                        panel_metadata.get("scroll_offset", explanation_panel_state["scroll_offset"])
+                    )
+                    explanation_panel_state["up_rect"] = panel_metadata.get("up_rect")
+                    explanation_panel_state["down_rect"] = panel_metadata.get("down_rect")
+                else:
+                    panel = panel_render_result
+                    explanation_panel_state["up_rect"] = None
+                    explanation_panel_state["down_rect"] = None
+                cv2.imshow("Situation Explanation", panel)
+                if (
+                    not explanation_panel_mouse_callback_registered
+                    and callable(getattr(cv2, "setMouseCallback", None))
+                ):
+                    cv2.setMouseCallback("Situation Explanation", _handle_explanation_window_mouse)
+                    explanation_panel_mouse_callback_registered = True
             viewer_active = _update_viewer(viewer, artifacts)
             key = cv2.waitKey(1) & 0xFF
             window_visible = window_is_visible(cv2, "Object Recognition")
@@ -588,8 +1002,41 @@ def run(
                 map_builder.reset()
                 cached_detections = []
                 cached_segmentation = None
+                latest_explanation_request_id = None
+                if config.explanation_enabled:
+                    explanation_result = ExplanationResult(
+                        text="",
+                        status=ExplanationStatus.IDLE,
+                        latency_ms=None,
+                        model=config.explanation_model,
+                        error_message=None,
+                    )
+                    explanation_status = (
+                        ExplanationStatus.DISABLED
+                        if explanation_status == ExplanationStatus.DISABLED
+                        else ExplanationStatus.IDLE
+                    )
+                explanation_panel_state["scroll_offset"] = 0
+                explanation_panel_state["pending_scroll"] = 0
+                explanation_panel_state["up_rect"] = None
+                explanation_panel_state["down_rect"] = None
+                explanation_button_state["pending_click"] = False
                 frame_index += 1
                 continue
+
+            if key == ord("d"):
+                depth_debug_level = {
+                    "off": "basic",
+                    "basic": "detailed",
+                    "detailed": "off",
+                }[depth_debug_level]
+
+            if explanation_button_state["pending_click"]:
+                explanation_button_state["pending_click"] = False
+                _submit_explanation_request(artifacts)
+
+            if key == ord("e"):
+                _submit_explanation_request(artifacts)
 
             if key == ord("q") or not viewer_active or window_closed:
                 break
@@ -602,6 +1049,8 @@ def run(
             slam_bridge.close()
         if segmentation_worker is not None:
             segmentation_worker.close()
+        if explanation_worker is not None:
+            explanation_worker.close()
         if viewer is not None:
             viewer.close()
         cv2.destroyAllWindows()
@@ -612,6 +1061,8 @@ def main() -> None:
         parse_config(),
         slam_bridge_factory=OrbSlam3Bridge,
         map_builder_factory=TsdfMeshMapBuilder,
+        situation_explainer_factory=OpenAISituationExplainer,
+        explanation_worker_factory=SituationExplanationWorker,
     )
 
 

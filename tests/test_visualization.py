@@ -3,12 +3,15 @@ from __future__ import annotations
 import numpy as np
 
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
-from obj_recog.types import Detection, PanopticSegment
+from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment
 from obj_recog.visualization import (
     Open3DMeshViewer,
     _display_points_for_view,
     draw_detections,
+    explanation_button_rect,
     highlight_detected_points,
+    render_multiline_unicode_text,
+    render_explanation_panel,
 )
 
 
@@ -237,6 +240,169 @@ def test_draw_detections_renders_small_runtime_status_lines() -> None:
         "KF 7",
         "Mesh 123t / 88v",
     ]
+
+
+def test_draw_detections_renders_explanation_status_line() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((24, 24, 3), dtype=np.uint8)
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=7,
+            mesh_triangle_count=123,
+            mesh_vertex_count=88,
+            explanation_status="ready",
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert "Explain: ready" in fake_cv2.text_calls
+    assert "Explain" in fake_cv2.text_calls
+
+
+def test_draw_detections_renders_depth_debug_overlay_lines() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((24, 24, 3), dtype=np.uint8)
+        diagnostics = DepthDiagnostics(
+            calibration_source="explicit",
+            profile="balanced",
+            raw_percentiles=(0.2, 0.8, 1.4),
+            normalizer_low_high=(0.1, 1.6),
+            normalized_distance_percentiles=(1.2, 2.1, 4.4),
+            valid_depth_ratio=0.92,
+            dense_z_span=2.4,
+            mesh_z_span=1.7,
+            intrinsics_summary=(575.0, 575.0, 320.0, 180.0),
+            hint="depth normalization compression likely",
+        )
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=7,
+            mesh_triangle_count=123,
+            mesh_vertex_count=88,
+            depth_diagnostics=diagnostics,
+            depth_debug_level="basic",
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert "Calib explicit" in fake_cv2.text_calls
+    assert "Depth balanced" in fake_cv2.text_calls
+    assert "Dist 1.20/2.10/4.40m" in fake_cv2.text_calls
+    assert "Mesh z 1.70m" in fake_cv2.text_calls
+    assert "Hint depth normalization compression likely" in fake_cv2.text_calls
+
+
+def test_draw_detections_renders_detailed_depth_debug_lines() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((24, 24, 3), dtype=np.uint8)
+        diagnostics = DepthDiagnostics(
+            calibration_source="disabled/approx",
+            profile="depthy",
+            raw_percentiles=(0.1, 0.7, 1.8),
+            normalizer_low_high=(0.05, 1.9),
+            normalized_distance_percentiles=(1.0, 2.9, 5.4),
+            valid_depth_ratio=0.85,
+            dense_z_span=3.2,
+            mesh_z_span=2.2,
+            intrinsics_summary=(520.0, 518.0, 320.0, 180.0),
+            hint="approx intrinsics in use",
+        )
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            depth_diagnostics=diagnostics,
+            depth_debug_level="detailed",
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert "Raw 0.10/0.70/1.80" in fake_cv2.text_calls
+    assert "Norm 0.05/1.90" in fake_cv2.text_calls
+    assert "Dense/Mesh 3.20/2.20m" in fake_cv2.text_calls
+    assert "Valid 85.0%" in fake_cv2.text_calls
+    assert "fx/fy 520.0/518.0" in fake_cv2.text_calls
+
+
+def test_explanation_button_rect_is_bottom_right() -> None:
+    rect = explanation_button_rect(frame_width=640, frame_height=480)
+
+    assert rect[0] > 640 // 2
+    assert rect[1] > 480 // 2
+    assert rect[2] == 640 - 12
+    assert rect[3] == 480 - 12
 
 
 def test_draw_detections_blends_segmentation_overlay_before_boxes() -> None:
@@ -547,6 +713,209 @@ def test_draw_detections_renders_scene_graph_debug_counts_in_runtime_status() ->
         "Localized 1",
         "front-right cup (near)",
     ]
+
+
+def test_render_explanation_panel_renders_status_and_truncates_wrapped_body() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        panel = render_explanation_panel(
+            status="ready",
+            text=(
+                "현재 장면 설명이 길게 이어집니다. " * 20
+                + "\n핵심 객체: 컵, 탁자\n공간 관계: 컵은 탁자 위\n불확실성: 중간"
+            ),
+            model="gpt-4.1-mini",
+            latency_ms=321.0,
+            timestamp_label="12:34:56",
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert panel.shape[0] >= 240
+    assert fake_cv2.text_calls[0].startswith("Status: READY")
+    assert any(text.startswith("Model: gpt-4.1-mini") for text in fake_cv2.text_calls)
+    assert any(text.startswith("Latency: 321") for text in fake_cv2.text_calls)
+    body_lines = fake_cv2.text_calls[3:]
+    assert len(body_lines) <= 8
+    if body_lines:
+        assert body_lines[-1].endswith("...") or "불확실성:" in body_lines[-1]
+
+
+def test_render_explanation_panel_uses_injected_cv2_module() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    fake_cv2 = _FakeCV2()
+
+    panel = render_explanation_panel(
+        status="idle",
+        text="",
+        model="gpt-4.1-mini",
+        latency_ms=None,
+        timestamp_label="12:34:56",
+        cv2_module=fake_cv2,
+    )
+
+    assert panel.shape[1] >= 320
+    assert fake_cv2.text_calls[0].startswith("Status: IDLE")
+
+
+def test_render_explanation_panel_uses_unicode_text_renderer_for_body_lines() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    unicode_calls: list[list[str]] = []
+
+    def _fake_unicode_renderer(canvas, lines, *, origin, line_height, color):
+        unicode_calls.append(list(lines))
+        return canvas
+
+    fake_cv2 = _FakeCV2()
+    panel = render_explanation_panel(
+        status="ready",
+        text="현재 장면 설명\n핵심 객체: 컵\n공간 관계: 컵은 앞쪽\n불확실성: 낮음",
+        model="gpt-5-mini",
+        latency_ms=12.0,
+        timestamp_label="12:34:56",
+        cv2_module=fake_cv2,
+        unicode_text_renderer=_fake_unicode_renderer,
+    )
+
+    assert panel.shape[0] >= 240
+    assert fake_cv2.text_calls[:3] == [
+        "Status: READY | 12:34:56",
+        "Model: gpt-5-mini",
+        "Latency: 12ms",
+    ]
+    assert unicode_calls == [[
+        "현재 장면 설명",
+        "핵심 객체: 컵",
+        "공간 관계: 컵은 앞쪽",
+        "불확실성: 낮음",
+    ]]
+
+
+def test_render_explanation_panel_shows_ready_empty_response_message() -> None:
+    unicode_calls: list[list[str]] = []
+
+    def _fake_unicode_renderer(canvas, lines, *, origin, line_height, color):
+        unicode_calls.append(list(lines))
+        return canvas
+
+    panel = render_explanation_panel(
+        status="ready",
+        text="",
+        model="gpt-5-mini",
+        latency_ms=42.0,
+        timestamp_label="12:34:56",
+        unicode_text_renderer=_fake_unicode_renderer,
+    )
+
+    assert panel.shape[1] >= 320
+    assert unicode_calls == [["모델이 비어 있는 설명을 반환했습니다. 다시 시도해 주세요."]]
+
+
+def test_render_explanation_panel_supports_scroll_offset_and_returns_layout_metadata() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    unicode_calls: list[list[str]] = []
+
+    def _fake_unicode_renderer(canvas, lines, *, origin, line_height, color):
+        unicode_calls.append(list(lines))
+        return canvas
+
+    fake_cv2 = _FakeCV2()
+    lines = [f"line {index:02d}" for index in range(1, 19)]
+    panel, metadata = render_explanation_panel(
+        status="ready",
+        text="\n".join(lines),
+        model="gpt-5-mini",
+        latency_ms=12.0,
+        timestamp_label="12:34:56",
+        width=960,
+        height=360,
+        scroll_offset=4,
+        cv2_module=fake_cv2,
+        unicode_text_renderer=_fake_unicode_renderer,
+        return_metadata=True,
+    )
+
+    assert panel.shape[1] >= 960
+    assert metadata["scroll_offset"] == 4
+    assert metadata["max_scroll_offset"] > 0
+    assert metadata["up_rect"] is not None
+    assert metadata["down_rect"] is not None
+    assert unicode_calls
+    assert unicode_calls[-1][0] == "line 05"
+
+
+def test_render_multiline_unicode_text_returns_canvas_when_pil_unavailable() -> None:
+    canvas = np.zeros((40, 100, 3), dtype=np.uint8)
+
+    output = render_multiline_unicode_text(
+        canvas,
+        ["현재 장면 설명"],
+        origin=(10, 10),
+        line_height=18,
+        color=(255, 255, 255),
+        image_module=None,
+        draw_module=None,
+        font_module=None,
+    )
+
+    assert output.shape == canvas.shape
 
 
 def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:

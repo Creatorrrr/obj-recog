@@ -57,6 +57,26 @@ class AppConfig:
     graph_max_visible_nodes: int = 64
     graph_relation_smoothing_frames: int = 15
     graph_occlusion_ttl_frames: int = 15
+    explanation_enabled: bool = True
+    explanation_model: str = "gpt-5-mini"
+    explanation_timeout_sec: float = 8.0
+    explanation_max_detections: int = 12
+    explanation_max_graph_nodes: int = 20
+    explanation_max_graph_edges: int = 20
+    depth_profile: str = "balanced"
+
+
+@dataclass(frozen=True, slots=True)
+class DepthProfileSettings:
+    name: str
+    low_percentile: float
+    high_percentile: float
+    gamma: float
+    min_depth: float
+    max_depth: float
+    voxel_size: float
+    max_mesh_triangles: int
+    depth_sampling_stride: int
 
 
 DEFAULT_DETECTION_INTERVAL = 2
@@ -74,6 +94,48 @@ DEFAULT_SEGMENTATION_INTERVAL = 6
 DEFAULT_SEGMENTATION_INPUT_SIZE = 512
 DEFAULT_SLAM_WIDTH = 640
 DEFAULT_SLAM_HEIGHT = 360
+DEFAULT_EXPLANATION_MODEL = "gpt-5-mini"
+DEFAULT_EXPLANATION_TIMEOUT_SEC = 8.0
+DEFAULT_EXPLANATION_MAX_DETECTIONS = 12
+DEFAULT_EXPLANATION_MAX_GRAPH_NODES = 20
+DEFAULT_EXPLANATION_MAX_GRAPH_EDGES = 20
+DEFAULT_DEPTH_PROFILE = "balanced"
+
+DEPTH_PROFILE_SETTINGS: dict[str, DepthProfileSettings] = {
+    "fast": DepthProfileSettings(
+        name="fast",
+        low_percentile=5.0,
+        high_percentile=95.0,
+        gamma=1.0,
+        min_depth=0.3,
+        max_depth=6.0,
+        voxel_size=0.05,
+        max_mesh_triangles=10_000,
+        depth_sampling_stride=6,
+    ),
+    "balanced": DepthProfileSettings(
+        name="balanced",
+        low_percentile=2.0,
+        high_percentile=98.0,
+        gamma=0.82,
+        min_depth=0.3,
+        max_depth=6.0,
+        voxel_size=0.045,
+        max_mesh_triangles=14_000,
+        depth_sampling_stride=5,
+    ),
+    "depthy": DepthProfileSettings(
+        name="depthy",
+        low_percentile=1.0,
+        high_percentile=99.0,
+        gamma=0.70,
+        min_depth=0.3,
+        max_depth=6.0,
+        voxel_size=0.04,
+        max_mesh_triangles=18_000,
+        depth_sampling_stride=4,
+    ),
+}
 
 
 def _positive_int(value: str) -> int:
@@ -105,6 +167,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segmentation-mode", choices=("panoptic", "off"), default=DEFAULT_SEGMENTATION_MODE)
     parser.add_argument("--segmentation-alpha", type=_confidence, default=DEFAULT_SEGMENTATION_ALPHA)
     parser.add_argument("--segmentation-interval", type=_positive_int, default=DEFAULT_SEGMENTATION_INTERVAL)
+    parser.add_argument("--depth-profile", choices=tuple(DEPTH_PROFILE_SETTINGS), default=DEFAULT_DEPTH_PROFILE)
+    parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
+    parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
     parser.add_argument("--camera-calibration", type=str, default=None)
     parser.add_argument("--recalibrate", action="store_true")
     parser.add_argument("--disable-slam-calibration", action="store_true")
@@ -148,7 +213,21 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         map_voxel_size=DEFAULT_MAP_VOXEL_SIZE,
         max_map_points=DEFAULT_MAX_MAP_POINTS,
         max_mesh_triangles=DEFAULT_MAX_MESH_TRIANGLES,
+        explanation_enabled=args.explanation_mode == "on",
+        explanation_model=args.explanation_model,
+        explanation_timeout_sec=DEFAULT_EXPLANATION_TIMEOUT_SEC,
+        explanation_max_detections=DEFAULT_EXPLANATION_MAX_DETECTIONS,
+        explanation_max_graph_nodes=DEFAULT_EXPLANATION_MAX_GRAPH_NODES,
+        explanation_max_graph_edges=DEFAULT_EXPLANATION_MAX_GRAPH_EDGES,
+        depth_profile=args.depth_profile,
     )
+
+
+def resolve_depth_profile(profile_name: str) -> DepthProfileSettings:
+    try:
+        return DEPTH_PROFILE_SETTINGS[str(profile_name)]
+    except KeyError as exc:
+        raise ValueError(f"unknown depth profile: {profile_name}") from exc
 
 
 def resolve_device(requested_device: str) -> str:

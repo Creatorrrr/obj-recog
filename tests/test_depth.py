@@ -48,3 +48,17 @@ def test_running_percentile_normalizer_defaults_to_six_meter_range() -> None:
 
     assert depth_map.min() == pytest.approx(0.3)
     assert depth_map.max() == pytest.approx(6.0)
+
+
+def test_running_percentile_normalizer_depth_gamma_expands_mid_to_far_distances() -> None:
+    raw_depth = np.array([[0.0, 1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+    fast = RunningPercentileNormalizer(alpha=1.0, gamma=1.0)
+    depthy = RunningPercentileNormalizer(alpha=1.0, gamma=0.7)
+
+    fast_depth = fast.normalize(raw_depth)
+    depthy_depth = depthy.normalize(raw_depth)
+
+    assert np.all(np.diff(fast_depth.reshape(-1)) <= 0.0)
+    assert np.all(np.diff(depthy_depth.reshape(-1)) <= 0.0)
+    assert depthy_depth[0, 1] > fast_depth[0, 1]
+    assert depthy_depth[0, 2] > fast_depth[0, 2]

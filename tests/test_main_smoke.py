@@ -268,6 +268,8 @@ class FakeCV2:
     INTER_AREA = 1
     INTER_CUBIC = 2
     COLOR_BGR2GRAY = 6
+    EVENT_LBUTTONDOWN = 1
+    EVENT_MOUSEWHEEL = 10
     FONT_HERSHEY_SIMPLEX = 0
     LINE_AA = 16
 
@@ -277,15 +279,19 @@ class FakeCV2:
         window_visible: float = 1.0,
         window_visibility_sequence: list[float] | None = None,
         key_sequence: list[int] | None = None,
+        mouse_events: list[tuple[int, int, int]] | None = None,
     ) -> None:
         self._captures = list(captures or [])
         self.window_visible = window_visible
         self.window_visibility_sequence = list(window_visibility_sequence or [])
         self.key_sequence = list(key_sequence or [])
+        self.mouse_events = list(mouse_events or [])
         self.destroyed = False
         self.destroy_window_calls: list[str] = []
         self.imshow_calls = 0
+        self.imshow_windows: list[str] = []
         self.waitkey_calls = 0
+        self.mouse_callbacks: dict[str, object] = {}
 
     def VideoCapture(self, camera_index: int, backend: int | None = None) -> FakeCapture:
         capture = self._captures.pop(0)
@@ -309,9 +315,30 @@ class FakeCV2:
 
     def imshow(self, window_name: str, frame: np.ndarray) -> None:
         self.imshow_calls += 1
+        self.imshow_windows.append(window_name)
+
+    def setMouseCallback(self, window_name: str, callback) -> None:
+        self.mouse_callbacks[window_name] = callback
+
+    def getMouseWheelDelta(self, flags: int) -> int:
+        return int(flags)
 
     def waitKey(self, delay: int) -> int:
         self.waitkey_calls += 1
+        if self.mouse_events:
+            mouse_event = self.mouse_events.pop(0)
+            if len(mouse_event) == 3:
+                event, x, y = mouse_event
+                window_name = "Object Recognition"
+                flags = 0
+            elif len(mouse_event) == 4 and isinstance(mouse_event[0], str):
+                window_name, event, x, y = mouse_event
+                flags = 0
+            else:
+                window_name, event, x, y, flags = mouse_event
+            callback = self.mouse_callbacks.get(window_name)
+            if callback is not None:
+                callback(event, x, y, flags, None)
         if self.key_sequence:
             return self.key_sequence.pop(0)
         return -1
@@ -373,6 +400,45 @@ class FakeSegmentationWorker:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeExplanationWorker:
+    def __init__(self, results: list[tuple[int, object] | None] | None = None) -> None:
+        self.results = list(results or [])
+        self.submissions: list[tuple[int, object]] = []
+        self.closed = False
+
+    def is_idle(self) -> bool:
+        return True
+
+    def submit(self, snapshot_id: int, payload) -> None:
+        self.submissions.append((snapshot_id, payload))
+
+    def poll(self):
+        if self.results:
+            return self.results.pop(0)
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeExplainer:
+    def __init__(self, text: str = "현재 장면 설명\n핵심 객체: 사람\n공간 관계: 사람은 앞쪽\n불확실성: 낮음") -> None:
+        self.calls: list[object] = []
+        self.text = text
+
+    def explain(self, snapshot):
+        from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+        self.calls.append(snapshot)
+        return ExplanationResult(
+            text=self.text,
+            status=ExplanationStatus.READY,
+            latency_ms=5.0,
+            model="fake-model",
+            error_message=None,
+        )
 
 
 class FakeSceneGraphMemory:
@@ -507,6 +573,8 @@ def test_process_frame_creates_frame_artifacts() -> None:
     assert artifacts.mesh_vertex_colors.shape[1] == 3
     assert artifacts.slam_tracking_state == "TRACKING"
     assert artifacts.keyframe_id == 1
+    assert artifacts.depth_diagnostics is not None
+    assert artifacts.depth_diagnostics.profile == "balanced"
     assert cached == artifacts.detections
 
 
@@ -1103,7 +1171,8 @@ def test_run_exits_when_opencv_window_is_closed_and_cleans_up_resources() -> Non
     assert viewer.closed is True
     assert capture.released is True
     assert fake_cv2.destroyed is True
-    assert fake_cv2.imshow_calls == 1
+    assert fake_cv2.imshow_calls == 2
+    assert fake_cv2.imshow_windows == ["Object Recognition", "Situation Explanation"]
 
 
 def test_run_releases_camera_if_viewer_creation_fails() -> None:
@@ -1715,3 +1784,745 @@ def test_run_updates_scene_graph_and_passes_snapshot_to_overlay_and_viewer() -> 
     assert len(overlay_calls[-1]["visible_graph_nodes"]) == 2
     assert len(overlay_calls[-1]["visible_graph_edges"]) == 1
     assert viewer.last_scene_graph_snapshot is not None
+
+
+def test_run_marks_explanation_disabled_without_api_key_and_keeps_loop_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("obj_recog.main._load_app_dotenv", lambda: None)
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    camera_session = CameraSession(
+        capture=FakeCapture(width=16, height=16, frames=[np.zeros((16, 16, 3), dtype=np.uint8)]),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+    )
+
+    assert overlay_calls[-1]["explanation_status"] == "disabled"
+    assert "Situation Explanation" in fake_cv2.imshow_windows
+
+
+def test_run_submits_explanation_snapshot_on_e_and_applies_latest_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(key_sequence=[ord("e"), -1, ord("q")])
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=16,
+            height=16,
+            frames=[
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            None,
+            (
+                1,
+                ExplanationResult(
+                    text="현재 장면 설명\n핵심 객체: 사람\n공간 관계: 사람은 앞쪽\n불확실성: 낮음",
+                    status=ExplanationStatus.READY,
+                    latency_ms=123.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+        ]
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+        explanation_worker_factory=lambda **_: worker,
+    )
+
+    assert len(worker.submissions) == 1
+    snapshot_id, payload = worker.submissions[0]
+    assert snapshot_id == 1
+    assert "Visible objects" in payload.structured_context
+    assert "Situation Explanation" in fake_cv2.imshow_windows
+    assert overlay_calls[-1]["explanation_status"] in {"loading", "ready"}
+
+
+def test_run_submits_explanation_snapshot_on_button_click(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, ord("q")],
+        mouse_events=[(FakeCV2.EVENT_LBUTTONDOWN, 620, 460)],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        explanation_worker_factory=lambda **_: worker,
+    )
+
+    assert len(worker.submissions) == 1
+    snapshot_id, payload = worker.submissions[0]
+    assert snapshot_id == 1
+    assert "Visible objects" in payload.structured_context
+
+
+def test_run_updates_explanation_scroll_offset_on_panel_button_click(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, -1, ord("q")],
+        mouse_events=[
+            ("Object Recognition", FakeCV2.EVENT_LBUTTONDOWN, 620, 460),
+            ("Situation Explanation", FakeCV2.EVENT_LBUTTONDOWN, 930, 320),
+        ],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            (
+                1,
+                ExplanationResult(
+                    text="\n".join(f"line {index:02d}" for index in range(1, 21)),
+                    status=ExplanationStatus.READY,
+                    latency_ms=25.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+            None,
+        ]
+    )
+    scroll_offsets: list[int] = []
+
+    def _fake_explanation_panel_renderer(
+        *,
+        status,
+        text,
+        model,
+        latency_ms,
+        timestamp_label,
+        scroll_offset=0,
+        cv2_module=None,
+        return_metadata=False,
+        **_,
+    ):
+        scroll_offsets.append(int(scroll_offset))
+        panel = np.zeros((360, 960, 3), dtype=np.uint8)
+        metadata = {
+            "scroll_offset": int(scroll_offset),
+            "max_scroll_offset": 4,
+            "up_rect": (900, 16, 944, 56),
+            "down_rect": (900, 304, 944, 344),
+        }
+        if return_metadata:
+            return panel, metadata
+        return panel
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        explanation_worker_factory=lambda **_: worker,
+        explanation_panel_renderer=_fake_explanation_panel_renderer,
+    )
+
+    assert scroll_offsets[0] == 0
+    assert scroll_offsets[-1] == 1
+
+
+def test_run_updates_explanation_scroll_offset_on_mouse_wheel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, -1, ord("q")],
+        mouse_events=[
+            ("Object Recognition", FakeCV2.EVENT_LBUTTONDOWN, 620, 460),
+            ("Situation Explanation", FakeCV2.EVENT_MOUSEWHEEL, 930, 320, -120),
+        ],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            (
+                1,
+                ExplanationResult(
+                    text="\n".join(f"line {index:02d}" for index in range(1, 21)),
+                    status=ExplanationStatus.READY,
+                    latency_ms=25.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+            None,
+        ]
+    )
+    scroll_offsets: list[int] = []
+
+    def _fake_explanation_panel_renderer(
+        *,
+        status,
+        text,
+        model,
+        latency_ms,
+        timestamp_label,
+        scroll_offset=0,
+        cv2_module=None,
+        return_metadata=False,
+        **_,
+    ):
+        scroll_offsets.append(int(scroll_offset))
+        panel = np.zeros((360, 960, 3), dtype=np.uint8)
+        metadata = {
+            "scroll_offset": int(scroll_offset),
+            "max_scroll_offset": 4,
+            "up_rect": (900, 16, 944, 56),
+            "down_rect": (900, 304, 944, 344),
+        }
+        if return_metadata:
+            return panel, metadata
+        return panel
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        explanation_worker_factory=lambda **_: worker,
+        explanation_panel_renderer=_fake_explanation_panel_renderer,
+    )
+
+    assert scroll_offsets[0] == 0
+    assert scroll_offsets[-1] == 1
+
+
+def test_run_toggles_depth_debug_level_with_d_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(key_sequence=[ord("d"), ord("q")])
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=16,
+            height=16,
+            frames=[
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+        explanation_worker_factory=lambda **_: FakeExplanationWorker(),
+    )
+
+    assert overlay_calls[0]["depth_debug_level"] == "basic"
+    assert overlay_calls[-1]["depth_debug_level"] == "detailed"
+
+
+def test_run_default_explanation_path_uses_default_explainer_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("obj_recog.main.OpenAISituationExplainer", lambda **_: FakeExplainer())
+    fake_cv2 = FakeCV2(key_sequence=[ord("e"), -1, ord("q")])
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=16,
+            height=16,
+            frames=[
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+    )
+
+    assert overlay_calls[-1]["explanation_status"] in {"loading", "ready"}
+
+
+def test_run_ignores_stale_explanation_result_after_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(key_sequence=[ord("e"), ord("r"), -1, ord("q")])
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=16,
+            height=16,
+            frames=[
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+                np.zeros((16, 16, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            None,
+            None,
+            (
+                1,
+                ExplanationResult(
+                    text="현재 장면 설명\n핵심 객체: 사람\n공간 관계: 사람은 앞쪽\n불확실성: 낮음",
+                    status=ExplanationStatus.READY,
+                    latency_ms=123.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+            None,
+        ]
+    )
+    overlay_calls: list[dict[str, object]] = []
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: overlay_calls.append(kwargs) or frame_bgr,
+        explanation_worker_factory=lambda **_: worker,
+    )
+
+    assert all(call["explanation_status"] != "ready" for call in overlay_calls[1:])
+
+
+def test_run_loads_openai_api_key_from_dotenv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=dotenv-key\n", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    camera_session = CameraSession(
+        capture=FakeCapture(width=16, height=16, frames=[np.zeros((16, 16, 3), dtype=np.uint8)]),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        situation_explainer_factory=lambda **kwargs: captured.setdefault("api_key", kwargs["api_key"]) or FakeExplainer(),
+        explanation_worker_factory=lambda **_: FakeExplanationWorker(),
+    )
+
+    assert captured["api_key"] == "dotenv-key"
