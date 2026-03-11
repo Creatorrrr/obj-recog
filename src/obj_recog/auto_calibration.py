@@ -756,19 +756,20 @@ def ensure_runtime_calibration(
     warmup_runner=run_slam_self_calibration,
     debug_log=_default_debug_log,
 ) -> RuntimeCalibrationState:
+    explicit_output_path: Path | None = None
     if config.camera_calibration:
         path = Path(config.camera_calibration)
-        if not path.is_file():
-            raise RuntimeError(f"camera calibration file not found: {config.camera_calibration}")
-        calibration = load_orbslam3_settings(path)
-        return RuntimeCalibrationState(
-            source="explicit",
-            settings_path=str(path),
-            calibration=calibration,
-            cache_entry=None,
-            warmup_restarted=False,
-            promoted_bridge=None,
-        )
+        if path.is_file():
+            calibration = load_orbslam3_settings(path)
+            return RuntimeCalibrationState(
+                source="explicit",
+                settings_path=str(path),
+                calibration=calibration,
+                cache_entry=None,
+                warmup_restarted=False,
+                promoted_bridge=None,
+            )
+        explicit_output_path = path
 
     cache_dir = Path(config.calibration_cache_dir) if config.calibration_cache_dir else default_calibration_cache_dir()
     fingerprint = build_camera_fingerprint(camera_session, config)
@@ -777,7 +778,7 @@ def ensure_runtime_calibration(
             image_width=config.slam_width,
             image_height=config.slam_height,
         )
-        disabled_settings_path = _warmup_settings_path(cache_dir, fingerprint, "disabled")
+        disabled_settings_path = explicit_output_path or _warmup_settings_path(cache_dir, fingerprint, "disabled")
         _write_settings_yaml(disabled_settings_path, approx_calibration, fps=30.0)
         debug_log(f"runtime calibration using approximate settings with self-calibration disabled ({disabled_settings_path})")
         return RuntimeCalibrationState(
@@ -789,7 +790,7 @@ def ensure_runtime_calibration(
             promoted_bridge=None,
         )
 
-    if not config.recalibrate:
+    if explicit_output_path is None and not config.recalibrate:
         cached_entry = load_cached_calibration_entry(cache_dir, fingerprint)
         if cached_entry is not None and not cached_entry.stale:
             cached_calibration = load_orbslam3_settings(cached_entry.yaml_path)
@@ -831,6 +832,16 @@ def ensure_runtime_calibration(
         fps=30.0,
         debug_log=debug_log,
     )
+    if explicit_output_path is not None:
+        _write_settings_yaml(explicit_output_path, warmup.calibration, fps=30.0)
+        return RuntimeCalibrationState(
+            source="auto",
+            settings_path=str(explicit_output_path),
+            calibration=warmup.calibration,
+            cache_entry=None,
+            warmup_restarted=warmup.warmup_restarted,
+            promoted_bridge=warmup.bridge,
+        )
     cache_entry = store_calibration_cache(
         cache_dir=cache_dir,
         fingerprint=fingerprint,

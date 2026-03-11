@@ -6,10 +6,10 @@ import numpy as np
 import pytest
 
 from obj_recog.camera import CameraDevice, CameraSession, open_camera
-from obj_recog.config import AppConfig
+from obj_recog.config import AppConfig, parse_config
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
-from obj_recog.main import process_frame, run
+from obj_recog.main import _load_app_dotenv, main, process_frame, run
 from obj_recog.types import Detection, PanopticSegment, SegmentationResult
 
 
@@ -308,6 +308,9 @@ class FakeCV2:
     def cvtColor(self, frame: np.ndarray, code: int) -> np.ndarray:
         if code == self.COLOR_BGR2GRAY and frame.ndim == 3:
             return np.zeros(frame.shape[:2], dtype=frame.dtype)
+        return frame
+
+    def rectangle(self, frame, pt1, pt2, color, thickness):
         return frame
 
     def putText(self, frame, text, org, font, font_scale, color, thickness, line_type):
@@ -2010,6 +2013,79 @@ def test_run_submits_explanation_snapshot_on_button_click(
     assert "Visible objects" in payload.structured_context
 
 
+def test_run_auto_refreshes_explanation_while_toggle_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+        explanation_refresh_interval_sec=1.0,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, -1, ord("q")],
+        mouse_events=[("Object Recognition", FakeCV2.EVENT_LBUTTONDOWN, 620, 460)],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        explanation_worker_factory=lambda **_: worker,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        time_source=FakeClock([0.0, 0.0, 0.0, 0.5, 0.5, 1.6, 1.6, 2.0]),
+    )
+
+    assert [snapshot_id for snapshot_id, _payload in worker.submissions] == [1, 2]
+
+
 def test_run_updates_explanation_scroll_offset_on_panel_button_click(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2526,3 +2602,48 @@ def test_run_loads_openai_api_key_from_dotenv(
     )
 
     assert captured["api_key"] == "dotenv-key"
+
+
+def test_load_app_dotenv_exposes_camera_calibration_for_parse_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calibration_path = tmp_path / "camera.yaml"
+    calibration_path.write_text("Camera.width: 640\nCamera.height: 360\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        f"CAMERA_CALIBRATION={calibration_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    _load_app_dotenv()
+    config = parse_config([])
+
+    assert config.camera_calibration == str(calibration_path)
+
+
+def test_main_loads_dotenv_before_parse_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calibration_path = tmp_path / "camera.yaml"
+    calibration_path.write_text("Camera.width: 640\nCamera.height: 360\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        f"CAMERA_CALIBRATION={calibration_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["obj_recog.main"])
+
+    captured: dict[str, AppConfig] = {}
+
+    def fake_run(config: AppConfig, **_: object) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr("obj_recog.main.run", fake_run)
+
+    main()
+
+    assert captured["config"].camera_calibration == str(calibration_path)

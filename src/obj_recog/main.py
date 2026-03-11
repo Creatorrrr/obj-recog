@@ -494,8 +494,10 @@ def run(
     explanation_snapshot_id = 0
     latest_explanation_request_id: int | None = None
     latest_explanation_timestamp = "-"
+    explanation_auto_refresh_enabled = False
+    last_explanation_request_time: float | None = None
     explanation_button_state = {
-        "pending_click": False,
+        "pending_toggle": False,
         "rect": None,
     }
     explanation_panel_state = {
@@ -513,7 +515,7 @@ def run(
         if event != getattr(cv2, "EVENT_LBUTTONDOWN", None):
             return
         if point_in_rect(int(x), int(y), explanation_button_state.get("rect")):
-            explanation_button_state["pending_click"] = True
+            explanation_button_state["pending_toggle"] = True
 
     def _handle_explanation_window_mouse(event, x, y, _flags, _param) -> None:
         if event == getattr(cv2, "EVENT_LBUTTONDOWN", None):
@@ -536,17 +538,25 @@ def run(
                 direction * step_count
             )
 
-    def _submit_explanation_request(artifacts: FrameArtifacts) -> None:
+    def _submit_explanation_request(
+        artifacts: FrameArtifacts,
+        *,
+        requested_at: float | None = None,
+    ) -> bool:
         nonlocal explanation_snapshot_id
         nonlocal latest_explanation_request_id
         nonlocal latest_explanation_timestamp
         nonlocal explanation_status
         nonlocal explanation_result
+        nonlocal last_explanation_request_time
         if not config.explanation_enabled or explanation_worker is None:
-            return
+            return False
         explanation_status = ExplanationStatus.CAPTURING
         explanation_snapshot_id += 1
         latest_explanation_request_id = explanation_snapshot_id
+        last_explanation_request_time = (
+            float(requested_at) if requested_at is not None else float(time_source())
+        )
         latest_explanation_timestamp = time.strftime("%H:%M:%S")
         snapshot = explanation_snapshot_builder(
             artifacts,
@@ -567,6 +577,20 @@ def run(
         )
         explanation_panel_state["scroll_offset"] = 0
         explanation_panel_state["pending_scroll"] = 0
+        return True
+
+    def _toggle_explanation_auto_refresh(
+        artifacts: FrameArtifacts,
+        *,
+        toggled_at: float | None = None,
+    ) -> None:
+        nonlocal explanation_auto_refresh_enabled
+        if not config.explanation_enabled or explanation_worker is None:
+            explanation_auto_refresh_enabled = False
+            return
+        explanation_auto_refresh_enabled = not explanation_auto_refresh_enabled
+        if explanation_auto_refresh_enabled:
+            _submit_explanation_request(artifacts, requested_at=toggled_at)
 
     if config.list_cameras:
         for device in camera_lister():
@@ -757,7 +781,8 @@ def run(
                     map_builder.reset()
                 cached_detections = []
                 latest_explanation_request_id = None
-                explanation_button_state["pending_click"] = False
+                last_explanation_request_time = None
+                explanation_button_state["pending_toggle"] = False
                 if config.explanation_enabled:
                     explanation_result = ExplanationResult(
                         text="",
@@ -917,8 +942,10 @@ def run(
                 visible_graph_nodes=artifacts.visible_graph_nodes,
                 visible_graph_edges=artifacts.visible_graph_edges,
                 explanation_status=str(explanation_status) if explanation_status is not None else None,
+                explanation_auto_refresh_enabled=explanation_auto_refresh_enabled,
                 depth_diagnostics=artifacts.depth_diagnostics,
                 depth_debug_level=depth_debug_level,
+                cv2_module=cv2,
             )
             cv2.imshow("Object Recognition", overlay)
             explanation_button_state["rect"] = (
@@ -1003,6 +1030,7 @@ def run(
                 cached_detections = []
                 cached_segmentation = None
                 latest_explanation_request_id = None
+                last_explanation_request_time = None
                 if config.explanation_enabled:
                     explanation_result = ExplanationResult(
                         text="",
@@ -1020,7 +1048,7 @@ def run(
                 explanation_panel_state["pending_scroll"] = 0
                 explanation_panel_state["up_rect"] = None
                 explanation_panel_state["down_rect"] = None
-                explanation_button_state["pending_click"] = False
+                explanation_button_state["pending_toggle"] = False
                 frame_index += 1
                 continue
 
@@ -1031,15 +1059,26 @@ def run(
                     "detailed": "off",
                 }[depth_debug_level]
 
-            if explanation_button_state["pending_click"]:
-                explanation_button_state["pending_click"] = False
-                _submit_explanation_request(artifacts)
+            if explanation_button_state["pending_toggle"]:
+                explanation_button_state["pending_toggle"] = False
+                _toggle_explanation_auto_refresh(artifacts, toggled_at=now)
 
             if key == ord("e"):
-                _submit_explanation_request(artifacts)
+                _toggle_explanation_auto_refresh(artifacts, toggled_at=now)
 
             if key == ord("q") or not viewer_active or window_closed:
                 break
+
+            if (
+                explanation_auto_refresh_enabled
+                and explanation_worker is not None
+                and explanation_worker.is_idle()
+                and (
+                    last_explanation_request_time is None
+                    or (now - last_explanation_request_time) >= config.explanation_refresh_interval_sec
+                )
+            ):
+                _submit_explanation_request(artifacts, requested_at=now)
 
             frame_index += 1
     finally:
@@ -1057,6 +1096,7 @@ def run(
 
 
 def main() -> None:
+    _load_app_dotenv()
     run(
         parse_config(),
         slam_bridge_factory=OrbSlam3Bridge,

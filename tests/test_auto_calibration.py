@@ -22,7 +22,7 @@ from obj_recog.auto_calibration import (
     refine_focal_lengths,
     store_calibration_cache,
 )
-from obj_recog.calibration import CalibrationResult
+from obj_recog.calibration import CalibrationResult, load_orbslam3_settings
 from obj_recog.camera import CameraSession
 from obj_recog.config import AppConfig
 from obj_recog.slam_bridge import KeyframeObservation
@@ -403,6 +403,68 @@ def test_ensure_runtime_calibration_prefers_explicit_path(tmp_path: Path) -> Non
     assert state.calibration.image_width == calibration.image_width
     assert state.warmup_restarted is False
     assert state.promoted_bridge is None
+
+
+def test_ensure_runtime_calibration_generates_missing_explicit_path(tmp_path: Path) -> None:
+    generated_path = tmp_path / "calibration" / "camera.yaml"
+    generated = CalibrationResult(
+        camera_matrix=np.array([[500.0, 0.0, 320.0], [0.0, 505.0, 180.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        distortion_coefficients=np.zeros((1, 5), dtype=np.float32),
+        image_width=640,
+        image_height=360,
+        rms_error=1.8,
+    )
+    config = _config(camera_calibration=str(generated_path))
+    warmup_calls: list[int] = []
+
+    state = ensure_runtime_calibration(
+        config,
+        _session(),
+        slam_bridge_factory=lambda **_: object(),
+        validator_runner=lambda **_: (_ for _ in ()).throw(AssertionError("validator should not run")),
+        warmup_runner=lambda **_: warmup_calls.append(1) or _warmup_result(
+            generated,
+            bridge=object(),
+            settings_path="/tmp/generated.yaml",
+            metrics=_metrics(median_reprojection_error=1.8),
+        ),
+    )
+
+    assert warmup_calls == [1]
+    assert state.source == "auto"
+    assert state.settings_path == str(generated_path)
+    assert Path(state.settings_path).is_file()
+    assert state.cache_entry is None
+    assert state.promoted_bridge is not None
+    loaded = load_orbslam3_settings(generated_path)
+    assert loaded.image_width == 640
+    assert loaded.image_height == 360
+    assert float(loaded.camera_matrix[0, 0]) == pytest.approx(500.0)
+    assert float(loaded.camera_matrix[1, 1]) == pytest.approx(505.0)
+
+
+def test_ensure_runtime_calibration_writes_disabled_mode_to_missing_explicit_path(tmp_path: Path) -> None:
+    generated_path = tmp_path / "calibration" / "camera.yaml"
+    config = _config(
+        camera_calibration=str(generated_path),
+        disable_slam_calibration=True,
+    )
+
+    state = ensure_runtime_calibration(
+        config,
+        _session(),
+        slam_bridge_factory=lambda **_: (_ for _ in ()).throw(AssertionError("bridge should not start")),
+        validator_runner=lambda **_: (_ for _ in ()).throw(AssertionError("validator should not run")),
+        warmup_runner=lambda **_: (_ for _ in ()).throw(AssertionError("warmup should not run")),
+    )
+
+    assert state.source == "disabled"
+    assert state.settings_path == str(generated_path)
+    assert Path(state.settings_path).is_file()
+    assert state.cache_entry is None
+    loaded = load_orbslam3_settings(generated_path)
+    assert loaded.image_width == config.slam_width
+    assert loaded.image_height == config.slam_height
 
 
 def test_ensure_runtime_calibration_allows_disabling_self_calibration(tmp_path: Path) -> None:

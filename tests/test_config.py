@@ -5,7 +5,8 @@ import pytest
 from obj_recog.config import build_parser, parse_config, resolve_device
 
 
-def test_parse_config_uses_expected_defaults() -> None:
+def test_parse_config_uses_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
     config = parse_config([])
 
     assert config.camera_index == 0
@@ -40,13 +41,15 @@ def test_parse_config_uses_expected_defaults() -> None:
     assert config.explanation_enabled is True
     assert config.explanation_model == "gpt-5-mini"
     assert config.explanation_timeout_sec == pytest.approx(8.0)
+    assert config.explanation_refresh_interval_sec == pytest.approx(10.0)
     assert config.explanation_max_detections == 12
     assert config.explanation_max_graph_nodes == 20
     assert config.explanation_max_graph_edges == 20
     assert config.depth_profile == "balanced"
 
 
-def test_parse_config_accepts_custom_values() -> None:
+def test_parse_config_accepts_custom_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
     config = parse_config(
         [
             "--camera-index",
@@ -118,6 +121,36 @@ def test_parse_config_accepts_custom_values() -> None:
     assert config.orb_features == 1200
     assert config.max_map_points == 200_000
     assert config.max_mesh_triangles == 10_000
+
+
+def test_parse_config_uses_camera_calibration_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAMERA_CALIBRATION", "/tmp/from-env.yaml")
+
+    config = parse_config([])
+
+    assert config.camera_calibration == "/tmp/from-env.yaml"
+
+
+def test_parse_config_prefers_cli_camera_calibration_over_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAMERA_CALIBRATION", "/tmp/from-env.yaml")
+
+    config = parse_config(["--camera-calibration", "/tmp/from-cli.yaml"])
+
+    assert config.camera_calibration == "/tmp/from-cli.yaml"
+
+
+def test_parse_config_uses_explanation_refresh_interval_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXPLANATION_REFRESH_INTERVAL_SEC", "3.5")
+
+    config = parse_config([])
+
+    assert config.explanation_refresh_interval_sec == pytest.approx(3.5)
 
 
 def test_parser_rejects_invalid_choices() -> None:

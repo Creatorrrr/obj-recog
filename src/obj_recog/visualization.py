@@ -117,7 +117,13 @@ def point_in_rect(x: int, y: int, rect: tuple[int, int, int, int] | None) -> boo
     return x1 <= int(x) <= x2 and y1 <= int(y) <= y2
 
 
-def _draw_explanation_button(cv2, canvas: np.ndarray, *, status: str | None) -> None:
+def _draw_explanation_button(
+    cv2,
+    canvas: np.ndarray,
+    *,
+    status: str | None,
+    auto_refresh_enabled: bool = False,
+) -> None:
     if status is None:
         return
 
@@ -149,7 +155,7 @@ def _draw_explanation_button(cv2, canvas: np.ndarray, *, status: str | None) -> 
     _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), fill, -1)
     _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), border, 1)
 
-    label = "Explain"
+    label = "Explain ON" if bool(auto_refresh_enabled) else "Explain OFF"
     text_width, text_height = _measure_text(
         cv2,
         label,
@@ -414,10 +420,12 @@ def draw_detections(
     visible_graph_nodes=None,
     visible_graph_edges=None,
     explanation_status: str | None = None,
+    explanation_auto_refresh_enabled: bool = False,
     depth_diagnostics: DepthDiagnostics | None = None,
     depth_debug_level: str | None = None,
+    cv2_module=None,
 ) -> np.ndarray:
-    import cv2
+    cv2 = load_cv2(cv2_module)
 
     canvas = frame_bgr.copy()
     graph_nodes = list(visible_graph_nodes or scene_graph_snapshot.visible_nodes) if scene_graph_snapshot is not None else []
@@ -491,7 +499,12 @@ def draw_detections(
         visible_graph_nodes=graph_nodes,
         visible_graph_edges=graph_edges,
     )
-    _draw_explanation_button(cv2, canvas, status=explanation_status)
+    _draw_explanation_button(
+        cv2,
+        canvas,
+        status=explanation_status,
+        auto_refresh_enabled=explanation_auto_refresh_enabled,
+    )
     return canvas
 
 

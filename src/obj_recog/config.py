@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 
 try:
     import torch as _torch
@@ -60,6 +61,7 @@ class AppConfig:
     explanation_enabled: bool = True
     explanation_model: str = "gpt-5-mini"
     explanation_timeout_sec: float = 8.0
+    explanation_refresh_interval_sec: float = 10.0
     explanation_max_detections: int = 12
     explanation_max_graph_nodes: int = 20
     explanation_max_graph_edges: int = 20
@@ -96,6 +98,7 @@ DEFAULT_SLAM_WIDTH = 640
 DEFAULT_SLAM_HEIGHT = 360
 DEFAULT_EXPLANATION_MODEL = "gpt-5-mini"
 DEFAULT_EXPLANATION_TIMEOUT_SEC = 8.0
+DEFAULT_EXPLANATION_REFRESH_INTERVAL_SEC = 10.0
 DEFAULT_EXPLANATION_MAX_DETECTIONS = 12
 DEFAULT_EXPLANATION_MAX_GRAPH_NODES = 20
 DEFAULT_EXPLANATION_MAX_GRAPH_EDGES = 20
@@ -152,6 +155,13 @@ def _confidence(value: str) -> float:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("value must be greater than 0")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Real-time object recognition and monocular 3D reconstruction demo"
@@ -170,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth-profile", choices=tuple(DEPTH_PROFILE_SETTINGS), default=DEFAULT_DEPTH_PROFILE)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
     parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
-    parser.add_argument("--camera-calibration", type=str, default=None)
+    parser.add_argument("--camera-calibration", type=str, default=os.getenv("CAMERA_CALIBRATION"))
     parser.add_argument("--recalibrate", action="store_true")
     parser.add_argument("--disable-slam-calibration", action="store_true")
     parser.add_argument("--calibration-cache-dir", type=str, default=None)
@@ -183,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_config(argv: list[str] | None = None) -> AppConfig:
     args = build_parser().parse_args(argv)
+    explanation_refresh_interval_raw = os.getenv("EXPLANATION_REFRESH_INTERVAL_SEC")
+    explanation_refresh_interval_sec = (
+        DEFAULT_EXPLANATION_REFRESH_INTERVAL_SEC
+        if explanation_refresh_interval_raw is None
+        else _positive_float(explanation_refresh_interval_raw)
+    )
     return AppConfig(
         camera_index=args.camera_index,
         width=args.width,
@@ -216,6 +232,7 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         explanation_enabled=args.explanation_mode == "on",
         explanation_model=args.explanation_model,
         explanation_timeout_sec=DEFAULT_EXPLANATION_TIMEOUT_SEC,
+        explanation_refresh_interval_sec=explanation_refresh_interval_sec,
         explanation_max_detections=DEFAULT_EXPLANATION_MAX_DETECTIONS,
         explanation_max_graph_nodes=DEFAULT_EXPLANATION_MAX_GRAPH_NODES,
         explanation_max_graph_edges=DEFAULT_EXPLANATION_MAX_GRAPH_EDGES,

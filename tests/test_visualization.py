@@ -281,7 +281,49 @@ def test_draw_detections_renders_explanation_status_line() -> None:
             sys.modules["cv2"] = previous_cv2
 
     assert "Explain: ready" in fake_cv2.text_calls
-    assert "Explain" in fake_cv2.text_calls
+    assert "Explain OFF" in fake_cv2.text_calls
+
+
+def test_draw_detections_renders_explanation_toggle_on_label() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        frame = np.zeros((24, 24, 3), dtype=np.uint8)
+        draw_detections(
+            frame,
+            [],
+            24.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=7,
+            mesh_triangle_count=123,
+            mesh_vertex_count=88,
+            explanation_status="ready",
+            explanation_auto_refresh_enabled=True,
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert "Explain ON" in fake_cv2.text_calls
 
 
 def test_draw_detections_renders_depth_debug_overlay_lines() -> None:
@@ -836,6 +878,13 @@ def test_render_explanation_panel_uses_unicode_text_renderer_for_body_lines() ->
 
 
 def test_render_explanation_panel_shows_ready_empty_response_message() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            return None
+
     unicode_calls: list[list[str]] = []
 
     def _fake_unicode_renderer(canvas, lines, *, origin, line_height, color):
@@ -848,6 +897,7 @@ def test_render_explanation_panel_shows_ready_empty_response_message() -> None:
         model="gpt-5-mini",
         latency_ms=42.0,
         timestamp_label="12:34:56",
+        cv2_module=_FakeCV2(),
         unicode_text_renderer=_fake_unicode_renderer,
     )
 
