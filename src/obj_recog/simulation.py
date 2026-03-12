@@ -10,7 +10,12 @@ from typing import Any, Protocol
 import numpy as np
 
 from obj_recog.auto_calibration import create_approximate_calibration, refine_focal_lengths
-from obj_recog.blender_worker import BlenderFrameRequest, BlenderFrameResponse, BlenderWorkerClient, build_blender_worker_command
+from obj_recog.blender_worker import (
+    BlenderFrameRequest,
+    BlenderFrameResponse,
+    BlenderWorkerClient,
+    build_realtime_blender_worker_command,
+)
 from obj_recog.config import AppConfig, SIM_SCENARIO_CHOICES
 from obj_recog.frame_source import FramePacket
 from obj_recog.opencv_runtime import load_cv2
@@ -2150,7 +2155,13 @@ class SimulationRuntime:
                             report_path=self.report_path,
                         )
                         if self.blender_worker_client_factory is not None
-                        else _build_default_blender_worker_client(self.config)
+                        else _build_default_blender_worker_client(
+                            config=self.config,
+                            scenario=scenario,
+                            asset_manifest=asset_manifest,
+                            camera_rig=camera_rig,
+                            report_path=self.report_path,
+                        )
                     )
                     external_frame_source = BlenderRealtimeFrameSource(
                         config=self.config,
@@ -2233,10 +2244,30 @@ def _load_array_or_image(
     return np.asarray(frame)
 
 
-def _build_default_blender_worker_client(config: AppConfig) -> BlenderWorkerClient:
-    worker_script = Path(__file__).resolve().parents[2] / "scripts" / "blender" / "realtime_worker.py"
-    command = build_blender_worker_command(
+def _build_default_blender_worker_client(
+    *,
+    config: AppConfig,
+    scenario: ScenarioSpec,
+    asset_manifest,
+    camera_rig: CameraRigSpec,
+    report_path: str | Path,
+) -> BlenderWorkerClient:
+    repo_root = Path(__file__).resolve().parents[2]
+    scene_manifest_path = write_blender_scene_manifest(
+        scenario=scenario,
+        asset_manifest=asset_manifest,
+        rig=camera_rig,
+        output_dir=Path(config.asset_cache_dir) / "scene_manifests",
+    )
+    render_root = Path(report_path).parent / "blender_renders" / str(asset_manifest.manifest_id)
+    blend_file = repo_root / "scripts" / "blender" / "scene_template" / "base_scene.blend"
+    command = build_realtime_blender_worker_command(
         blender_exec=str(config.blender_exec),
-        worker_script=worker_script,
+        repo_root=repo_root,
+        scene_manifest_path=scene_manifest_path,
+        render_root=render_root,
+        asset_cache_dir=Path(config.asset_cache_dir),
+        quality=str(config.asset_quality),
+        blend_file=blend_file if blend_file.is_file() else None,
     )
     return BlenderWorkerClient(command=command)

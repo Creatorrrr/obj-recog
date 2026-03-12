@@ -14,6 +14,7 @@ from obj_recog.blender_worker import (
     BlenderFrameResponse,
     BlenderWorkerClient,
     build_blender_worker_command,
+    build_realtime_blender_worker_command,
 )
 
 
@@ -85,6 +86,35 @@ def test_build_blender_worker_command_uses_expected_invocation_shape() -> None:
         "--background",
         "--python",
         "/tmp/realtime_worker.py",
+    ]
+
+
+def test_build_realtime_blender_worker_command_adds_scene_bootstrap_arguments() -> None:
+    command = build_realtime_blender_worker_command(
+        blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+        repo_root=Path("/workspace"),
+        scene_manifest_path=Path("/tmp/scene.json"),
+        render_root=Path("/tmp/render-bundle"),
+        asset_cache_dir=Path("/tmp/assets"),
+        quality="high",
+        blend_file=Path("/workspace/scripts/blender/scene_template/base_scene.blend"),
+    )
+
+    assert command == [
+        "/Applications/Blender.app/Contents/MacOS/Blender",
+        "/workspace/scripts/blender/scene_template/base_scene.blend",
+        "--background",
+        "--python",
+        "/workspace/scripts/blender/realtime_worker.py",
+        "--",
+        "--scene-manifest",
+        "/tmp/scene.json",
+        "--render-root",
+        "/tmp/render-bundle",
+        "--asset-cache-dir",
+        "/tmp/assets",
+        "--quality",
+        "high",
     ]
 
 

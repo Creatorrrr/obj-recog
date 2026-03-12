@@ -28,6 +28,36 @@ def build_blender_worker_command(
     return command
 
 
+def build_realtime_blender_worker_command(
+    *,
+    blender_exec: str,
+    repo_root: str | Path,
+    scene_manifest_path: str | Path,
+    render_root: str | Path,
+    asset_cache_dir: str | Path,
+    quality: str,
+    blend_file: str | Path | None = None,
+) -> list[str]:
+    root = Path(repo_root)
+    worker_script = root / "scripts" / "blender" / "realtime_worker.py"
+    extra_args = [
+        "--scene-manifest",
+        str(scene_manifest_path),
+        "--render-root",
+        str(render_root),
+        "--asset-cache-dir",
+        str(asset_cache_dir),
+        "--quality",
+        str(quality),
+    ]
+    return build_blender_worker_command(
+        blender_exec=blender_exec,
+        worker_script=worker_script,
+        blend_file=blend_file,
+        extra_args=extra_args,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BlenderFrameRequest:
     frame_index: int
