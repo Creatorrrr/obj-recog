@@ -29,6 +29,7 @@ def _base_config(**overrides) -> AppConfig:
         explanation_enabled=True,
         graph_enabled=True,
         scenario_preview_shots=False,
+        render_profile="fast",
     )
     values.update(overrides)
     return AppConfig(**values)
@@ -158,7 +159,18 @@ def _artifacts(
     )
 
 
-def _scenario_state(*, selfcal_converged: bool, render_backend: str = "analytic") -> SimulationScenarioState:
+def _scenario_state(
+    *,
+    selfcal_converged: bool,
+    render_backend: str = "analytic",
+    render_profile: str = "fast",
+    asset_manifest_id: str = "asset-manifest-01",
+    environment_objects: tuple[dict[str, object], ...] = (),
+    semantic_mask_path: str | None = None,
+    instance_mask_path: str | None = None,
+    worker_state: str | None = None,
+    render_time_ms: float | None = None,
+) -> SimulationScenarioState:
     return SimulationScenarioState(
         scene_id="studio_open_v1",
         difficulty_level=1,
@@ -173,9 +185,14 @@ def _scenario_state(*, selfcal_converged: bool, render_backend: str = "analytic"
         active_goal=None,
         target_motion_state="static",
         render_backend=render_backend,
-        render_profile="fast",
+        render_profile=render_profile,
         semantic_target_class="backpack",
-        asset_manifest_id="asset-manifest-01",
+        asset_manifest_id=asset_manifest_id,
+        environment_objects=environment_objects,
+        semantic_mask_path=semantic_mask_path,
+        instance_mask_path=instance_mask_path,
+        worker_state=worker_state,
+        render_time_ms=render_time_ms,
     )
 
 
@@ -238,6 +255,10 @@ def test_runtime_validation_probe_marks_passes_for_complete_pipeline() -> None:
     report = probe.build_report()
 
     assert report.subsystems["render_realism"].status == "pass"
+    assert report.subsystems["mesh_backed_environment"].status == "skipped"
+    assert report.subsystems["worker_health"].status == "skipped"
+    assert report.subsystems["frame_latency"].status == "skipped"
+    assert report.subsystems["pass_output_presence"].status == "skipped"
     assert report.subsystems["reconstruction"].status == "pass"
     assert report.subsystems["calibration"].status == "pass"
     assert report.subsystems["object_detection"].status == "pass"
@@ -285,6 +306,10 @@ def test_runtime_validation_probe_marks_failures_and_skips() -> None:
     report = probe.build_report()
 
     assert report.subsystems["render_realism"].status == "fail"
+    assert report.subsystems["mesh_backed_environment"].status == "skipped"
+    assert report.subsystems["worker_health"].status == "skipped"
+    assert report.subsystems["frame_latency"].status == "skipped"
+    assert report.subsystems["pass_output_presence"].status == "skipped"
     assert report.subsystems["reconstruction"].status == "fail"
     assert report.subsystems["calibration"].status == "fail"
     assert report.subsystems["object_detection"].status == "fail"
@@ -385,3 +410,160 @@ def test_run_validation_suite_writes_per_scenario_reports_summary_and_preview_sh
     assert payload["total_runs"] == 2
     assert payload["reports"][0]["scenario"] == "studio_open_v1"
     assert payload["reports"][0]["subsystems"]["render_realism"]["status"] == "pass"
+
+
+def test_runtime_validation_probe_marks_photoreal_worker_health_and_pass_outputs() -> None:
+    probe = RuntimeValidationProbe(_base_config(render_profile="photoreal"))
+    probe.on_start(explanation_api_available=True)
+    mesh_vertices_xyz = np.array(
+        [[0.0, 0.0, 3.2], [0.2, 0.0, 3.4], [0.0, 0.2, 3.6], [0.1, 0.1, 3.5]],
+        dtype=np.float32,
+    )
+    mesh_triangles = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+    mesh_vertex_colors = np.full((4, 3), 0.6, dtype=np.float32)
+    detection = Detection(
+        xyxy=(8, 5, 26, 22),
+        class_id=1,
+        label="backpack",
+        confidence=0.91,
+        color=(40, 80, 225),
+    )
+
+    scenario_state = _scenario_state(
+        selfcal_converged=True,
+        render_backend="blender-realtime",
+        render_profile="photoreal",
+        environment_objects=(
+            {
+                "label": "desk",
+                "asset_id": "desk_oak",
+                "render_representation": "mesh",
+                "target_role": False,
+            },
+            {
+                "label": "backpack",
+                "asset_id": "backpack_red",
+                "render_representation": "mesh",
+                "target_role": True,
+            },
+        ),
+        semantic_mask_path="/tmp/semantic-mask.png",
+        instance_mask_path="/tmp/instance-mask.png",
+        worker_state="ready",
+        render_time_ms=28.0,
+    )
+
+    frame_packet = type(
+        "Packet",
+        (),
+        {
+            "scenario_state": scenario_state,
+            "calibration_source": "blender-ground-truth",
+            "semantic_mask": np.ones((24, 32), dtype=np.uint8),
+            "instance_mask": np.ones((24, 32), dtype=np.uint8),
+            "depth_map": np.full((24, 32), 3.4, dtype=np.float32),
+            "timestamp_sec": 1.0,
+        },
+    )()
+
+    probe.record_frame(
+        frame_index=0,
+        frame_packet=frame_packet,
+        artifacts=_artifacts(
+            mesh_vertices_xyz=mesh_vertices_xyz,
+            mesh_triangles=mesh_triangles,
+            mesh_vertex_colors=mesh_vertex_colors,
+            detections=[detection],
+            segments=[],
+            scene_graph_snapshot=None,
+            segmentation_overlay_bgr=np.zeros((24, 32, 3), dtype=np.uint8),
+            calibration_source="blender-ground-truth",
+        ),
+        explanation_status=ExplanationStatus.DISABLED,
+        explanation_result=ExplanationResult(
+            text="",
+            status=ExplanationStatus.DISABLED,
+            latency_ms=None,
+            model="gpt-5-mini",
+            error_message=None,
+        ),
+        viewer_active=True,
+    )
+
+    report = probe.build_report()
+
+    assert report.subsystems["mesh_backed_environment"].status == "pass"
+    assert report.subsystems["worker_health"].status == "pass"
+    assert report.subsystems["frame_latency"].status == "pass"
+    assert report.subsystems["frame_latency"].key_metrics["max_total_frame_time_ms"] >= 28.0
+    assert report.subsystems["pass_output_presence"].status == "pass"
+    assert report.subsystems["pass_output_presence"].key_metrics["rgb_pass_frames"] == 1
+
+
+def test_runtime_validation_probe_marks_photoreal_worker_failures() -> None:
+    probe = RuntimeValidationProbe(_base_config(render_profile="photoreal"))
+    probe.on_start(explanation_api_available=False)
+
+    scenario_state = _scenario_state(
+        selfcal_converged=True,
+        render_backend="blender-realtime",
+        render_profile="photoreal",
+        asset_manifest_id="",
+        environment_objects=(
+            {
+                "label": "placeholder",
+                "asset_id": None,
+                "render_representation": "sprite",
+                "target_role": False,
+            },
+        ),
+        semantic_mask_path=None,
+        instance_mask_path=None,
+        worker_state="restart_failed",
+        render_time_ms=180.0,
+    )
+    frame_packet = type(
+        "Packet",
+        (),
+        {
+            "scenario_state": scenario_state,
+            "calibration_source": "blender-ground-truth",
+            "semantic_mask": None,
+            "instance_mask": None,
+            "depth_map": None,
+            "timestamp_sec": 1.0,
+        },
+    )()
+
+    probe.record_frame(
+        frame_index=0,
+        frame_packet=frame_packet,
+        artifacts=_artifacts(
+            mesh_vertices_xyz=np.empty((0, 3), dtype=np.float32),
+            mesh_triangles=np.empty((0, 3), dtype=np.int32),
+            mesh_vertex_colors=np.empty((0, 3), dtype=np.float32),
+            detections=[],
+            segments=[],
+            scene_graph_snapshot=None,
+            segmentation_overlay_bgr=None,
+            calibration_source="blender-ground-truth",
+            mesh_z_span=0.0,
+        ),
+        explanation_status=ExplanationStatus.DISABLED,
+        explanation_result=ExplanationResult(
+            text="",
+            status=ExplanationStatus.DISABLED,
+            latency_ms=None,
+            model="gpt-5-mini",
+            error_message=None,
+        ),
+        viewer_active=True,
+    )
+
+    report = probe.build_report()
+
+    assert report.subsystems["mesh_backed_environment"].status == "fail"
+    assert report.subsystems["worker_health"].status == "fail"
+    assert report.subsystems["frame_latency"].status == "fail"
+    assert report.subsystems["pass_output_presence"].status == "fail"
+    assert report.subsystems["pass_output_presence"].key_metrics["rgb_pass_frames"] == 1

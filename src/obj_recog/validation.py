@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Callable, Iterable
 
 import numpy as np
@@ -118,6 +119,31 @@ class RuntimeValidationProbe:
         self._max_target_crop_unique_colors = 0
         self._preview_shot_path: str | None = None
 
+        self._environment_frames = 0
+        self._mesh_environment_frames = 0
+        self._max_environment_objects = 0
+        self._max_mesh_environment_objects = 0
+        self._target_role_environment_frames = 0
+
+        self._worker_ready_frames = 0
+        self._worker_starting_frames = 0
+        self._worker_error_frames = 0
+        self._worker_restart_events = 0
+        self._first_worker_failure_frame: int | None = None
+        self._last_worker_state: str | None = None
+
+        self._render_time_ms_values: list[float] = []
+        self._estimated_ipc_overhead_ms_values: list[float] = []
+        self._total_frame_time_ms_values: list[float] = []
+        self._last_recorded_at_monotonic: float | None = None
+
+        self._rgb_pass_frames = 0
+        self._semantic_pass_frames = 0
+        self._instance_pass_frames = 0
+        self._depth_pass_frames = 0
+        self._semantic_pass_path_frames = 0
+        self._instance_pass_path_frames = 0
+
         self._segmentation_frames = 0
         self._overlay_shape_match_frames = 0
         self._max_segments = 0
@@ -150,6 +176,7 @@ class RuntimeValidationProbe:
         viewer_active: bool,
     ) -> None:
         del viewer_active
+        recorded_at = time.perf_counter()
         if self._first_frame_index is None:
             self._first_frame_index = int(frame_index)
         self._frame_count += 1
@@ -170,6 +197,75 @@ class RuntimeValidationProbe:
             self._selfcal_converged = self._selfcal_converged or bool(
                 getattr(scenario_state, "selfcal_converged", False)
             )
+            environment_objects = tuple(getattr(scenario_state, "environment_objects", ()) or ())
+            if environment_objects:
+                self._environment_frames += 1
+                self._max_environment_objects = max(self._max_environment_objects, len(environment_objects))
+                mesh_environment_count = sum(
+                    1
+                    for item in environment_objects
+                    if str(self._scenario_item_value(item, "render_representation", "mesh")).lower() == "mesh"
+                )
+                if mesh_environment_count >= 1:
+                    self._mesh_environment_frames += 1
+                    self._max_mesh_environment_objects = max(
+                        self._max_mesh_environment_objects,
+                        int(mesh_environment_count),
+                    )
+                if any(
+                    bool(self._scenario_item_value(item, "target_role", False))
+                    for item in environment_objects
+                ):
+                    self._target_role_environment_frames += 1
+
+            worker_state = getattr(scenario_state, "worker_state", None)
+            if worker_state not in (None, ""):
+                normalized_worker_state = str(worker_state).strip().lower()
+                if normalized_worker_state == "ready":
+                    self._worker_ready_frames += 1
+                elif any(token in normalized_worker_state for token in ("start", "boot", "init", "spin")):
+                    self._worker_starting_frames += 1
+                if any(token in normalized_worker_state for token in ("restart", "recover")):
+                    self._worker_restart_events += 1
+                if any(token in normalized_worker_state for token in ("error", "fail", "crash", "timeout", "dead")):
+                    self._worker_error_frames += 1
+                    if self._first_worker_failure_frame is None:
+                        self._first_worker_failure_frame = int(frame_index)
+                self._last_worker_state = normalized_worker_state
+
+            render_time_ms = getattr(scenario_state, "render_time_ms", None)
+            if render_time_ms is not None:
+                render_time_ms_value = float(render_time_ms)
+                self._render_time_ms_values.append(render_time_ms_value)
+                total_frame_time_ms = render_time_ms_value
+                if self._last_recorded_at_monotonic is not None:
+                    observed_gap_ms = max(0.0, (recorded_at - self._last_recorded_at_monotonic) * 1000.0)
+                    estimated_ipc_overhead_ms = max(0.0, observed_gap_ms - render_time_ms_value)
+                    self._estimated_ipc_overhead_ms_values.append(estimated_ipc_overhead_ms)
+                    total_frame_time_ms += estimated_ipc_overhead_ms
+                self._total_frame_time_ms_values.append(total_frame_time_ms)
+
+            if getattr(scenario_state, "semantic_mask_path", None):
+                self._semantic_pass_path_frames += 1
+            if getattr(scenario_state, "instance_mask_path", None):
+                self._instance_pass_path_frames += 1
+
+        self._last_recorded_at_monotonic = recorded_at
+
+        frame_bgr = getattr(artifacts, "frame_bgr", None)
+        if frame_bgr is not None and np.asarray(frame_bgr).size > 0:
+            self._rgb_pass_frames += 1
+        semantic_mask = getattr(frame_packet, "semantic_mask", None)
+        if semantic_mask is not None and np.asarray(semantic_mask).size > 0:
+            self._semantic_pass_frames += 1
+        instance_mask = getattr(frame_packet, "instance_mask", None)
+        if instance_mask is not None and np.asarray(instance_mask).size > 0:
+            self._instance_pass_frames += 1
+        depth_map = getattr(frame_packet, "depth_map", getattr(artifacts, "depth_map", None))
+        if depth_map is not None:
+            depth_array = np.asarray(depth_map, dtype=np.float32)
+            if depth_array.size > 0 and bool(np.isfinite(depth_array).any()):
+                self._depth_pass_frames += 1
 
         mesh_vertices_xyz = np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3), dtype=np.float32)))
         mesh_triangles = np.asarray(getattr(artifacts, "mesh_triangles", np.empty((0, 3), dtype=np.int32)))
@@ -279,6 +375,10 @@ class RuntimeValidationProbe:
             self._error_message = str(error_message)
         subsystems = {
             "render_realism": self._render_realism_verdict(),
+            "mesh_backed_environment": self._mesh_backed_environment_verdict(),
+            "worker_health": self._worker_health_verdict(),
+            "frame_latency": self._frame_latency_verdict(),
+            "pass_output_presence": self._pass_output_presence_verdict(),
             "reconstruction": self._reconstruction_verdict(),
             "calibration": self._calibration_verdict(),
             "object_detection": self._object_detection_verdict(),
@@ -349,6 +449,195 @@ class RuntimeValidationProbe:
             reason="mesh remained empty or degenerate throughout the run",
             key_metrics=metrics,
             first_failure_frame=self._first_empty_mesh_frame,
+            sample_count=self._frame_count,
+        )
+
+    def _mesh_backed_environment_verdict(self) -> SubsystemVerdict:
+        if not self._photoreal_validation_enabled():
+            return SubsystemVerdict(
+                status="skipped",
+                reason="mesh-backed environment validation only applies to photoreal runs",
+                key_metrics={"render_profile": self._render_profile, "render_backend": self._render_backend},
+                sample_count=self._frame_count,
+            )
+        metrics = {
+            "environment_frames": int(self._environment_frames),
+            "mesh_environment_frames": int(self._mesh_environment_frames),
+            "max_environment_objects": int(self._max_environment_objects),
+            "max_mesh_environment_objects": int(self._max_mesh_environment_objects),
+            "target_role_environment_frames": int(self._target_role_environment_frames),
+            "asset_manifest_present": bool(self._asset_manifest_id),
+        }
+        if (
+            self._mesh_environment_frames >= 1
+            and self._max_mesh_environment_objects >= 1
+            and bool(self._asset_manifest_id)
+        ):
+            return SubsystemVerdict(
+                status="pass",
+                reason="environment metadata exposed mesh-backed scene objects from the asset manifest",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        return SubsystemVerdict(
+            status="fail",
+            reason="photoreal run did not expose a mesh-backed environment manifest",
+            key_metrics=metrics,
+            first_failure_frame=self._first_frame_index,
+            sample_count=self._frame_count,
+        )
+
+    def _worker_health_verdict(self) -> SubsystemVerdict:
+        if not self._photoreal_validation_enabled():
+            return SubsystemVerdict(
+                status="skipped",
+                reason="worker health validation only applies to photoreal runs",
+                key_metrics={"render_profile": self._render_profile, "render_backend": self._render_backend},
+                sample_count=self._frame_count,
+            )
+        metrics = {
+            "worker_ready_frames": int(self._worker_ready_frames),
+            "worker_starting_frames": int(self._worker_starting_frames),
+            "worker_error_frames": int(self._worker_error_frames),
+            "worker_restart_events": int(self._worker_restart_events),
+            "last_worker_state": self._last_worker_state,
+        }
+        if self._worker_ready_frames >= 1 and self._worker_error_frames == 0 and self._worker_restart_events == 0:
+            return SubsystemVerdict(
+                status="pass",
+                reason="Blender worker reached a stable ready state without restarts or errors",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        if self._worker_ready_frames >= 1 and self._worker_error_frames == 0:
+            return SubsystemVerdict(
+                status="warn",
+                reason="Blender worker recovered, but restarts were observed during the run",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        return SubsystemVerdict(
+            status="fail",
+            reason="Blender worker never reached a healthy ready state",
+            key_metrics=metrics,
+            first_failure_frame=self._first_worker_failure_frame or self._first_frame_index,
+            sample_count=self._frame_count,
+        )
+
+    def _frame_latency_verdict(self) -> SubsystemVerdict:
+        if not self._photoreal_validation_enabled():
+            return SubsystemVerdict(
+                status="skipped",
+                reason="frame latency validation only applies to photoreal runs",
+                key_metrics={"render_profile": self._render_profile, "render_backend": self._render_backend},
+                sample_count=self._frame_count,
+            )
+        avg_render_time_ms = (
+            0.0
+            if not self._render_time_ms_values
+            else float(sum(self._render_time_ms_values) / len(self._render_time_ms_values))
+        )
+        avg_estimated_ipc_overhead_ms = (
+            0.0
+            if not self._estimated_ipc_overhead_ms_values
+            else float(sum(self._estimated_ipc_overhead_ms_values) / len(self._estimated_ipc_overhead_ms_values))
+        )
+        metrics = {
+            "render_time_samples": int(len(self._render_time_ms_values)),
+            "avg_render_time_ms": round(avg_render_time_ms, 3),
+            "max_render_time_ms": round(max(self._render_time_ms_values, default=0.0), 3),
+            "avg_estimated_ipc_overhead_ms": round(avg_estimated_ipc_overhead_ms, 3),
+            "max_estimated_ipc_overhead_ms": round(max(self._estimated_ipc_overhead_ms_values, default=0.0), 3),
+            "avg_total_frame_time_ms": round(
+                0.0
+                if not self._total_frame_time_ms_values
+                else float(sum(self._total_frame_time_ms_values) / len(self._total_frame_time_ms_values)),
+                3,
+            ),
+            "max_total_frame_time_ms": round(max(self._total_frame_time_ms_values, default=0.0), 3),
+        }
+        max_render_time_ms = max(self._render_time_ms_values, default=0.0)
+        max_ipc_overhead_ms = max(self._estimated_ipc_overhead_ms_values, default=0.0)
+        max_total_frame_time_ms = max(self._total_frame_time_ms_values, default=0.0)
+        if (
+            self._render_time_ms_values
+            and max_render_time_ms <= 100.0
+            and max_ipc_overhead_ms <= 35.0
+            and max_total_frame_time_ms <= 100.0
+        ):
+            return SubsystemVerdict(
+                status="pass",
+                reason="photoreal frames stayed within the interactive latency budget",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        if (
+            self._render_time_ms_values
+            and max_render_time_ms <= 140.0
+            and max_ipc_overhead_ms <= 60.0
+            and max_total_frame_time_ms <= 140.0
+        ):
+            return SubsystemVerdict(
+                status="warn",
+                reason="photoreal frames were usable but drifted outside the target latency budget",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        return SubsystemVerdict(
+            status="fail",
+            reason="photoreal frames exceeded the latency budget or never reported render timings",
+            key_metrics=metrics,
+            first_failure_frame=self._first_frame_index,
+            sample_count=self._frame_count,
+        )
+
+    def _pass_output_presence_verdict(self) -> SubsystemVerdict:
+        if not self._photoreal_validation_enabled():
+            return SubsystemVerdict(
+                status="skipped",
+                reason="pass-output validation only applies to photoreal runs",
+                key_metrics={"render_profile": self._render_profile, "render_backend": self._render_backend},
+                sample_count=self._frame_count,
+            )
+        metrics = {
+            "rgb_pass_frames": int(self._rgb_pass_frames),
+            "semantic_pass_frames": int(self._semantic_pass_frames),
+            "instance_pass_frames": int(self._instance_pass_frames),
+            "depth_pass_frames": int(self._depth_pass_frames),
+            "semantic_pass_path_frames": int(self._semantic_pass_path_frames),
+            "instance_pass_path_frames": int(self._instance_pass_path_frames),
+        }
+        if (
+            self._rgb_pass_frames >= 1
+            and self._semantic_pass_frames >= 1
+            and self._instance_pass_frames >= 1
+            and self._depth_pass_frames >= 1
+            and self._semantic_pass_path_frames >= 1
+            and self._instance_pass_path_frames >= 1
+        ):
+            return SubsystemVerdict(
+                status="pass",
+                reason="photoreal runtime produced depth, semantic, and instance pass outputs",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        if (
+            self._rgb_pass_frames >= 1
+            and self._depth_pass_frames >= 1
+            and (self._semantic_pass_frames >= 1 or self._instance_pass_frames >= 1)
+        ):
+            return SubsystemVerdict(
+                status="warn",
+                reason="photoreal runtime produced partial auxiliary passes but some outputs were missing",
+                key_metrics=metrics,
+                first_failure_frame=self._first_frame_index,
+                sample_count=self._frame_count,
+            )
+        return SubsystemVerdict(
+            status="fail",
+            reason="photoreal runtime did not produce the required depth and mask passes",
+            key_metrics=metrics,
+            first_failure_frame=self._first_frame_index,
             sample_count=self._frame_count,
         )
 
@@ -600,6 +889,15 @@ class RuntimeValidationProbe:
         preview_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(crop[:, :, ::-1], mode="RGB").save(preview_path)
         self._preview_shot_path = str(preview_path)
+
+    def _photoreal_validation_enabled(self) -> bool:
+        return self._render_profile == "photoreal" or "blender" in self._render_backend.lower()
+
+    @staticmethod
+    def _scenario_item_value(item: object, key: str, default: Any) -> Any:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
 
 
 class _HeadlessCv2Proxy:
