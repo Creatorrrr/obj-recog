@@ -593,7 +593,12 @@ def run(
         toggled_at: float | None = None,
     ) -> None:
         nonlocal explanation_auto_refresh_enabled
+        nonlocal explanation_status
+        nonlocal explanation_result
+        nonlocal latest_explanation_request_id
+        nonlocal latest_explanation_timestamp
         nonlocal explanation_refresh_status
+        nonlocal last_explanation_request_time
         if not config.explanation_enabled or explanation_worker is None:
             explanation_auto_refresh_enabled = False
             explanation_refresh_status = "idle"
@@ -602,7 +607,21 @@ def run(
         if explanation_auto_refresh_enabled:
             _submit_explanation_request(artifacts, requested_at=toggled_at)
         else:
+            latest_explanation_request_id = None
+            last_explanation_request_time = None
             explanation_refresh_status = "idle"
+            if explanation_status == ExplanationStatus.LOADING:
+                latest_explanation_timestamp = "-"
+                explanation_result = ExplanationResult(
+                    text="",
+                    status=ExplanationStatus.IDLE,
+                    latency_ms=None,
+                    model=config.explanation_model,
+                    error_message=None,
+                )
+                explanation_status = ExplanationStatus.IDLE
+                explanation_panel_state["scroll_offset"] = 0
+                explanation_panel_state["pending_scroll"] = 0
 
     if config.list_cameras:
         for device in camera_lister():
