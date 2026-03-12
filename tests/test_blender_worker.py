@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import select
 
 import numpy as np
 import pytest
@@ -158,6 +160,61 @@ def test_blender_worker_client_request_frame_round_trips_json() -> None:
     assert fake_stdin.flush_calls == 1
 
 
+def test_blender_worker_client_skips_non_json_stdout_logs() -> None:
+    fake_process = _FakeProcess(
+        stdin=_FakeWritable(),
+        stdout=_FakeReadable(
+            [
+                b"Blender 4.2.0 startup banner\n",
+                b'{"rgb_path":"/tmp/rgb.png","depth_path":"/tmp/depth.npy","pose_world_gt":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],"intrinsics_gt":{"fx":10.0,"fy":10.0,"cx":3.0,"cy":2.0}}\n',
+            ]
+        ),
+        stderr=_FakeReadable([]),
+        poll_result=None,
+    )
+    client = BlenderWorkerClient(
+        command=["blender", "--background", "--python", "worker.py"],
+        popen_factory=lambda *_args, **_kwargs: fake_process,
+        selector=lambda reads, _writes, _errors, _timeout: (reads, [], []),
+    )
+    client.start()
+
+    response = client.request_frame(
+        BlenderFrameRequest(
+            frame_index=1,
+            timestamp_sec=0.1,
+            scenario_id="studio_open_v1",
+            camera_pose_world=np.eye(4, dtype=np.float32),
+            intrinsics={"fx": 10.0, "fy": 10.0, "cx": 4.0, "cy": 3.0},
+            dynamic_actor_transforms={},
+            lighting_seed=1,
+        ),
+        timeout_sec=0.5,
+    )
+
+    assert response.rgb_path == "/tmp/rgb.png"
+
+
+def test_blender_frame_response_requires_gt_pose_and_intrinsics() -> None:
+    with pytest.raises(ValueError, match="pose_world_gt"):
+        BlenderFrameResponse.from_payload(
+            {
+                "rgb_path": "/tmp/rgb.png",
+                "depth_path": "/tmp/depth.npy",
+                "intrinsics_gt": {"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
+            }
+        )
+
+    with pytest.raises(ValueError, match="intrinsics_gt"):
+        BlenderFrameResponse.from_payload(
+            {
+                "rgb_path": "/tmp/rgb.png",
+                "depth_path": "/tmp/depth.npy",
+                "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
+            }
+        )
+
+
 def test_blender_worker_client_raises_clean_error_when_process_fails_to_start() -> None:
     fake_process = _FakeProcess(
         stdin=_FakeWritable(),
@@ -203,6 +260,52 @@ def test_blender_worker_client_raises_clean_timeout_on_response_wait() -> None:
             ),
             timeout_sec=0.25,
         )
+
+
+def test_blender_worker_client_times_out_on_partial_stdout_without_newline() -> None:
+    read_stream = None
+    write_stream = None
+    read_fd, write_fd = os.pipe()
+    try:
+        read_stream = os.fdopen(read_fd, "rb", buffering=0)
+        write_stream = os.fdopen(write_fd, "wb", buffering=0)
+        write_stream.write(b'{"rgb_path":"/tmp/rgb.png"')
+        write_stream.flush()
+        fake_process = _FakeProcess(
+            stdin=_FakeWritable(),
+            stdout=read_stream,
+            stderr=_FakeReadable([]),
+            poll_result=None,
+        )
+        client = BlenderWorkerClient(
+            command=["blender", "--background", "--python", "worker.py"],
+            popen_factory=lambda *_args, **_kwargs: fake_process,
+            selector=select.select,
+        )
+        client.start()
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            client.request_frame(
+                BlenderFrameRequest(
+                    frame_index=2,
+                    timestamp_sec=0.2,
+                    scenario_id="studio_open_v1",
+                    camera_pose_world=np.eye(4, dtype=np.float32),
+                    intrinsics={"fx": 10.0, "fy": 10.0, "cx": 4.0, "cy": 3.0},
+                    dynamic_actor_transforms={},
+                    lighting_seed=5,
+                ),
+                timeout_sec=0.05,
+            )
+    finally:
+        try:
+            write_stream.close()
+        except Exception:
+            pass
+        try:
+            read_stream.close()
+        except Exception:
+            pass
 
 
 def test_blender_worker_client_close_terminates_process() -> None:

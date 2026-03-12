@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import select
+import time
 import subprocess
 from typing import Any, Callable
 
@@ -63,6 +65,8 @@ class BlenderFrameResponse:
 
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> BlenderFrameResponse:
+        pose_world_gt = _require_payload_field(payload, "pose_world_gt")
+        intrinsics_gt = _require_payload_field(payload, "intrinsics_gt")
         return cls(
             rgb_path=str(payload["rgb_path"]),
             depth_path=str(payload["depth_path"]),
@@ -72,10 +76,10 @@ class BlenderFrameResponse:
             instance_mask_path=(
                 None if payload.get("instance_mask_path") in (None, "") else str(payload["instance_mask_path"])
             ),
-            pose_world_gt=np.asarray(payload.get("pose_world_gt") or np.eye(4, dtype=np.float32), dtype=np.float32).reshape(4, 4),
+            pose_world_gt=np.asarray(pose_world_gt, dtype=np.float32).reshape(4, 4),
             intrinsics_gt={
                 str(key): float(value)
-                for key, value in dict(payload.get("intrinsics_gt") or {}).items()
+                for key, value in dict(intrinsics_gt).items()
             },
             render_time_ms=(
                 None if payload.get("render_time_ms") is None else float(payload["render_time_ms"])
@@ -127,18 +131,28 @@ class BlenderWorkerClient:
         packet = json.dumps(request.to_payload(), separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
         process.stdin.write(packet)
         process.stdin.flush()
-        response_line = _read_stdout_line(process.stdout, timeout_sec=timeout_sec, selector=self._selector)
-        if response_line is None:
-            raise TimeoutError(f"Blender worker response timed out after {timeout_sec} seconds")
-        if not response_line.strip():
-            raise RuntimeError("Blender worker returned an empty response")
-        try:
-            payload = json.loads(response_line.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Blender worker returned invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("Blender worker response must be a JSON object")
-        return BlenderFrameResponse.from_payload(payload)
+        deadline = None if timeout_sec is None else time.monotonic() + float(timeout_sec)
+        while True:
+            remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            response_line = _read_stdout_line(
+                process.stdout,
+                timeout_sec=remaining_timeout,
+                selector=self._selector,
+            )
+            if response_line is None:
+                raise TimeoutError(f"Blender worker response timed out after {timeout_sec} seconds")
+            stripped = response_line.strip()
+            if not stripped:
+                continue
+            if stripped[:1] not in (b"{", b"["):
+                continue
+            try:
+                payload = json.loads(stripped.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Blender worker returned invalid JSON") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError("Blender worker response must be a JSON object")
+            return BlenderFrameResponse.from_payload(payload)
 
     def close(self) -> None:
         process = self._process
@@ -162,11 +176,37 @@ class BlenderWorkerClient:
 
 
 def _read_stdout_line(stdout, *, timeout_sec: float | None, selector) -> bytes | None:
+    fileno = getattr(stdout, "fileno", None)
+    if callable(fileno):
+        try:
+            return _read_stdout_line_from_fd(stdout, timeout_sec=timeout_sec, selector=selector)
+        except (OSError, ValueError):
+            pass
     if timeout_sec is not None:
         readable, _, _ = selector([stdout], [], [], timeout_sec)
         if not readable:
             return None
     return stdout.readline()
+
+
+def _read_stdout_line_from_fd(stdout, *, timeout_sec: float | None, selector) -> bytes | None:
+    fd = stdout.fileno()
+    deadline = None if timeout_sec is None else time.monotonic() + float(timeout_sec)
+    buffer = bytearray()
+    while True:
+        newline_index = buffer.find(b"\n")
+        if newline_index >= 0:
+            return bytes(buffer[: newline_index + 1])
+        remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if remaining_timeout is not None and remaining_timeout <= 0.0:
+            return None
+        readable, _, _ = selector([stdout], [], [], remaining_timeout)
+        if not readable:
+            return None
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            return None if not buffer else bytes(buffer)
+        buffer.extend(chunk)
 
 
 def _read_stderr_line(process: subprocess.Popen[bytes]) -> str:
@@ -176,6 +216,12 @@ def _read_stderr_line(process: subprocess.Popen[bytes]) -> str:
         return process.stderr.readline().decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
+
+
+def _require_payload_field(payload: dict[str, object], key: str) -> object:
+    if key not in payload or payload[key] is None:
+        raise ValueError(f"Blender worker response is missing required field '{key}'")
+    return payload[key]
 
 
 def _json_ready(value: Any) -> Any:
