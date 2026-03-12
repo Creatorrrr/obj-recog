@@ -444,6 +444,40 @@ class FakeExplainer:
         )
 
 
+class ProbeRecorder:
+    def __init__(self) -> None:
+        self.started_with: list[dict[str, object]] = []
+        self.frames: list[dict[str, object]] = []
+        self.finished = False
+
+    def on_start(self, *, explanation_api_available: bool) -> None:
+        self.started_with.append({"explanation_api_available": explanation_api_available})
+
+    def record_frame(
+        self,
+        *,
+        frame_index: int,
+        frame_packet,
+        artifacts,
+        explanation_status,
+        explanation_result,
+        viewer_active: bool,
+    ) -> None:
+        self.frames.append(
+            {
+                "frame_index": frame_index,
+                "frame_packet": frame_packet,
+                "artifacts": artifacts,
+                "explanation_status": explanation_status,
+                "explanation_result": explanation_result,
+                "viewer_active": viewer_active,
+            }
+        )
+
+    def finish(self) -> None:
+        self.finished = True
+
+
 class FakeSceneGraphMemory:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -1787,6 +1821,57 @@ def test_run_updates_scene_graph_and_passes_snapshot_to_overlay_and_viewer() -> 
     assert len(overlay_calls[-1]["visible_graph_nodes"]) == 2
     assert len(overlay_calls[-1]["visible_graph_edges"]) == 1
     assert viewer.last_scene_graph_snapshot is not None
+
+
+def test_run_records_runtime_frames_into_validation_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        segmentation_mode="off",
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("obj_recog.main._load_app_dotenv", lambda: None)
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 20, dtype=np.uint8)])
+    viewer = FakeViewer()
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    probe = ProbeRecorder()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        validation_probe=probe,
+    )
+
+    assert probe.started_with == [{"explanation_api_available": False}]
+    assert len(probe.frames) == 1
+    assert probe.frames[0]["frame_index"] == 0
+    assert probe.frames[0]["artifacts"].mesh_vertices_xyz.shape == (1, 3)
+    assert probe.frames[0]["viewer_active"] is True
+    assert probe.finished is True
 
 
 def test_run_marks_explanation_disabled_without_api_key_and_keeps_loop_running(

@@ -66,6 +66,28 @@ class AppConfig:
     explanation_max_graph_nodes: int = 20
     explanation_max_graph_edges: int = 20
     depth_profile: str = "balanced"
+    input_source: str = "live"
+    scenario: str = "studio_open_v1"
+    sim_seed: int = 0
+    sim_max_steps: int = 600
+    sim_profile: str = "lightweight"
+    eval_budget_sec: float = 20.0
+    sim_camera_fps: float = 10.0
+    sim_camera_fov_deg: float = 72.0
+    sim_camera_near: float = 0.2
+    sim_camera_far: float = 8.0
+    sim_depth_noise_std: float = 0.02
+    sim_motion_blur: float = 0.1
+    sim_enable_distortion: bool = False
+    sim_yaw_rate_limit_deg: float = 45.0
+    sim_linear_velocity_limit: float = 0.5
+    sim_goal_selector: str = "heuristic"
+    sim_goal_model: str = "gpt-5-mini"
+    sim_goal_timeout_sec: float = 4.0
+    sim_external_manifest: str | None = None
+    sim_perception_mode: str = "assisted"
+    validate_all_scenarios: bool = False
+    validation_output_dir: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +125,32 @@ DEFAULT_EXPLANATION_MAX_DETECTIONS = 12
 DEFAULT_EXPLANATION_MAX_GRAPH_NODES = 20
 DEFAULT_EXPLANATION_MAX_GRAPH_EDGES = 20
 DEFAULT_DEPTH_PROFILE = "balanced"
+DEFAULT_INPUT_SOURCE = "live"
+SIM_SCENARIO_CHOICES = (
+    "studio_open_v1",
+    "office_clutter_v1",
+    "lab_corridor_v1",
+    "showroom_occlusion_v1",
+    "office_crossflow_v1",
+    "warehouse_moving_target_v1",
+)
+DEFAULT_SCENARIO = "studio_open_v1"
+DEFAULT_SIM_SEED = 0
+DEFAULT_SIM_MAX_STEPS = 600
+DEFAULT_SIM_PROFILE = "lightweight"
+DEFAULT_EVAL_BUDGET_SEC = 20.0
+DEFAULT_SIM_CAMERA_FPS = 10.0
+DEFAULT_SIM_CAMERA_FOV_DEG = 72.0
+DEFAULT_SIM_CAMERA_NEAR = 0.2
+DEFAULT_SIM_CAMERA_FAR = 8.0
+DEFAULT_SIM_DEPTH_NOISE_STD = 0.02
+DEFAULT_SIM_MOTION_BLUR = 0.1
+DEFAULT_SIM_YAW_RATE_LIMIT_DEG = 45.0
+DEFAULT_SIM_LINEAR_VELOCITY_LIMIT = 0.5
+DEFAULT_SIM_GOAL_SELECTOR = "heuristic"
+DEFAULT_SIM_GOAL_MODEL = "gpt-5-mini"
+DEFAULT_SIM_GOAL_TIMEOUT_SEC = 4.0
+DEFAULT_SIM_PERCEPTION_MODE = "assisted"
 
 DEPTH_PROFILE_SETTINGS: dict[str, DepthProfileSettings] = {
     "fast": DepthProfileSettings(
@@ -178,6 +226,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segmentation-alpha", type=_confidence, default=DEFAULT_SEGMENTATION_ALPHA)
     parser.add_argument("--segmentation-interval", type=_positive_int, default=DEFAULT_SEGMENTATION_INTERVAL)
     parser.add_argument("--depth-profile", choices=tuple(DEPTH_PROFILE_SETTINGS), default=DEFAULT_DEPTH_PROFILE)
+    parser.add_argument("--input-source", choices=("live", "sim"), default=DEFAULT_INPUT_SOURCE)
+    parser.add_argument("--scenario", choices=SIM_SCENARIO_CHOICES, default=DEFAULT_SCENARIO)
+    parser.add_argument("--sim-seed", type=int, default=DEFAULT_SIM_SEED)
+    parser.add_argument("--sim-max-steps", type=_positive_int, default=DEFAULT_SIM_MAX_STEPS)
+    parser.add_argument("--sim-profile", choices=("lightweight", "external"), default=DEFAULT_SIM_PROFILE)
+    parser.add_argument("--eval-budget-sec", type=_positive_float, default=DEFAULT_EVAL_BUDGET_SEC)
+    parser.add_argument("--sim-camera-fps", type=_positive_float, default=DEFAULT_SIM_CAMERA_FPS)
+    parser.add_argument("--sim-camera-fov-deg", type=_positive_float, default=DEFAULT_SIM_CAMERA_FOV_DEG)
+    parser.add_argument("--sim-camera-near", type=_positive_float, default=DEFAULT_SIM_CAMERA_NEAR)
+    parser.add_argument("--sim-camera-far", type=_positive_float, default=DEFAULT_SIM_CAMERA_FAR)
+    parser.add_argument("--sim-depth-noise-std", type=float, default=DEFAULT_SIM_DEPTH_NOISE_STD)
+    parser.add_argument("--sim-motion-blur", type=_confidence, default=DEFAULT_SIM_MOTION_BLUR)
+    parser.add_argument("--sim-enable-distortion", action="store_true")
+    parser.add_argument("--sim-yaw-rate-limit-deg", type=_positive_float, default=DEFAULT_SIM_YAW_RATE_LIMIT_DEG)
+    parser.add_argument("--sim-linear-velocity-limit", type=_positive_float, default=DEFAULT_SIM_LINEAR_VELOCITY_LIMIT)
+    parser.add_argument("--sim-goal-selector", choices=("heuristic", "llm"), default=DEFAULT_SIM_GOAL_SELECTOR)
+    parser.add_argument("--sim-goal-model", type=str, default=DEFAULT_SIM_GOAL_MODEL)
+    parser.add_argument("--sim-goal-timeout-sec", type=_positive_float, default=DEFAULT_SIM_GOAL_TIMEOUT_SEC)
+    parser.add_argument("--sim-external-manifest", type=str, default=None)
+    parser.add_argument(
+        "--sim-perception-mode",
+        choices=("runtime", "ground_truth", "assisted"),
+        default=DEFAULT_SIM_PERCEPTION_MODE,
+    )
+    parser.add_argument("--validate-all-scenarios", action="store_true")
+    parser.add_argument("--validation-output-dir", type=str, default=None)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
     parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
     parser.add_argument("--camera-calibration", type=str, default=os.getenv("CAMERA_CALIBRATION"))
@@ -237,6 +311,28 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         explanation_max_graph_nodes=DEFAULT_EXPLANATION_MAX_GRAPH_NODES,
         explanation_max_graph_edges=DEFAULT_EXPLANATION_MAX_GRAPH_EDGES,
         depth_profile=args.depth_profile,
+        input_source=args.input_source,
+        scenario=args.scenario,
+        sim_seed=args.sim_seed,
+        sim_max_steps=args.sim_max_steps,
+        sim_profile=args.sim_profile,
+        eval_budget_sec=args.eval_budget_sec,
+        sim_camera_fps=args.sim_camera_fps,
+        sim_camera_fov_deg=args.sim_camera_fov_deg,
+        sim_camera_near=args.sim_camera_near,
+        sim_camera_far=args.sim_camera_far,
+        sim_depth_noise_std=max(0.0, float(args.sim_depth_noise_std)),
+        sim_motion_blur=args.sim_motion_blur,
+        sim_enable_distortion=bool(args.sim_enable_distortion),
+        sim_yaw_rate_limit_deg=args.sim_yaw_rate_limit_deg,
+        sim_linear_velocity_limit=args.sim_linear_velocity_limit,
+        sim_goal_selector=args.sim_goal_selector,
+        sim_goal_model=args.sim_goal_model,
+        sim_goal_timeout_sec=args.sim_goal_timeout_sec,
+        sim_external_manifest=args.sim_external_manifest,
+        sim_perception_mode=args.sim_perception_mode,
+        validate_all_scenarios=bool(args.validate_all_scenarios),
+        validation_output_dir=args.validation_output_dir,
     )
 
 

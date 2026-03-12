@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import inspect
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -14,12 +16,14 @@ from obj_recog.camera import CameraSession, list_available_cameras, open_camera,
 from obj_recog.config import AppConfig, parse_config, resolve_depth_profile, resolve_device
 from obj_recog.depth import DepthEstimator
 from obj_recog.detector import ObjectDetector
+from obj_recog.frame_source import FramePacket, LiveCameraFrameSource
 from obj_recog.mapping import LocalMapBuilder, TsdfMeshMapBuilder
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.reconstruct import depth_to_point_cloud, intrinsics_for_frame
 from obj_recog.scene_graph import SceneGraphMemory
 from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
 from obj_recog.slam_bridge import OrbSlam3Bridge, SlamFrameResult
+from obj_recog.simulation import SimulationRuntime
 from obj_recog.situation_explainer import (
     ExplanationResult,
     ExplanationStatus,
@@ -128,6 +132,48 @@ def _update_map_builder(
         )
 
 
+def _build_map_builder(map_builder_factory, *candidate_kwargs_sets):
+    try:
+        signature = inspect.signature(map_builder_factory)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is None:
+        return map_builder_factory(**candidate_kwargs_sets[0])
+
+    parameters = signature.parameters
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+    for candidate_kwargs in candidate_kwargs_sets:
+        if accepts_var_kwargs:
+            return map_builder_factory(**candidate_kwargs)
+
+        filtered_kwargs = {key: value for key, value in candidate_kwargs.items() if key in parameters}
+        missing_required = [
+            name
+            for name, parameter in parameters.items()
+            if parameter.default is inspect._empty
+            and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            and name not in filtered_kwargs
+        ]
+        if not missing_required:
+            return map_builder_factory(**filtered_kwargs)
+
+    return map_builder_factory(**candidate_kwargs_sets[0])
+
+
+class _FramePacketOnlyDetector:
+    def detect(self, _frame_bgr):
+        raise RuntimeError("runtime detector path disabled while sim ground-truth perception is enabled")
+
+
+class _FramePacketOnlyDepthEstimator:
+    def estimate(self, _frame_bgr):
+        raise RuntimeError("runtime depth path disabled while sim ground-truth perception is enabled")
+
+
 def _update_viewer(viewer, artifacts: FrameArtifacts) -> bool:
     try:
         return viewer.update(
@@ -158,18 +204,31 @@ def process_frame(
     *,
     slam_bridge=None,
     tracker=None,
+    frame_packet: FramePacket | None = None,
+    prefer_frame_packet_ground_truth: bool = False,
+    assist_frame_packet_ground_truth: bool = False,
     cv2_module=None,
 ) -> tuple[FrameArtifacts, list[Detection]]:
     cv2 = load_cv2(cv2_module)
     inference_frame, scale_x, scale_y = resize_for_inference(frame_bgr, config.inference_width)
 
-    if frame_index % config.detection_interval == 0 or not cached_detections:
+    packet_detections = None if frame_packet is None else frame_packet.detections
+    if prefer_frame_packet_ground_truth and packet_detections is not None:
+        detections = list(packet_detections)
+    elif frame_index % config.detection_interval == 0 or not cached_detections:
         detections = detector.detect(inference_frame)
         detections = [_scale_detection(detection, scale_x, scale_y) for detection in detections]
     else:
         detections = cached_detections
+    if assist_frame_packet_ground_truth and not detections and packet_detections is not None:
+        detections = list(packet_detections)
 
-    depth_map = depth_estimator.estimate(inference_frame)
+    packet_depth_map = None if frame_packet is None else frame_packet.depth_map
+    depth_map = (
+        packet_depth_map
+        if (prefer_frame_packet_ground_truth or assist_frame_packet_ground_truth) and packet_depth_map is not None
+        else depth_estimator.estimate(inference_frame)
+    )
     if depth_map.shape != frame_bgr.shape[:2]:
         depth_map = cv2.resize(
             depth_map,
@@ -183,6 +242,8 @@ def process_frame(
             target_width=frame_bgr.shape[1],
             target_height=frame_bgr.shape[0],
         )
+    elif frame_packet is not None and frame_packet.intrinsics_gt is not None:
+        intrinsics = frame_packet.intrinsics_gt
     else:
         intrinsics = intrinsics_for_frame(frame_bgr.shape[1], frame_bgr.shape[0])
     depth_profile = resolve_depth_profile(config.depth_profile)
@@ -199,7 +260,24 @@ def process_frame(
     else:
         points_xyz = np.empty((0, 3), dtype=np.float32)
         map_point_colors = np.empty((0, 3), dtype=np.float32)
-    if slam_bridge is not None:
+    if prefer_frame_packet_ground_truth and frame_packet is not None and frame_packet.pose_world_gt is not None:
+        slam_result = SlamFrameResult(
+            tracking_state=str(frame_packet.tracking_state),
+            pose_world=np.asarray(frame_packet.pose_world_gt, dtype=np.float32),
+            keyframe_inserted=bool(frame_packet.keyframe_inserted),
+            keyframe_id=frame_packet.keyframe_id,
+            optimized_keyframe_poses={
+                int(key): np.asarray(value, dtype=np.float32)
+                for key, value in frame_packet.optimized_keyframe_poses.items()
+            },
+            sparse_map_points_xyz=np.asarray(frame_packet.sparse_map_points_xyz, dtype=np.float32).reshape(-1, 3),
+            loop_closure_applied=bool(frame_packet.loop_closure_applied),
+            tracked_feature_count=int(frame_packet.tracked_feature_count),
+            median_reprojection_error=frame_packet.median_reprojection_error,
+            keyframe_observations=list(frame_packet.keyframe_observations),
+            map_points_changed=bool(frame_packet.map_points_changed),
+        )
+    elif slam_bridge is not None:
         if timestamp_sec is None:
             raise RuntimeError("SLAM bridge requires a real frame timestamp in seconds")
         slam_gray = resize_for_slam(frame_bgr, config.slam_width, config.slam_height, cv2_module=cv2)
@@ -466,8 +544,10 @@ def run(
     explanation_snapshot_builder=build_explanation_snapshot,
     explanation_panel_renderer=render_explanation_panel,
     scene_graph_memory_factory=SceneGraphMemory,
+    frame_source_factory=None,
     time_source=time.perf_counter,
     debug_log=_default_debug_log,
+    validation_probe=None,
 ) -> None:
     cv2 = load_cv2(cv2_module)
     _load_app_dotenv()
@@ -511,6 +591,38 @@ def run(
     explanation_panel_mouse_callback_registered = False
     depth_debug_level = "basic"
     calibration_source = "disabled/approx"
+    frame_source = None
+    sim_perception_mode = getattr(config, "sim_perception_mode", "assisted")
+    use_frame_packet_ground_truth = config.input_source == "sim" and sim_perception_mode == "ground_truth"
+    assist_frame_packet_ground_truth = config.input_source == "sim" and sim_perception_mode == "assisted"
+
+    def _default_sim_frame_source(current_config: AppConfig):
+        report_path = Path.cwd() / "reports" / f"{current_config.scenario}-seed{current_config.sim_seed}.json"
+        return SimulationRuntime(
+            config=current_config,
+            report_path=report_path,
+            cv2_module=cv2,
+        ).create_frame_source()
+
+    def _live_frame_timestamp() -> float | None:
+        if slam_time_origin is None:
+            return None
+        return max(0.0, time_source() - slam_time_origin)
+
+    def _build_live_frame_source(current_session: CameraSession):
+        if frame_source_factory is not None:
+            return frame_source_factory(
+                config,
+                camera_session=current_session,
+                cv2_module=cv2,
+                time_source=_live_frame_timestamp,
+                frame_reader=read_camera_frame,
+            )
+        return LiveCameraFrameSource(
+            camera_session=current_session,
+            time_source=_live_frame_timestamp,
+            frame_reader=read_camera_frame,
+        )
 
     def _handle_object_window_mouse(event, x, y, _flags, _param) -> None:
         if event != getattr(cv2, "EVENT_LBUTTONDOWN", None):
@@ -628,7 +740,7 @@ def run(
             print(f"{device.index}: {device.name}")
         return
 
-    use_slam_bridge = slam_bridge_factory is not None
+    use_slam_bridge = slam_bridge_factory is not None and config.input_source != "sim"
     if use_slam_bridge:
         if not config.slam_vocabulary:
             raise RuntimeError("ORB-SLAM3 requires --slam-vocabulary")
@@ -646,52 +758,69 @@ def run(
     object_window_has_been_visible = False
 
     try:
-        camera_session = open_camera_fn(
-            config,
-            cv2_module=cv2,
-            preferred_name=config.camera_name,
-        )
-        if use_slam_bridge:
-            runtime_calibration = runtime_calibration_resolver(
+        if config.input_source == "sim":
+            frame_source = (
+                frame_source_factory(config, cv2_module=cv2, time_source=time_source)
+                if frame_source_factory is not None
+                else _default_sim_frame_source(config)
+            )
+        else:
+            camera_session = open_camera_fn(
                 config,
-                camera_session,
                 cv2_module=cv2,
-                frame_reader=read_camera_frame,
-                slam_bridge_factory=slam_bridge_factory,
-                time_source=time_source,
-                debug_log=debug_log,
+                preferred_name=config.camera_name,
             )
-            calibration = runtime_calibration.calibration
-            runtime_settings_path = runtime_calibration.settings_path
-            calibration_source = _normalize_calibration_source(getattr(runtime_calibration, "source", None))
-            debug_log(
-                f"runtime calibration ready (source={runtime_calibration.source}, settings={runtime_settings_path})"
-            )
-            if getattr(runtime_calibration, "source", None) in {"auto", "cache"}:
-                close_calibration_window(cv2)
-                _show_runtime_loading_preview(
-                    cv2,
-                    int(config.width),
-                    int(config.height),
-                    "Calibration complete. Loading models...",
+            if use_slam_bridge:
+                runtime_calibration = runtime_calibration_resolver(
+                    config,
+                    camera_session,
+                    cv2_module=cv2,
+                    frame_reader=read_camera_frame,
+                    slam_bridge_factory=slam_bridge_factory,
+                    time_source=time_source,
+                    debug_log=debug_log,
                 )
-        debug_log("detector init start")
-        detector = detector_factory(conf_threshold=config.conf_threshold, device=effective_device)
-        debug_log("detector init done")
-        debug_log("depth init start")
-        try:
-            depth_estimator = depth_estimator_factory(
-                device=effective_device,
-                profile=depth_profile.name,
-                low_percentile=depth_profile.low_percentile,
-                high_percentile=depth_profile.high_percentile,
-                min_depth=depth_profile.min_depth,
-                max_depth=depth_profile.max_depth,
-                gamma=depth_profile.gamma,
-            )
-        except TypeError:
-            depth_estimator = depth_estimator_factory(device=effective_device)
-        debug_log("depth init done")
+                calibration = runtime_calibration.calibration
+                runtime_settings_path = runtime_calibration.settings_path
+                calibration_source = _normalize_calibration_source(getattr(runtime_calibration, "source", None))
+                debug_log(
+                    f"runtime calibration ready (source={runtime_calibration.source}, settings={runtime_settings_path})"
+                )
+                if getattr(runtime_calibration, "source", None) in {"auto", "cache"}:
+                    close_calibration_window(cv2)
+                    _show_runtime_loading_preview(
+                        cv2,
+                        int(config.width),
+                        int(config.height),
+                        "Calibration complete. Loading models...",
+                    )
+            frame_source = _build_live_frame_source(camera_session)
+        if use_frame_packet_ground_truth:
+            detector = _FramePacketOnlyDetector()
+            depth_estimator = _FramePacketOnlyDepthEstimator()
+        elif assist_frame_packet_ground_truth:
+            debug_log("detector init start")
+            detector = detector_factory(conf_threshold=config.conf_threshold, device=effective_device)
+            debug_log("detector init done")
+            depth_estimator = _FramePacketOnlyDepthEstimator()
+        else:
+            debug_log("detector init start")
+            detector = detector_factory(conf_threshold=config.conf_threshold, device=effective_device)
+            debug_log("detector init done")
+            debug_log("depth init start")
+            try:
+                depth_estimator = depth_estimator_factory(
+                    device=effective_device,
+                    profile=depth_profile.name,
+                    low_percentile=depth_profile.low_percentile,
+                    high_percentile=depth_profile.high_percentile,
+                    min_depth=depth_profile.min_depth,
+                    max_depth=depth_profile.max_depth,
+                    gamma=depth_profile.gamma,
+                )
+            except TypeError:
+                depth_estimator = depth_estimator_factory(device=effective_device)
+            debug_log("depth init done")
         if config.segmentation_mode != "off":
             try:
                 debug_log("segmentation init start")
@@ -731,6 +860,10 @@ def run(
                     )
                     explanation_refresh_status = "failed"
                     debug_log(f"explanation disabled ({exc})")
+        if validation_probe is not None and hasattr(validation_probe, "on_start"):
+            validation_probe.on_start(
+                explanation_api_available=bool(config.explanation_enabled and os.getenv("OPENAI_API_KEY"))
+            )
         tracker = None
         if use_slam_bridge:
             slam_bridge = getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
@@ -744,22 +877,43 @@ def run(
                 )
             else:
                 debug_log("reusing promoted SLAM bridge from calibration")
-            map_builder = map_builder_factory(
-                window_keyframes=config.mapping_window_keyframes,
-                voxel_size=depth_profile.voxel_size,
-                max_mesh_triangles=depth_profile.max_mesh_triangles,
-                depth_trunc=depth_profile.max_depth,
-                depth_sampling_stride=depth_profile.depth_sampling_stride,
+            map_builder = _build_map_builder(
+                map_builder_factory,
+                dict(
+                    window_keyframes=config.mapping_window_keyframes,
+                    voxel_size=depth_profile.voxel_size,
+                    max_mesh_triangles=depth_profile.max_mesh_triangles,
+                    depth_trunc=depth_profile.max_depth,
+                    depth_sampling_stride=depth_profile.depth_sampling_stride,
+                ),
+                dict(
+                    translation_threshold=config.keyframe_translation,
+                    rotation_threshold_deg=config.keyframe_rotation_deg,
+                    frame_interval=12,
+                    window_keyframes=config.mapping_window_keyframes,
+                    voxel_size=config.map_voxel_size,
+                    max_map_points=config.max_map_points,
+                ),
             )
         else:
             tracker = tracker_factory(orb_features=config.orb_features)
-            map_builder = map_builder_factory(
-                translation_threshold=config.keyframe_translation,
-                rotation_threshold_deg=config.keyframe_rotation_deg,
-                frame_interval=12,
-                window_keyframes=config.mapping_window_keyframes,
-                voxel_size=config.map_voxel_size,
-                max_map_points=config.max_map_points,
+            map_builder = _build_map_builder(
+                map_builder_factory,
+                dict(
+                    translation_threshold=config.keyframe_translation,
+                    rotation_threshold_deg=config.keyframe_rotation_deg,
+                    frame_interval=12,
+                    window_keyframes=config.mapping_window_keyframes,
+                    voxel_size=config.map_voxel_size,
+                    max_map_points=config.max_map_points,
+                ),
+                dict(
+                    window_keyframes=config.mapping_window_keyframes,
+                    voxel_size=depth_profile.voxel_size,
+                    max_mesh_triangles=depth_profile.max_mesh_triangles,
+                    depth_trunc=depth_profile.max_depth,
+                    depth_sampling_stride=depth_profile.depth_sampling_stride,
+                ),
             )
         if config.graph_enabled:
             scene_graph_memory = scene_graph_memory_factory(
@@ -774,10 +928,17 @@ def run(
             slam_time_origin = time_source()
 
         while True:
-            ok, frame_bgr = read_camera_frame(camera_session.capture, timeout_sec=1.0)
-            if not ok:
-                if camera_session.requested_name and not camera_session.used_fallback:
-                    camera_session.capture.release()
+            frame_packet = None if frame_source is None else frame_source.next_frame(timeout_sec=1.0)
+            if frame_packet is None:
+                restarted_stream = False
+                if (
+                    config.input_source != "sim"
+                    and camera_session is not None
+                    and camera_session.requested_name
+                    and not camera_session.used_fallback
+                ):
+                    if frame_source is not None:
+                        frame_source.close()
                     camera_session = open_camera_fn(
                         config,
                         cv2_module=cv2,
@@ -810,7 +971,9 @@ def run(
                                 frame_height=config.slam_height,
                             )
                         slam_time_origin = time_source()
+                    frame_source = _build_live_frame_source(camera_session)
                     map_builder.reset()
+                    restarted_stream = True
                 cached_detections = []
                 latest_explanation_request_id = None
                 explanation_refresh_status = "idle"
@@ -829,10 +992,11 @@ def run(
                         if explanation_status == ExplanationStatus.DISABLED
                         else ExplanationStatus.IDLE
                     )
+                if restarted_stream:
                     continue
                 break
-
-            frame_timestamp_sec = None if slam_time_origin is None else max(0.0, time_source() - slam_time_origin)
+            frame_bgr = np.asarray(frame_packet.frame_bgr, dtype=np.uint8)
+            frame_timestamp_sec = frame_packet.timestamp_sec
             artifacts, cached_detections = process_frame(
                 frame_bgr=frame_bgr,
                 detector=detector,
@@ -845,9 +1009,19 @@ def run(
                 timestamp_sec=frame_timestamp_sec,
                 cached_detections=cached_detections,
                 calibration=calibration,
-                calibration_source=calibration_source,
+                calibration_source=(
+                    frame_packet.calibration_source
+                    if frame_packet is not None and frame_packet.calibration_source is not None
+                    else calibration_source
+                ),
+                frame_packet=frame_packet,
+                prefer_frame_packet_ground_truth=use_frame_packet_ground_truth,
+                assist_frame_packet_ground_truth=assist_frame_packet_ground_truth,
                 cv2_module=cv2,
             )
+            record_runtime_observation = getattr(frame_source, "record_runtime_observation", None)
+            if frame_packet is not None and callable(record_runtime_observation):
+                record_runtime_observation(frame_packet=frame_packet, artifacts=artifacts)
             if frame_index == 0:
                 debug_log("first runtime frame processed")
 
@@ -929,10 +1103,7 @@ def run(
                         target_height=artifacts.frame_bgr.shape[0],
                     )
                 else:
-                    graph_intrinsics = intrinsics_for_frame(
-                        artifacts.frame_bgr.shape[1],
-                        artifacts.frame_bgr.shape[0],
-                    )
+                    graph_intrinsics = artifacts.intrinsics
                 scene_graph_snapshot = scene_graph_memory.update(
                     frame_index=frame_index,
                     detections=artifacts.detections,
@@ -1059,6 +1230,15 @@ def run(
                     cv2.setMouseCallback("Situation Explanation", _handle_explanation_window_mouse)
                     explanation_panel_mouse_callback_registered = True
             viewer_active = _update_viewer(viewer, artifacts)
+            if validation_probe is not None and hasattr(validation_probe, "record_frame"):
+                validation_probe.record_frame(
+                    frame_index=frame_index,
+                    frame_packet=frame_packet,
+                    artifacts=artifacts,
+                    explanation_status=explanation_status,
+                    explanation_result=explanation_result,
+                    viewer_active=viewer_active,
+                )
             key = cv2.waitKey(1) & 0xFF
             window_visible = window_is_visible(cv2, "Object Recognition")
             object_window_has_been_visible = object_window_has_been_visible or window_visible
@@ -1133,6 +1313,12 @@ def run(
 
             frame_index += 1
     finally:
+        if validation_probe is not None and hasattr(validation_probe, "finish"):
+            validation_probe.finish()
+        if frame_source is not None:
+            frame_source.close()
+            if isinstance(frame_source, LiveCameraFrameSource):
+                camera_session = None
         if camera_session is not None:
             camera_session.capture.release()
         if slam_bridge is not None:
@@ -1148,8 +1334,27 @@ def run(
 
 def main() -> None:
     _load_app_dotenv()
+    config = parse_config()
+    if config.validate_all_scenarios:
+        from obj_recog.validation import run_validation_suite
+
+        summary = run_validation_suite(
+            replace(config, validate_all_scenarios=False),
+            output_dir=config.validation_output_dir,
+            run_fn=run,
+            slam_bridge_factory=OrbSlam3Bridge,
+            map_builder_factory=TsdfMeshMapBuilder,
+            situation_explainer_factory=OpenAISituationExplainer,
+            explanation_worker_factory=SituationExplanationWorker,
+        )
+        print(
+            f"validation summary: total={summary.total_runs} pass={summary.pass_runs} "
+            f"warn={summary.warn_runs} fail={summary.fail_runs} skipped={summary.skipped_runs} "
+            f"output={summary.output_dir}"
+        )
+        return
     run(
-        parse_config(),
+        config,
         slam_bridge_factory=OrbSlam3Bridge,
         map_builder_factory=TsdfMeshMapBuilder,
         situation_explainer_factory=OpenAISituationExplainer,

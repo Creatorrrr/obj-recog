@@ -5,6 +5,16 @@ import pytest
 from obj_recog.config import build_parser, parse_config, resolve_device
 
 
+_SCENARIO_IDS = (
+    "studio_open_v1",
+    "office_clutter_v1",
+    "lab_corridor_v1",
+    "showroom_occlusion_v1",
+    "office_crossflow_v1",
+    "warehouse_moving_target_v1",
+)
+
+
 def test_parse_config_uses_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
     config = parse_config([])
@@ -35,6 +45,28 @@ def test_parse_config_uses_expected_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert config.slam_vocabulary is None
     assert config.slam_width == 640
     assert config.slam_height == 360
+    assert config.input_source == "live"
+    assert config.scenario == "studio_open_v1"
+    assert config.sim_seed == 0
+    assert config.sim_max_steps == 600
+    assert config.sim_profile == "lightweight"
+    assert config.eval_budget_sec == pytest.approx(20.0)
+    assert config.sim_camera_fps == pytest.approx(10.0)
+    assert config.sim_camera_fov_deg == pytest.approx(72.0)
+    assert config.sim_camera_near == pytest.approx(0.2)
+    assert config.sim_camera_far == pytest.approx(8.0)
+    assert config.sim_depth_noise_std == pytest.approx(0.02)
+    assert config.sim_motion_blur == pytest.approx(0.1)
+    assert config.sim_enable_distortion is False
+    assert config.sim_yaw_rate_limit_deg == pytest.approx(45.0)
+    assert config.sim_linear_velocity_limit == pytest.approx(0.5)
+    assert config.sim_goal_selector == "heuristic"
+    assert config.sim_goal_model == "gpt-5-mini"
+    assert config.sim_goal_timeout_sec == pytest.approx(4.0)
+    assert config.sim_external_manifest is None
+    assert config.sim_perception_mode == "assisted"
+    assert config.validate_all_scenarios is False
+    assert config.validation_output_dir is None
     assert config.recalibrate is False
     assert config.disable_slam_calibration is False
     assert config.calibration_cache_dir is None
@@ -70,6 +102,48 @@ def test_parse_config_accepts_custom_values(monkeypatch: pytest.MonkeyPatch) -> 
             "5000",
             "--camera-calibration",
             "/tmp/camera.yaml",
+            "--input-source",
+            "sim",
+            "--scenario",
+            "warehouse_moving_target_v1",
+            "--sim-seed",
+            "17",
+            "--sim-max-steps",
+            "240",
+            "--sim-profile",
+            "external",
+            "--eval-budget-sec",
+            "18.5",
+            "--sim-camera-fps",
+            "12.5",
+            "--sim-camera-fov-deg",
+            "80.0",
+            "--sim-camera-near",
+            "0.15",
+            "--sim-camera-far",
+            "10.0",
+            "--sim-depth-noise-std",
+            "0.05",
+            "--sim-motion-blur",
+            "0.25",
+            "--sim-enable-distortion",
+            "--sim-yaw-rate-limit-deg",
+            "60.0",
+            "--sim-linear-velocity-limit",
+            "0.8",
+            "--sim-goal-selector",
+            "llm",
+            "--sim-goal-model",
+            "gpt-4.1-mini",
+            "--sim-goal-timeout-sec",
+            "6.5",
+            "--sim-external-manifest",
+            "/tmp/blender-manifest.json",
+            "--sim-perception-mode",
+            "ground_truth",
+            "--validate-all-scenarios",
+            "--validation-output-dir",
+            "/tmp/validation",
             "--segmentation-mode",
             "off",
             "--segmentation-alpha",
@@ -104,6 +178,28 @@ def test_parse_config_accepts_custom_values(monkeypatch: pytest.MonkeyPatch) -> 
     assert config.point_stride == 8
     assert config.max_points == 5000
     assert config.camera_calibration == "/tmp/camera.yaml"
+    assert config.input_source == "sim"
+    assert config.scenario == "warehouse_moving_target_v1"
+    assert config.sim_seed == 17
+    assert config.sim_max_steps == 240
+    assert config.sim_profile == "external"
+    assert config.eval_budget_sec == pytest.approx(18.5)
+    assert config.sim_camera_fps == pytest.approx(12.5)
+    assert config.sim_camera_fov_deg == pytest.approx(80.0)
+    assert config.sim_camera_near == pytest.approx(0.15)
+    assert config.sim_camera_far == pytest.approx(10.0)
+    assert config.sim_depth_noise_std == pytest.approx(0.05)
+    assert config.sim_motion_blur == pytest.approx(0.25)
+    assert config.sim_enable_distortion is True
+    assert config.sim_yaw_rate_limit_deg == pytest.approx(60.0)
+    assert config.sim_linear_velocity_limit == pytest.approx(0.8)
+    assert config.sim_goal_selector == "llm"
+    assert config.sim_goal_model == "gpt-4.1-mini"
+    assert config.sim_goal_timeout_sec == pytest.approx(6.5)
+    assert config.sim_external_manifest == "/tmp/blender-manifest.json"
+    assert config.sim_perception_mode == "ground_truth"
+    assert config.validate_all_scenarios is True
+    assert config.validation_output_dir == "/tmp/validation"
     assert config.segmentation_mode == "off"
     assert config.segmentation_alpha == pytest.approx(0.5)
     assert config.segmentation_interval == 9
@@ -153,6 +249,32 @@ def test_parse_config_uses_explanation_refresh_interval_from_environment(
     assert config.explanation_refresh_interval_sec == pytest.approx(3.5)
 
 
+def test_parse_config_accepts_assisted_sim_perception_mode() -> None:
+    config = parse_config(["--sim-perception-mode", "assisted"])
+
+    assert config.sim_perception_mode == "assisted"
+
+
+def test_parse_config_accepts_validation_flags() -> None:
+    config = parse_config(
+        [
+            "--validate-all-scenarios",
+            "--validation-output-dir",
+            "/tmp/validation",
+        ]
+    )
+
+    assert config.validate_all_scenarios is True
+    assert config.validation_output_dir == "/tmp/validation"
+
+
+@pytest.mark.parametrize("scenario_name", _SCENARIO_IDS)
+def test_parse_config_accepts_all_supported_scenarios(scenario_name: str) -> None:
+    config = parse_config(["--scenario", scenario_name])
+
+    assert config.scenario == scenario_name
+
+
 def test_parser_rejects_invalid_choices() -> None:
     parser = build_parser()
 
@@ -164,6 +286,21 @@ def test_parser_rejects_invalid_choices() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--depth-profile", "extreme"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--input-source", "dataset"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--scenario", "warehouse"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--sim-profile", "hybrid"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--sim-goal-selector", "manual"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--sim-perception-mode", "hybrid"])
 
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:
