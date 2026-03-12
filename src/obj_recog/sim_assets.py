@@ -24,6 +24,26 @@ class AssetCatalogEntry:
     preview_style: str
     base_palette: tuple[tuple[int, int, int], ...]
 
+    @property
+    def blender_library_relpath(self) -> str:
+        return f"libraries/{self.asset_family}/{self.asset_id}.blend"
+
+    @property
+    def blender_object_name(self) -> str:
+        return "".join(part.capitalize() for part in self.asset_id.split("_"))
+
+    @property
+    def lod_hint(self) -> str:
+        if self.asset_family in {"architecture", "warehouse"}:
+            return "high"
+        if self.asset_family in {"character", "electronics"}:
+            return "medium"
+        return "low"
+
+    @property
+    def material_variant(self) -> str:
+        return f"{self.asset_family}-{self.preview_style}"
+
 
 @dataclass(frozen=True, slots=True)
 class ScenarioAssetPlacement:
@@ -38,6 +58,12 @@ class ScenarioAssetPlacement:
     yaw_deg: float
     color_bgr: tuple[int, int, int]
     preview_sprite_path: str
+    blender_library_path: str
+    blender_object_name: str
+    recommended_scale: float
+    lod_hint: str
+    material_variant: str
+    render_representation: str = "mesh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +472,12 @@ def write_blender_scene_manifest(
                 "size_xyz": list(placement.size_xyz),
                 "yaw_deg": placement.yaw_deg,
                 "preview_sprite_path": placement.preview_sprite_path,
+                "blender_library_path": placement.blender_library_path,
+                "blender_object_name": placement.blender_object_name,
+                "recommended_scale": placement.recommended_scale,
+                "lod_hint": placement.lod_hint,
+                "material_variant": placement.material_variant,
+                "render_representation": placement.render_representation,
             }
             for placement in asset_manifest.placements
         ],
@@ -499,6 +531,11 @@ def _placement_from_spec(
         yaw_deg=float((abs(hash((source_key, seed))) % 36000) / 100.0),
         color_bgr=tuple(int(v) for v in getattr(item, "color_bgr")),
         preview_sprite_path=str(sprite_path),
+        blender_library_path=str(Path(cache_dir) / entry.blender_library_relpath),
+        blender_object_name=entry.blender_object_name,
+        recommended_scale=float(entry.recommended_scale),
+        lod_hint=entry.lod_hint,
+        material_variant=entry.material_variant,
     )
 
 

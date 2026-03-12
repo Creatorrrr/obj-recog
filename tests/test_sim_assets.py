@@ -25,6 +25,11 @@ def test_load_asset_catalog_exposes_semantic_assets_with_download_metadata() -> 
         assert entry.license_name == "CC0"
         assert entry.download_url.startswith("https://")
         assert entry.asset_family
+        assert entry.blender_library_relpath.endswith(".blend")
+        assert entry.blender_object_name
+        assert entry.recommended_scale > 0.0
+        assert entry.lod_hint in {"low", "medium", "high"}
+        assert entry.material_variant
 
 
 def test_build_scenario_asset_manifest_is_deterministic(tmp_path: Path) -> None:
@@ -48,6 +53,25 @@ def test_build_scenario_asset_manifest_is_deterministic(tmp_path: Path) -> None:
         (item.asset_id, item.semantic_class, item.target_role) for item in manifest_b.placements
     )
     assert manifest_a.semantic_target_class == "backpack"
+
+
+def test_build_scenario_asset_manifest_uses_mesh_first_placements(tmp_path: Path) -> None:
+    scenario = SCENARIO_SPECS["studio_open_v1"]
+    manifest = build_scenario_asset_manifest(
+        scenario,
+        seed=7,
+        cache_dir=tmp_path,
+        quality="low",
+    )
+
+    assert manifest.placements
+    for placement in manifest.placements:
+        assert placement.render_representation == "mesh"
+        assert placement.blender_library_path.endswith(".blend")
+        assert placement.blender_object_name
+        assert placement.recommended_scale > 0.0
+        assert placement.lod_hint in {"low", "medium", "high"}
+        assert placement.material_variant
 
 
 def test_ensure_preview_sprite_writes_nonempty_rgba_sprite(tmp_path: Path) -> None:
