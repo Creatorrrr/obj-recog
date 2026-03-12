@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import numpy as np
+from PIL import Image
 
 from obj_recog.config import AppConfig, SIM_SCENARIO_CHOICES
 from obj_recog.opencv_runtime import load_cv2
@@ -80,14 +81,18 @@ class ValidationSummaryReport:
 
 
 class RuntimeValidationProbe:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, output_dir: str | Path | None = None) -> None:
         self._config = config
+        self._output_dir = None if output_dir is None else Path(output_dir)
         self._frame_count = 0
         self._first_frame_index: int | None = None
         self._scene_id = str(config.scenario)
         self._scenario_family = SCENARIO_SPECS[str(config.scenario)].scenario_family
         self._difficulty_level = int(SCENARIO_SPECS[str(config.scenario)].difficulty_level)
         self._render_backend = "unknown"
+        self._render_profile = str(getattr(config, "render_profile", "fast"))
+        self._semantic_target_class = "target"
+        self._asset_manifest_id = ""
         self._explanation_api_available = False
         self._error_message: str | None = None
 
@@ -110,6 +115,8 @@ class RuntimeValidationProbe:
         self._target_detection_frames = 0
         self._max_detection_count = 0
         self._target_confidences: list[float] = []
+        self._max_target_crop_unique_colors = 0
+        self._preview_shot_path: str | None = None
 
         self._segmentation_frames = 0
         self._overlay_shape_match_frames = 0
@@ -155,6 +162,11 @@ class RuntimeValidationProbe:
             if spec is not None:
                 self._scenario_family = spec.scenario_family
             self._render_backend = str(getattr(scenario_state, "render_backend", self._render_backend))
+            self._render_profile = str(getattr(scenario_state, "render_profile", self._render_profile))
+            self._semantic_target_class = str(
+                getattr(scenario_state, "semantic_target_class", self._semantic_target_class)
+            )
+            self._asset_manifest_id = str(getattr(scenario_state, "asset_manifest_id", self._asset_manifest_id))
             self._selfcal_converged = self._selfcal_converged or bool(
                 getattr(scenario_state, "selfcal_converged", False)
             )
@@ -203,11 +215,22 @@ class RuntimeValidationProbe:
         if detections:
             self._detection_frames += 1
         self._max_detection_count = max(self._max_detection_count, len(detections))
-        target_detections = [item for item in detections if str(getattr(item, "label", "")) == "target"]
+        target_detections = [
+            item for item in detections if str(getattr(item, "label", "")) == self._semantic_target_class
+        ]
         if target_detections:
             self._target_detection_frames += 1
             self._target_confidences.append(
                 max(float(getattr(item, "confidence", 0.0)) for item in target_detections)
+            )
+            self._max_target_crop_unique_colors = max(
+                self._max_target_crop_unique_colors,
+                self._target_crop_unique_colors(getattr(artifacts, "frame_bgr"), target_detections),
+            )
+            self._maybe_save_preview_shot(
+                frame_bgr=np.asarray(getattr(artifacts, "frame_bgr"), dtype=np.uint8),
+                frame_index=frame_index,
+                target_detections=target_detections,
             )
 
         if self._config.segmentation_mode != "off":
@@ -255,6 +278,7 @@ class RuntimeValidationProbe:
         if error_message:
             self._error_message = str(error_message)
         subsystems = {
+            "render_realism": self._render_realism_verdict(),
             "reconstruction": self._reconstruction_verdict(),
             "calibration": self._calibration_verdict(),
             "object_detection": self._object_detection_verdict(),
@@ -370,6 +394,7 @@ class RuntimeValidationProbe:
             "target_detection_frames": int(self._target_detection_frames),
             "avg_target_confidence": round(avg_target_confidence, 4),
             "max_detection_count": int(self._max_detection_count),
+            "semantic_target_class": self._semantic_target_class,
         }
         if self._target_detection_frames >= 1 and avg_target_confidence >= float(self._config.conf_threshold):
             return SubsystemVerdict(
@@ -388,6 +413,43 @@ class RuntimeValidationProbe:
         return SubsystemVerdict(
             status="fail",
             reason="target was never detected",
+            key_metrics=metrics,
+            first_failure_frame=self._first_frame_index,
+            sample_count=self._frame_count,
+        )
+
+    def _render_realism_verdict(self) -> SubsystemVerdict:
+        metrics = {
+            "render_profile": self._render_profile,
+            "render_backend": self._render_backend,
+            "semantic_target_class": self._semantic_target_class,
+            "target_detection_frames": int(self._target_detection_frames),
+            "max_target_crop_unique_colors": int(self._max_target_crop_unique_colors),
+            "asset_manifest_present": bool(self._asset_manifest_id),
+            "preview_shot_path": self._preview_shot_path,
+        }
+        if (
+            self._target_detection_frames >= 1
+            and self._max_target_crop_unique_colors >= 12
+            and (not self._config.scenario_preview_shots or self._preview_shot_path is not None)
+        ):
+            return SubsystemVerdict(
+                status="pass",
+                reason="target-visible frames contained textured object appearance and preview evidence",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        if self._target_detection_frames >= 1:
+            return SubsystemVerdict(
+                status="warn",
+                reason="target appeared but render detail stayed sparse or preview evidence was missing",
+                key_metrics=metrics,
+                first_failure_frame=self._first_frame_index,
+                sample_count=self._frame_count,
+            )
+        return SubsystemVerdict(
+            status="fail",
+            reason="rendered frames never produced a usable target-visible reference shot",
             key_metrics=metrics,
             first_failure_frame=self._first_frame_index,
             sample_count=self._frame_count,
@@ -510,6 +572,35 @@ class RuntimeValidationProbe:
             sample_count=self._frame_count,
         )
 
+    def _target_crop_unique_colors(self, frame_bgr: np.ndarray, target_detections: list[Any]) -> int:
+        counts: list[int] = []
+        for detection in target_detections:
+            x1, y1, x2, y2 = (int(value) for value in getattr(detection, "xyxy"))
+            crop = frame_bgr[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
+            if crop.size == 0:
+                continue
+            unique_colors = np.unique(crop.reshape(-1, crop.shape[-1]), axis=0)
+            counts.append(int(unique_colors.shape[0]))
+        return max(counts, default=0)
+
+    def _maybe_save_preview_shot(
+        self,
+        *,
+        frame_bgr: np.ndarray,
+        frame_index: int,
+        target_detections: list[Any],
+    ) -> None:
+        if not self._config.scenario_preview_shots or self._preview_shot_path is not None or self._output_dir is None:
+            return
+        x1, y1, x2, y2 = (int(value) for value in getattr(target_detections[0], "xyxy"))
+        crop = frame_bgr[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
+        if crop.size == 0:
+            return
+        preview_path = self._output_dir / f"{self._scene_id}-{self._config.sim_perception_mode}-preview-f{frame_index}.png"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(crop[:, :, ::-1], mode="RGB").save(preview_path)
+        self._preview_shot_path = str(preview_path)
+
 
 class _HeadlessCv2Proxy:
     def __init__(self, base_cv2, *, key_sequence: Iterable[int] | None = None) -> None:
@@ -577,7 +668,7 @@ def run_validation_suite(
                 sim_perception_mode=mode,
                 validate_all_scenarios=False,
             )
-            probe = RuntimeValidationProbe(scenario_config)
+            probe = RuntimeValidationProbe(scenario_config, output_dir=output_path)
             cv2_module = run_kwargs.get("cv2_module")
             if cv2_module is None:
                 cv2_module = _HeadlessCv2Proxy(load_cv2(), key_sequence=[ord("e")])

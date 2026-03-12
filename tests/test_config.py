@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from obj_recog.config import build_parser, parse_config, resolve_device
+from obj_recog.config import AppConfig, build_parser, parse_config, resolve_device
 
 
 _SCENARIO_IDS = (
@@ -65,6 +65,11 @@ def test_parse_config_uses_expected_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert config.sim_goal_timeout_sec == pytest.approx(4.0)
     assert config.sim_external_manifest is None
     assert config.sim_perception_mode == "assisted"
+    assert config.render_profile == "fast"
+    assert config.asset_cache_dir is not None and config.asset_cache_dir.endswith(".cache/obj-recog/assets")
+    assert config.asset_quality == "low"
+    assert config.blender_exec is None
+    assert config.scenario_preview_shots is False
     assert config.validate_all_scenarios is False
     assert config.validation_output_dir is None
     assert config.recalibrate is False
@@ -141,6 +146,15 @@ def test_parse_config_accepts_custom_values(monkeypatch: pytest.MonkeyPatch) -> 
             "/tmp/blender-manifest.json",
             "--sim-perception-mode",
             "ground_truth",
+            "--render-profile",
+            "photoreal",
+            "--asset-cache-dir",
+            "/tmp/obj-recog-assets",
+            "--asset-quality",
+            "high",
+            "--blender-exec",
+            "/Applications/Blender.app/Contents/MacOS/Blender",
+            "--scenario-preview-shots",
             "--validate-all-scenarios",
             "--validation-output-dir",
             "/tmp/validation",
@@ -198,6 +212,11 @@ def test_parse_config_accepts_custom_values(monkeypatch: pytest.MonkeyPatch) -> 
     assert config.sim_goal_timeout_sec == pytest.approx(6.5)
     assert config.sim_external_manifest == "/tmp/blender-manifest.json"
     assert config.sim_perception_mode == "ground_truth"
+    assert config.render_profile == "photoreal"
+    assert config.asset_cache_dir == "/tmp/obj-recog-assets"
+    assert config.asset_quality == "high"
+    assert config.blender_exec == "/Applications/Blender.app/Contents/MacOS/Blender"
+    assert config.scenario_preview_shots is True
     assert config.validate_all_scenarios is True
     assert config.validation_output_dir == "/tmp/validation"
     assert config.segmentation_mode == "off"
@@ -302,6 +321,12 @@ def test_parser_rejects_invalid_choices() -> None:
     with pytest.raises(SystemExit):
         parser.parse_args(["--sim-perception-mode", "hybrid"])
 
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--render-profile", "stylized"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--asset-quality", "ultra"])
+
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("obj_recog.config.torch.backends.mps.is_available", lambda: True)
@@ -315,3 +340,17 @@ def test_resolve_device_falls_back_to_cpu_when_mps_unavailable(
     monkeypatch.setattr("obj_recog.config.torch.backends.mps.is_available", lambda: False)
 
     assert resolve_device("auto") == "cpu"
+
+
+def test_app_config_direct_defaults_keep_asset_cache_outside_repo() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=64,
+        height=48,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=2,
+        max_points=1000,
+    )
+
+    assert config.asset_cache_dir.endswith(".cache/obj-recog/assets")

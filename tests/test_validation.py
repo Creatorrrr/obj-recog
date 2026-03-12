@@ -28,6 +28,7 @@ def _base_config(**overrides) -> AppConfig:
         segmentation_mode="panoptic",
         explanation_enabled=True,
         graph_enabled=True,
+        scenario_preview_shots=False,
     )
     values.update(overrides)
     return AppConfig(**values)
@@ -56,7 +57,7 @@ def _scene_graph_snapshot(frame_index: int) -> SceneGraphSnapshot:
             GraphNode(
                 id="obj_target_1",
                 type="object",
-                label="target",
+                label="backpack",
                 state="visible",
                 confidence=0.95,
                 world_centroid=np.array([0.0, 0.0, 3.5], dtype=np.float32),
@@ -94,6 +95,12 @@ def _artifacts(
     mesh_z_span: float = 0.8,
 ) -> FrameArtifacts:
     frame_bgr = np.full((24, 32, 3), 32, dtype=np.uint8)
+    for detection in detections:
+        x1, y1, x2, y2 = detection.xyxy
+        for row_offset, row in enumerate(range(y1, y2)):
+            frame_bgr[row, x1:x2, 0] = (40 + row_offset * 7) % 255
+            frame_bgr[row, x1:x2, 1] = (80 + row_offset * 11) % 255
+            frame_bgr[row, x1:x2, 2] = (130 + row_offset * 13) % 255
     depth_map = np.full((24, 32), 3.6, dtype=np.float32)
     intrinsics = _intrinsics()
     dense_map_points_xyz = (
@@ -162,10 +169,13 @@ def _scenario_state(*, selfcal_converged: bool, render_backend: str = "analytic"
         rig_x=0.0,
         rig_z=0.0,
         yaw_deg=0.0,
-        visible_labels=("target",),
+        visible_labels=("backpack",),
         active_goal=None,
         target_motion_state="static",
         render_backend=render_backend,
+        render_profile="fast",
+        semantic_target_class="backpack",
+        asset_manifest_id="asset-manifest-01",
     )
 
 
@@ -181,7 +191,7 @@ def test_runtime_validation_probe_marks_passes_for_complete_pipeline() -> None:
     detection = Detection(
         xyxy=(8, 5, 26, 22),
         class_id=1,
-        label="target",
+        label="backpack",
         confidence=0.91,
         color=(40, 80, 225),
     )
@@ -227,6 +237,7 @@ def test_runtime_validation_probe_marks_passes_for_complete_pipeline() -> None:
 
     report = probe.build_report()
 
+    assert report.subsystems["render_realism"].status == "pass"
     assert report.subsystems["reconstruction"].status == "pass"
     assert report.subsystems["calibration"].status == "pass"
     assert report.subsystems["object_detection"].status == "pass"
@@ -273,6 +284,7 @@ def test_runtime_validation_probe_marks_failures_and_skips() -> None:
 
     report = probe.build_report()
 
+    assert report.subsystems["render_realism"].status == "fail"
     assert report.subsystems["reconstruction"].status == "fail"
     assert report.subsystems["calibration"].status == "fail"
     assert report.subsystems["object_detection"].status == "fail"
@@ -281,7 +293,7 @@ def test_runtime_validation_probe_marks_failures_and_skips() -> None:
     assert report.subsystems["llm_explanation"].status == "skipped"
 
 
-def test_run_validation_suite_writes_per_scenario_reports_and_summary(tmp_path: Path) -> None:
+def test_run_validation_suite_writes_per_scenario_reports_summary_and_preview_shots(tmp_path: Path) -> None:
     def fake_run_fn(config, *, validation_probe=None, **_kwargs) -> None:
         assert validation_probe is not None
         validation_probe.on_start(explanation_api_available=False)
@@ -301,10 +313,13 @@ def test_run_validation_suite_writes_per_scenario_reports_and_summary(tmp_path: 
                         rig_x=0.0,
                         rig_z=0.0,
                         yaw_deg=0.0,
-                        visible_labels=("target",),
+                        visible_labels=("backpack",),
                         active_goal=None,
                         target_motion_state="static",
                         render_backend="analytic",
+                        render_profile="fast",
+                        semantic_target_class="backpack",
+                        asset_manifest_id="asset-manifest-01",
                     ),
                     "calibration_source": "auto",
                 },
@@ -320,7 +335,7 @@ def test_run_validation_suite_writes_per_scenario_reports_and_summary(tmp_path: 
                     Detection(
                         xyxy=(8, 5, 26, 22),
                         class_id=1,
-                        label="target",
+                        label="backpack",
                         confidence=0.91,
                         color=(40, 80, 225),
                     )
@@ -350,7 +365,7 @@ def test_run_validation_suite_writes_per_scenario_reports_and_summary(tmp_path: 
         )
 
     summary = run_validation_suite(
-        _base_config(sim_max_steps=60),
+        _base_config(sim_max_steps=60, scenario_preview_shots=True),
         output_dir=tmp_path,
         scenarios=("studio_open_v1", "office_clutter_v1"),
         perception_modes=("assisted",),
@@ -362,6 +377,11 @@ def test_run_validation_suite_writes_per_scenario_reports_and_summary(tmp_path: 
     assert (tmp_path / "office_clutter_v1-assisted.json").is_file()
     summary_path = tmp_path / "summary.json"
     assert summary_path.is_file()
+    assert sorted(path.name for path in tmp_path.glob("*preview*.png")) == [
+        "office_clutter_v1-assisted-preview-f0.png",
+        "studio_open_v1-assisted-preview-f0.png",
+    ]
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     assert payload["total_runs"] == 2
     assert payload["reports"][0]["scenario"] == "studio_open_v1"
+    assert payload["reports"][0]["subsystems"]["render_realism"]["status"] == "pass"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 import math
 import os
@@ -14,6 +14,7 @@ from obj_recog.config import AppConfig, SIM_SCENARIO_CHOICES
 from obj_recog.frame_source import FramePacket
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.reconstruct import CameraIntrinsics
+from obj_recog.sim_assets import build_scenario_asset_manifest, write_blender_scene_manifest
 from obj_recog.slam_bridge import KeyframeObservation, TRACKING_OK_STATES
 from obj_recog.types import Detection, FrameArtifacts
 
@@ -125,6 +126,24 @@ class EnvironmentSpec:
     start_z: float = 0.0
     start_yaw_deg: float = -25.0
     landmark_points: tuple[tuple[float, float, float], ...] = ()
+    wall_palette_bgr: tuple[tuple[int, int, int], ...] = ((126, 118, 111), (151, 143, 138))
+    floor_palette_bgr: tuple[tuple[int, int, int], ...] = ((82, 74, 65), (57, 51, 45))
+    accent_palette_bgr: tuple[tuple[int, int, int], ...] = ((84, 128, 178), (70, 100, 132))
+
+
+@dataclass(frozen=True, slots=True)
+class LightingSpec:
+    ambient_strength: float = 0.72
+    key_light_strength: float = 0.58
+    shadow_strength: float = 0.3
+    vignette_strength: float = 0.08
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialVariantSpec:
+    floor_texture: str = "wood"
+    wall_texture: str = "paint"
+    accent_texture: str = "matte"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +188,8 @@ class ScenarioSpec:
     static_objects: tuple[StaticObjectSpec, ...]
     dynamic_actors: tuple[DynamicActorSpec, ...]
     mission: MissionSpec
+    lighting: LightingSpec = field(default_factory=LightingSpec)
+    material_variant: MaterialVariantSpec = field(default_factory=MaterialVariantSpec)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +207,9 @@ class SimulationScenarioState:
     active_goal: NavigationGoal | None
     target_motion_state: str
     render_backend: str
+    render_profile: str
+    semantic_target_class: str
+    asset_manifest_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +218,9 @@ class _SceneObject:
     center_world: tuple[float, float, float]
     size_xyz: tuple[float, float, float]
     color_bgr: tuple[int, int, int]
+    asset_id: str | None = None
+    preview_sprite_path: str | None = None
+    target_role: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +231,9 @@ class _VisibleObject:
     bearing_rad: float
     area_pixels: int
     color_bgr: tuple[int, int, int]
+    asset_id: str | None = None
+    target_role: bool = False
+    preview_sprite_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -574,6 +604,9 @@ def _visible_object(
         bearing_rad=bearing,
         area_pixels=area,
         color_bgr=item.color_bgr,
+        asset_id=item.asset_id,
+        target_role=item.target_role,
+        preview_sprite_path=item.preview_sprite_path,
     )
 
 
@@ -659,12 +692,18 @@ def _scene_object_from_specs(
     center_world: tuple[float, float, float],
     size_xyz: tuple[float, float, float],
     color_bgr: tuple[int, int, int],
+    asset_id: str | None = None,
+    preview_sprite_path: str | None = None,
+    target_role: bool = False,
 ) -> _SceneObject:
     return _SceneObject(
         label=label,
         center_world=center_world,
         size_xyz=size_xyz,
         color_bgr=color_bgr,
+        asset_id=asset_id,
+        preview_sprite_path=preview_sprite_path,
+        target_role=target_role,
     )
 
 
@@ -781,10 +820,23 @@ class HeuristicGoalSelector:
 class AnalyticSceneRenderer:
     backend_name = "analytic"
 
-    def __init__(self, *, rig: CameraRigSpec, rng=None, environment: EnvironmentSpec | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        rig: CameraRigSpec,
+        rng=None,
+        environment: EnvironmentSpec | None = None,
+        lighting: LightingSpec | None = None,
+        material_variant: MaterialVariantSpec | None = None,
+        cv2_module=None,
+    ) -> None:
         self._rig = rig
         self._rng = rng or np.random.default_rng(0)
         self._environment = environment
+        self._lighting = lighting or LightingSpec()
+        self._material_variant = material_variant or MaterialVariantSpec()
+        self._cv2 = load_cv2(cv2_module)
+        self._sprite_cache: dict[str, np.ndarray] = {}
 
     def render(
         self,
@@ -794,10 +846,7 @@ class AnalyticSceneRenderer:
         scene_objects: list[_SceneObject],
         previous_frame_bgr: np.ndarray | None,
     ) -> _RenderOutput:
-        frame = np.zeros((self._rig.image_height, self._rig.image_width, 3), dtype=np.uint8)
-        horizon = max(1, frame.shape[0] // 2)
-        frame[:horizon, :, :] = np.array([118, 96, 78], dtype=np.uint8)
-        frame[horizon:, :, :] = np.array([48, 42, 38], dtype=np.uint8)
+        frame = self._render_room_background()
         depth_map = np.full(frame.shape[:2], float(self._rig.far_plane_m), dtype=np.float32)
 
         visible_objects = _visible_objects_for_scene(
@@ -808,14 +857,17 @@ class AnalyticSceneRenderer:
         )
         for item in visible_objects:
             x1, y1, x2, y2 = item.bbox
-            frame[y1:y2, x1:x2] = np.asarray(item.color_bgr, dtype=np.uint8)
-            frame[y1:y2, x1 : min(x1 + 2, x2)] = 255
-            frame[y1:y2, max(x2 - 2, x1):x2] = 255
-            frame[y1 : min(y1 + 2, y2), x1:x2] = 255
-            frame[max(y2 - 2, y1):y2, x1:x2] = 255
+            if x2 <= x1 or y2 <= y1:
+                continue
+            self._draw_shadow(frame, item)
+            sprite = self._load_sprite(item.preview_sprite_path, item.color_bgr)
+            sprite = self._cv2.resize(sprite, (x2 - x1, y2 - y1), interpolation=self._cv2.INTER_LINEAR)
+            self._alpha_composite(frame, sprite, x1, y1, brightness=max(0.58, 1.15 - (item.depth_m * 0.09)))
             noise = self._rng.normal(0.0, float(self._rig.depth_noise_std), size=(y2 - y1, x2 - x1))
             depth_map[y1:y2, x1:x2] = np.clip(
-                float(item.depth_m) + noise.astype(np.float32),
+                float(item.depth_m)
+                + np.linspace(-0.08, 0.08, y2 - y1, dtype=np.float32)[:, None]
+                + noise.astype(np.float32),
                 float(self._rig.near_plane_m),
                 float(self._rig.far_plane_m),
             )
@@ -834,6 +886,105 @@ class AnalyticSceneRenderer:
             visible_objects=visible_objects,
             backend=self.backend_name,
         )
+
+    def _render_room_background(self) -> np.ndarray:
+        height = self._rig.image_height
+        width = self._rig.image_width
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        horizon = max(1, int(height * 0.46))
+        wall_top = np.asarray(self._environment.wall_palette_bgr[0], dtype=np.float32)
+        wall_bottom = np.asarray(self._environment.wall_palette_bgr[-1], dtype=np.float32)
+        floor_near = np.asarray(self._environment.floor_palette_bgr[0], dtype=np.float32)
+        floor_far = np.asarray(self._environment.floor_palette_bgr[-1], dtype=np.float32)
+
+        for y in range(horizon):
+            alpha = y / max(horizon - 1, 1)
+            row = ((1.0 - alpha) * wall_top) + (alpha * wall_bottom)
+            frame[y, :, :] = np.clip(row, 0.0, 255.0).astype(np.uint8)
+        for y in range(horizon, height):
+            alpha = (y - horizon) / max(height - horizon - 1, 1)
+            row = ((1.0 - alpha) * floor_far) + (alpha * floor_near)
+            frame[y, :, :] = np.clip(row, 0.0, 255.0).astype(np.uint8)
+
+        xs = np.linspace(-1.0, 1.0, width, dtype=np.float32)
+        vignette = 1.0 - (self._lighting.vignette_strength * np.square(xs))[None, :, None]
+        frame = np.clip(frame.astype(np.float32) * vignette, 0.0, 255.0).astype(np.uint8)
+
+        self._draw_floor_perspective(frame, horizon)
+        noise = self._rng.normal(0.0, 5.0, size=frame.shape).astype(np.float32)
+        frame = np.clip(frame.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
+        return frame
+
+    def _draw_floor_perspective(self, frame: np.ndarray, horizon: int) -> None:
+        height, width = frame.shape[:2]
+        vanishing_x = width // 2
+        grid_color = tuple(int(v) for v in self._environment.accent_palette_bgr[0])
+        for offset in range(-5, 6):
+            start_x = int(((offset + 6) / 12.0) * width)
+            self._cv2.line(frame, (start_x, height - 1), (vanishing_x, horizon), grid_color, 1, self._cv2.LINE_AA)
+        for row in range(1, 7):
+            y = int(horizon + (1.0 - (0.78 ** row)) * (height - horizon))
+            self._cv2.line(frame, (0, y), (width, y), grid_color, 1, self._cv2.LINE_AA)
+        self._cv2.rectangle(frame, (0, 0), (width, max(1, horizon // 8)), tuple(int(v) for v in self._environment.accent_palette_bgr[-1]), -1)
+
+    def _draw_shadow(self, frame: np.ndarray, item: _VisibleObject) -> None:
+        x1, y1, x2, y2 = item.bbox
+        shadow = np.zeros_like(frame)
+        center = (int((x1 + x2) * 0.5), max(y1 + 2, int(y2 - max(4, (y2 - y1) * 0.08))))
+        axes = (
+            max(4, int((x2 - x1) * 0.48)),
+            max(2, int((y2 - y1) * 0.14)),
+        )
+        self._cv2.ellipse(shadow, center, axes, 0.0, 0.0, 360.0, (18, 20, 22), -1, self._cv2.LINE_AA)
+        blur = self._cv2.GaussianBlur(shadow, (0, 0), sigmaX=3.2, sigmaY=2.4)
+        mask = np.any(blur > 0, axis=2, keepdims=True)
+        darkened = np.clip((frame.astype(np.float32) * 0.92) - (blur.astype(np.float32) * 0.18), 0.0, 255.0)
+        frame[:] = np.where(mask, darkened.astype(np.uint8), frame)
+
+    def _load_sprite(self, preview_sprite_path: str | None, color_bgr: tuple[int, int, int]) -> np.ndarray:
+        if preview_sprite_path is None:
+            sprite = np.zeros((128, 128, 4), dtype=np.uint8)
+            sprite[:, :, :3] = np.asarray(color_bgr, dtype=np.uint8)
+            sprite[:, :, 3] = 255
+            return sprite
+        cache_key = str(preview_sprite_path)
+        cached = self._sprite_cache.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+        sprite = self._cv2.imread(cache_key, self._cv2.IMREAD_UNCHANGED)
+        if sprite is None:
+            sprite = np.zeros((128, 128, 4), dtype=np.uint8)
+            sprite[:, :, :3] = np.asarray(color_bgr, dtype=np.uint8)
+            sprite[:, :, 3] = 255
+        elif sprite.ndim == 2:
+            sprite = np.repeat(sprite[:, :, None], 4, axis=2)
+        elif sprite.shape[2] == 3:
+            alpha = np.full(sprite.shape[:2] + (1,), 255, dtype=np.uint8)
+            sprite = np.concatenate((sprite, alpha), axis=2)
+        self._sprite_cache[cache_key] = sprite
+        return sprite.copy()
+
+    def _alpha_composite(
+        self,
+        frame: np.ndarray,
+        sprite_rgba: np.ndarray,
+        x: int,
+        y: int,
+        *,
+        brightness: float,
+    ) -> None:
+        sprite = sprite_rgba.astype(np.float32).copy()
+        sprite[:, :, :3] = np.clip(sprite[:, :, :3] * float(brightness), 0.0, 255.0)
+        height, width = sprite.shape[:2]
+        x2 = min(frame.shape[1], x + width)
+        y2 = min(frame.shape[0], y + height)
+        if x >= x2 or y >= y2:
+            return
+        sprite = sprite[: y2 - y, : x2 - x]
+        alpha = (sprite[:, :, 3:4] / 255.0).astype(np.float32)
+        base = frame[y:y2, x:x2].astype(np.float32)
+        blended = (sprite[:, :, :3] * alpha) + (base * (1.0 - alpha))
+        frame[y:y2, x:x2] = np.clip(blended, 0.0, 255.0).astype(np.uint8)
 
 
 class Open3DSceneRenderer:
@@ -1056,7 +1207,13 @@ class SimulationFrameSource:
         self._report_path = Path(report_path)
         self._camera_rig = camera_rig or CameraRigSpec.from_config(config)
         self._scenario = _get_scenario_spec(str(config.scenario))
-        self._mission = self._scenario.mission
+        self._asset_manifest = build_scenario_asset_manifest(
+            self._scenario,
+            seed=int(config.sim_seed),
+            cache_dir=config.asset_cache_dir,
+            quality=config.asset_quality,
+        )
+        self._mission = replace(self._scenario.mission, target_label=self._asset_manifest.semantic_target_class)
         self._goal_selector = goal_selector or HeuristicGoalSelector()
         self._fallback_goal_selector = fallback_goal_selector
         if self._fallback_goal_selector is None and goal_selector is not None and not isinstance(goal_selector, HeuristicGoalSelector):
@@ -1100,6 +1257,13 @@ class SimulationFrameSource:
         self._runtime_pose_error_sum = 0.0
         self._runtime_pose_error_count = 0
         self._render_backend = ""
+        self._render_profile = str(getattr(config, "render_profile", "fast"))
+        self._static_asset_placements = tuple(
+            item for item in self._asset_manifest.placements if item.source_kind == "static"
+        )
+        self._dynamic_asset_placements = {
+            item.source_key: item for item in self._asset_manifest.placements if item.source_kind == "dynamic"
+        }
         self._static_scene_objects = self._build_scene_objects()
         self._active_scene_objects = list(self._static_scene_objects)
         self._landmark_points = self._build_landmark_points()
@@ -1113,6 +1277,8 @@ class SimulationFrameSource:
             rig=self._camera_rig,
             rng=self._rng,
             environment=self._scenario.environment,
+            lighting=self._scenario.lighting,
+            material_variant=self._scenario.material_variant,
         )
         self._external_frame_source = external_frame_source
 
@@ -1176,12 +1342,15 @@ class SimulationFrameSource:
     def _build_scene_objects(self) -> list[_SceneObject]:
         return [
             _scene_object_from_specs(
-                label=item.label,
+                label=item.semantic_class,
                 center_world=item.center_world,
                 size_xyz=item.size_xyz,
                 color_bgr=item.color_bgr,
+                asset_id=item.asset_id,
+                preview_sprite_path=item.preview_sprite_path,
+                target_role=item.target_role,
             )
-            for item in self._scenario.static_objects
+            for item in self._static_asset_placements
         ]
 
     def _build_landmark_points(self) -> dict[int, np.ndarray]:
@@ -1269,6 +1438,9 @@ class SimulationFrameSource:
             active_goal=self._active_goal,
             target_motion_state=self._target_motion_state,
             render_backend=self._render_backend,
+            render_profile=self._render_profile,
+            semantic_target_class=self._asset_manifest.semantic_target_class,
+            asset_manifest_id=self._asset_manifest.manifest_id,
         )
         return FramePacket(
             frame_bgr=np.asarray(render_output.frame_bgr, dtype=np.uint8),
@@ -1324,6 +1496,9 @@ class SimulationFrameSource:
             active_goal=self._active_goal,
             target_motion_state=self._target_motion_state,
             render_backend=self._render_backend,
+            render_profile=self._render_profile,
+            semantic_target_class=self._asset_manifest.semantic_target_class,
+            asset_manifest_id=self._asset_manifest.manifest_id,
         )
         detections = list(source_packet.detections or [])
         if not detections:
@@ -1399,6 +1574,7 @@ class SimulationFrameSource:
                     bearing_rad=bearing_rad,
                     area_pixels=max(0, x2 - x1) * max(0, y2 - y1),
                     color_bgr=detection.color,
+                    target_role=(str(detection.label) == self._asset_manifest.semantic_target_class),
                 )
             )
         visible_objects.sort(key=lambda item: float(item.depth_m), reverse=True)
@@ -1420,12 +1596,16 @@ class SimulationFrameSource:
                 center_world = actor.base_center_world
             else:
                 center_world = _resolve_waypoint_loop_position(actor, elapsed_sec=self._elapsed_sec)
+            placement = self._dynamic_asset_placements.get(str(actor.actor_id))
             active_scene_objects.append(
                 _scene_object_from_specs(
-                    label=actor.label,
+                    label=(placement.semantic_class if placement is not None else actor.label),
                     center_world=center_world,
                     size_xyz=actor.size_xyz,
                     color_bgr=actor.color_bgr,
+                    asset_id=None if placement is None else placement.asset_id,
+                    preview_sprite_path=None if placement is None else placement.preview_sprite_path,
+                    target_role=bool(placement.target_role) if placement is not None else False,
                 )
             )
         self._active_scene_objects = active_scene_objects
@@ -1592,7 +1772,7 @@ class SimulationFrameSource:
 
     def _target_visible_object(self) -> _VisibleObject | None:
         for item in self._control_visible_objects():
-            if item.label == self._mission.target_label:
+            if item.target_role or item.label == self._mission.target_label:
                 return item
         return None
 
@@ -1630,7 +1810,9 @@ class SimulationFrameSource:
     def _drive_explore(self) -> None:
         if self._external_frame_source is not None:
             return
-        target = next(item for item in self._active_scene_objects if item.label == self._mission.target_label)
+        target = next(
+            item for item in self._active_scene_objects if item.target_role or item.label == self._mission.target_label
+        )
         target_xy = np.array([target.center_world[0], target.center_world[2]], dtype=np.float32)
         camera_xy = np.array([self._x, self._z], dtype=np.float32)
         delta = target_xy - camera_xy
@@ -1687,6 +1869,7 @@ class SimulationFrameSource:
                     bearing_rad=bearing_rad,
                     area_pixels=area_pixels,
                     color_bgr=detection.color,
+                    target_role=(str(detection.label) == self._asset_manifest.semantic_target_class),
                 )
             )
         objects.sort(key=lambda item: float(item.depth_m), reverse=True)
@@ -1734,6 +1917,8 @@ class SimulationFrameSource:
             "sim_profile": self._config.sim_profile,
             "sim_perception_mode": self._config.sim_perception_mode,
             "render_backend": self._render_backend or getattr(self._renderer, "backend_name", "unknown"),
+            "render_profile": self._render_profile,
+            "asset_manifest_id": self._asset_manifest.manifest_id,
             "mission_success": bool(self._mission_success),
             "failure_reason": self._failure_reason,
             "time_to_first_valid_view": (
@@ -1747,7 +1932,7 @@ class SimulationFrameSource:
             ),
             "fallback_count": int(self._fallback_count),
             "dynamic_actor_count": int(len(self._scenario.dynamic_actors)),
-            "target_class": self._mission.target_label,
+            "target_class": self._asset_manifest.semantic_target_class,
             "steps": int(self._frame_index),
         }
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1781,9 +1966,25 @@ class SimulationRuntime:
                 goal_selector = HeuristicGoalSelector()
 
         external_frame_source = None
-        if self.config.sim_profile == "external":
+        if self.config.render_profile == "photoreal" or self.config.sim_profile == "external":
             if not self.config.sim_external_manifest:
-                raise RuntimeError("sim_profile=external requires --sim-external-manifest")
+                if self.config.sim_profile == "external":
+                    raise RuntimeError("sim_profile=external requires --sim-external-manifest")
+                scene_manifest_path = write_blender_scene_manifest(
+                    scenario=scenario,
+                    asset_manifest=build_scenario_asset_manifest(
+                        scenario,
+                        seed=int(self.config.sim_seed),
+                        cache_dir=self.config.asset_cache_dir,
+                        quality=self.config.asset_quality,
+                    ),
+                    rig=CameraRigSpec.from_config(self.config),
+                    output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
+                )
+                raise RuntimeError(
+                    "render_profile=photoreal requires --sim-external-manifest; scene manifest prepared at "
+                    f"{scene_manifest_path}"
+                )
             external_frame_source = ExternalManifestFrameSource(
                 manifest_path=self.config.sim_external_manifest,
                 cv2_module=self.cv2_module,
@@ -1807,6 +2008,9 @@ class SimulationRuntime:
                     renderer = AnalyticSceneRenderer(
                         rig=CameraRigSpec.from_config(self.config),
                         environment=scenario.environment,
+                        lighting=scenario.lighting,
+                        material_variant=scenario.material_variant,
+                        cv2_module=self.cv2_module,
                     )
 
         return SimulationFrameSource(

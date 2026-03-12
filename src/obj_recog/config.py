@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import os
+from pathlib import Path
 
 try:
     import torch as _torch
@@ -86,6 +87,11 @@ class AppConfig:
     sim_goal_timeout_sec: float = 4.0
     sim_external_manifest: str | None = None
     sim_perception_mode: str = "assisted"
+    render_profile: str = "fast"
+    asset_cache_dir: str = str(Path.home() / ".cache" / "obj-recog" / "assets")
+    asset_quality: str = "low"
+    blender_exec: str | None = None
+    scenario_preview_shots: bool = False
     validate_all_scenarios: bool = False
     validation_output_dir: str | None = None
 
@@ -151,6 +157,9 @@ DEFAULT_SIM_GOAL_SELECTOR = "heuristic"
 DEFAULT_SIM_GOAL_MODEL = "gpt-5-mini"
 DEFAULT_SIM_GOAL_TIMEOUT_SEC = 4.0
 DEFAULT_SIM_PERCEPTION_MODE = "assisted"
+DEFAULT_RENDER_PROFILE = "fast"
+DEFAULT_ASSET_CACHE_DIR = str(Path.home() / ".cache" / "obj-recog" / "assets")
+DEFAULT_ASSET_QUALITY = "low"
 
 DEPTH_PROFILE_SETTINGS: dict[str, DepthProfileSettings] = {
     "fast": DepthProfileSettings(
@@ -250,6 +259,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("runtime", "ground_truth", "assisted"),
         default=DEFAULT_SIM_PERCEPTION_MODE,
     )
+    parser.add_argument("--render-profile", choices=("fast", "photoreal"), default=DEFAULT_RENDER_PROFILE)
+    parser.add_argument("--asset-cache-dir", type=str, default=DEFAULT_ASSET_CACHE_DIR)
+    parser.add_argument("--asset-quality", choices=("low", "high"), default=DEFAULT_ASSET_QUALITY)
+    parser.add_argument("--blender-exec", type=str, default=None)
+    parser.add_argument("--scenario-preview-shots", action="store_true")
     parser.add_argument("--validate-all-scenarios", action="store_true")
     parser.add_argument("--validation-output-dir", type=str, default=None)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
@@ -331,6 +345,11 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         sim_goal_timeout_sec=args.sim_goal_timeout_sec,
         sim_external_manifest=args.sim_external_manifest,
         sim_perception_mode=args.sim_perception_mode,
+        render_profile=args.render_profile,
+        asset_cache_dir=args.asset_cache_dir,
+        asset_quality=args.asset_quality,
+        blender_exec=args.blender_exec,
+        scenario_preview_shots=bool(args.scenario_preview_shots),
         validate_all_scenarios=bool(args.validate_all_scenarios),
         validation_output_dir=args.validation_output_dir,
     )

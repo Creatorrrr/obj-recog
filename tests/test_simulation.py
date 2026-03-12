@@ -8,6 +8,7 @@ import pytest
 
 from obj_recog.config import AppConfig
 from obj_recog.reconstruct import CameraIntrinsics
+from obj_recog.sim_assets import build_scenario_asset_manifest
 from obj_recog.simulation import (
     SCENARIO_SPECS,
     ExternalManifestFrameSource,
@@ -109,7 +110,63 @@ def test_simulation_frame_source_emits_scenario_metadata_in_state_and_report(tmp
     assert report["scenario_family"] == "office"
     assert report["difficulty_level"] == 5
     assert report["dynamic_actor_count"] == 2
-    assert report["target_class"] == "target"
+    assert report["target_class"] == "laptop"
+
+
+def test_simulation_frame_source_emits_render_profile_and_asset_manifest_metadata(tmp_path: Path) -> None:
+    report_path = tmp_path / "render-profile-report.json"
+    source = SimulationFrameSource(
+        config=_config(scenario="studio_open_v1", sim_seed=29),
+        report_path=report_path,
+        goal_selector=HeuristicGoalSelector(),
+    )
+
+    packet = source.next_frame()
+    assert packet is not None
+    assert packet.scenario_state.render_profile == "fast"
+    assert packet.scenario_state.semantic_target_class == "backpack"
+    assert packet.scenario_state.asset_manifest_id
+
+    source.close()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["render_profile"] == "fast"
+    assert report["asset_manifest_id"]
+    assert report["target_class"] == "backpack"
+
+
+def test_build_scenario_asset_manifest_matches_runtime_target_class() -> None:
+    manifest = build_scenario_asset_manifest(
+        SCENARIO_SPECS["warehouse_moving_target_v1"],
+        seed=7,
+        cache_dir=Path("/tmp/obj-recog-assets-test"),
+        quality="low",
+    )
+
+    assert manifest.semantic_target_class == "suitcase"
+    assert any(item.target_role and item.semantic_class == "suitcase" for item in manifest.placements)
+
+
+def test_fast_sim_renderer_produces_textured_target_patch(tmp_path: Path) -> None:
+    source = SimulationFrameSource(
+        config=_config(scenario="studio_open_v1", sim_seed=7, sim_max_steps=32),
+        report_path=tmp_path / "rendered.json",
+        goal_selector=HeuristicGoalSelector(),
+    )
+
+    target_crop = None
+    while True:
+        packet = source.next_frame()
+        assert packet is not None
+        target_detection = next((item for item in (packet.detections or []) if item.label == "backpack"), None)
+        if target_detection is None:
+            continue
+        x1, y1, x2, y2 = target_detection.xyxy
+        target_crop = packet.frame_bgr[y1:y2, x1:x2]
+        break
+
+    assert target_crop is not None
+    unique_colors = np.unique(target_crop.reshape(-1, 3), axis=0)
+    assert unique_colors.shape[0] >= 12
 
 
 def test_simulation_frame_source_runs_closed_loop_and_writes_report(tmp_path: Path) -> None:
@@ -160,9 +217,9 @@ def test_showroom_occlusion_scenario_hides_target_during_occlusion_interval(tmp_
         if packet is None:
             break
         labels = tuple(packet.scenario_state.visible_labels)
-        if packet.timestamp_sec >= 8.0 and "target" in labels:
+        if packet.timestamp_sec >= 8.0 and "backpack" in labels:
             target_seen = True
-        elif packet.timestamp_sec >= 8.0 and target_seen and "target" not in labels:
+        elif packet.timestamp_sec >= 8.0 and target_seen and "backpack" not in labels:
             target_hidden_after_seen = True
             break
 
@@ -180,7 +237,7 @@ def test_warehouse_moving_target_scenario_updates_target_pose_over_time(tmp_path
     for _ in range(6):
         packet = source.next_frame()
         assert packet is not None
-        target = next(item for item in source._active_scene_objects if item.label == "target")
+        target = next(item for item in source._active_scene_objects if item.target_role or item.label == "suitcase")
         centers.append(target.center_world)
 
     assert len({(round(center[0], 3), round(center[2], 3)) for center in centers}) > 1
@@ -457,6 +514,63 @@ def test_simulation_runtime_external_profile_still_uses_simulation_runtime(tmp_p
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert report["render_backend"] == "external-manifest"
     assert report["failure_reason"] == "external_stream_end"
+
+
+def test_simulation_runtime_photoreal_profile_uses_external_manifest_bundle(tmp_path: Path) -> None:
+    rgb_path = tmp_path / "frame.npy"
+    depth_path = tmp_path / "depth.npy"
+    np.save(rgb_path, np.full((4, 6, 3), 123, dtype=np.uint8))
+    np.save(depth_path, np.full((4, 6), 2.25, dtype=np.float32))
+    manifest_path = tmp_path / "photoreal-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "rgb_path": rgb_path.name,
+                        "depth_path": depth_path.name,
+                        "timestamp_sec": 0.25,
+                        "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
+                        "intrinsics_gt": {"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
+                        "detections": [
+                            {
+                                "xyxy": [1, 1, 5, 3],
+                                "class_id": 1,
+                                "label": "backpack",
+                                "confidence": 0.95,
+                                "color": [0, 255, 0],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = SimulationRuntime(
+        config=_config(
+            render_profile="photoreal",
+            sim_external_manifest=str(manifest_path),
+        ),
+        report_path=tmp_path / "report.json",
+    )
+
+    source = runtime.create_frame_source()
+    packet = source.next_frame()
+
+    assert packet is not None
+    assert packet.scenario_state.render_profile == "photoreal"
+    assert packet.scenario_state.semantic_target_class == "backpack"
+
+
+def test_simulation_runtime_photoreal_profile_requires_render_bundle_manifest(tmp_path: Path) -> None:
+    runtime = SimulationRuntime(
+        config=_config(render_profile="photoreal", sim_external_manifest=None),
+        report_path=tmp_path / "report.json",
+    )
+
+    with pytest.raises(RuntimeError, match="render_profile=photoreal requires --sim-external-manifest"):
+        runtime.create_frame_source()
 
 
 def test_simulation_runtime_llm_selector_falls_back_when_api_key_missing(

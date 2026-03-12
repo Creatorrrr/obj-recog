@@ -96,6 +96,25 @@ def _legacy_tracking_to_slam_result(tracking_result) -> SlamFrameResult:
     )
 
 
+def _slam_result_from_frame_packet(frame_packet: FramePacket) -> SlamFrameResult:
+    return SlamFrameResult(
+        tracking_state=str(frame_packet.tracking_state),
+        pose_world=np.asarray(frame_packet.pose_world_gt, dtype=np.float32),
+        keyframe_inserted=bool(frame_packet.keyframe_inserted),
+        keyframe_id=frame_packet.keyframe_id,
+        optimized_keyframe_poses={
+            int(key): np.asarray(value, dtype=np.float32)
+            for key, value in frame_packet.optimized_keyframe_poses.items()
+        },
+        sparse_map_points_xyz=np.asarray(frame_packet.sparse_map_points_xyz, dtype=np.float32).reshape(-1, 3),
+        loop_closure_applied=bool(frame_packet.loop_closure_applied),
+        tracked_feature_count=int(frame_packet.tracked_feature_count),
+        median_reprojection_error=frame_packet.median_reprojection_error,
+        keyframe_observations=list(frame_packet.keyframe_observations),
+        map_points_changed=bool(frame_packet.map_points_changed),
+    )
+
+
 def _update_map_builder(
     map_builder,
     slam_result: SlamFrameResult,
@@ -260,23 +279,9 @@ def process_frame(
     else:
         points_xyz = np.empty((0, 3), dtype=np.float32)
         map_point_colors = np.empty((0, 3), dtype=np.float32)
-    if prefer_frame_packet_ground_truth and frame_packet is not None and frame_packet.pose_world_gt is not None:
-        slam_result = SlamFrameResult(
-            tracking_state=str(frame_packet.tracking_state),
-            pose_world=np.asarray(frame_packet.pose_world_gt, dtype=np.float32),
-            keyframe_inserted=bool(frame_packet.keyframe_inserted),
-            keyframe_id=frame_packet.keyframe_id,
-            optimized_keyframe_poses={
-                int(key): np.asarray(value, dtype=np.float32)
-                for key, value in frame_packet.optimized_keyframe_poses.items()
-            },
-            sparse_map_points_xyz=np.asarray(frame_packet.sparse_map_points_xyz, dtype=np.float32).reshape(-1, 3),
-            loop_closure_applied=bool(frame_packet.loop_closure_applied),
-            tracked_feature_count=int(frame_packet.tracked_feature_count),
-            median_reprojection_error=frame_packet.median_reprojection_error,
-            keyframe_observations=list(frame_packet.keyframe_observations),
-            map_points_changed=bool(frame_packet.map_points_changed),
-        )
+    packet_pose_available = frame_packet is not None and frame_packet.pose_world_gt is not None
+    if prefer_frame_packet_ground_truth and packet_pose_available:
+        slam_result = _slam_result_from_frame_packet(frame_packet)
     elif slam_bridge is not None:
         if timestamp_sec is None:
             raise RuntimeError("SLAM bridge requires a real frame timestamp in seconds")
@@ -291,6 +296,9 @@ def process_frame(
         slam_result = _legacy_tracking_to_slam_result(tracking_result)
     else:
         raise RuntimeError("process_frame requires either slam_bridge or tracker")
+
+    if assist_frame_packet_ground_truth and packet_pose_available:
+        slam_result = _slam_result_from_frame_packet(frame_packet)
 
     camera_pose_world = np.asarray(slam_result.pose_world, dtype=np.float32)
     map_update = _update_map_builder(

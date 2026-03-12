@@ -5,7 +5,7 @@ import pytest
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
-from obj_recog.main import run
+from obj_recog.main import process_frame, run
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.types import Detection
 
@@ -115,6 +115,28 @@ class _CountingTracker:
         self.reset_calls += 1
 
 
+class _WrongPoseTracker:
+    def __init__(self, **_kwargs) -> None:
+        self.calls = 0
+
+    def update(self, **_kwargs):
+        self.calls += 1
+        bad_pose = np.eye(4, dtype=np.float32)
+        bad_pose[0, 3] = 1.4
+        return type(
+            "TrackingResult",
+            (),
+            {
+                "camera_pose_world": bad_pose,
+                "tracking_ok": True,
+                "did_reset": False,
+            },
+        )()
+
+    def reset(self) -> None:
+        return None
+
+
 class _StrictTracker:
     def __init__(self, **_kwargs) -> None:
         pass
@@ -183,6 +205,28 @@ class _TsdfStyleMapBuilder:
         mesh_vertex_colors = np.array([[1.0, 1.0, 1.0]], dtype=np.float32)
         update = _FakeMapUpdate(mesh_vertices_xyz, mesh_vertex_colors)
         update.mesh_triangles = np.empty((0, 3), dtype=np.int32)
+        update.mesh_vertices_xyz = mesh_vertices_xyz
+        update.mesh_vertex_colors = mesh_vertex_colors
+        update.dense_map_points_xyz = mesh_vertices_xyz
+        update.dense_map_points_rgb = mesh_vertex_colors
+        return update
+
+    def reset(self) -> None:
+        return None
+
+
+class _RecordingTsdfMapBuilder:
+    requires_point_cloud = False
+
+    def __init__(self) -> None:
+        self.pose_world_history: list[np.ndarray] = []
+
+    def update(self, *, slam_result, frame_bgr: np.ndarray, depth_map: np.ndarray, intrinsics) -> _FakeMapUpdate:
+        _ = (frame_bgr, depth_map, intrinsics)
+        self.pose_world_history.append(np.asarray(slam_result.pose_world, dtype=np.float32).copy())
+        mesh_vertices_xyz = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        mesh_vertex_colors = np.array([[1.0, 1.0, 1.0]], dtype=np.float32)
+        update = _FakeMapUpdate(mesh_vertices_xyz, mesh_vertex_colors)
         update.mesh_vertices_xyz = mesh_vertices_xyz
         update.mesh_vertex_colors = mesh_vertex_colors
         update.dense_map_points_xyz = mesh_vertices_xyz
@@ -419,3 +463,43 @@ def test_run_uses_assisted_packets_for_sim_when_enabled() -> None:
     assert viewer.closed is True
     assert detector.calls == 1
     assert tracker.calls == 2
+
+
+def test_process_frame_uses_gt_pose_for_assisted_sim_mapping_when_available() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        sim_perception_mode="assisted",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+    )
+    frame_packet = _packet(0.0)
+    tracker = _WrongPoseTracker()
+    map_builder = _RecordingTsdfMapBuilder()
+
+    artifacts, cached_detections = process_frame(
+        frame_bgr=np.asarray(frame_packet.frame_bgr, dtype=np.uint8),
+        detector=_EmptyDetector(),
+        depth_estimator=_StrictDepthEstimator(),
+        map_builder=map_builder,
+        config=config,
+        frame_index=0,
+        timestamp_sec=frame_packet.timestamp_sec,
+        cached_detections=[],
+        tracker=tracker,
+        frame_packet=frame_packet,
+        assist_frame_packet_ground_truth=True,
+    )
+
+    assert tracker.calls == 1
+    assert cached_detections == frame_packet.detections
+    assert len(map_builder.pose_world_history) == 1
+    np.testing.assert_allclose(map_builder.pose_world_history[0], frame_packet.pose_world_gt)
+    np.testing.assert_allclose(artifacts.camera_pose_world, frame_packet.pose_world_gt)
