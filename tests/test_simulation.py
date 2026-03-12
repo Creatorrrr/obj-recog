@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from obj_recog.config import AppConfig
+from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.sim_assets import build_scenario_asset_manifest
 from obj_recog.simulation import (
@@ -54,6 +55,39 @@ def _config(**overrides: object) -> AppConfig:
     )
     values.update(overrides)
     return AppConfig(**values)
+
+
+class _FakePhotorealRealtimeSource:
+    backend_name = "blender-realtime"
+
+    def __init__(self) -> None:
+        self._emitted = False
+        self.closed = False
+
+    def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
+        _ = timeout_sec
+        if self._emitted:
+            return None
+        self._emitted = True
+        return FramePacket(
+            frame_bgr=np.full((4, 6, 3), 121, dtype=np.uint8),
+            timestamp_sec=0.25,
+            depth_map=np.full((4, 6), 2.25, dtype=np.float32),
+            pose_world_gt=np.eye(4, dtype=np.float32),
+            intrinsics_gt=CameraIntrinsics(fx=10.0, fy=10.0, cx=3.0, cy=2.0),
+            detections=[
+                Detection(
+                    xyxy=(1, 1, 5, 3),
+                    class_id=1,
+                    label="backpack",
+                    confidence=0.95,
+                    color=(0, 255, 0),
+                )
+            ],
+        )
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_scenario_registry_contains_expected_specs() -> None:
@@ -571,6 +605,33 @@ def test_simulation_runtime_photoreal_profile_requires_render_bundle_manifest(tm
 
     with pytest.raises(RuntimeError, match="render_profile=photoreal requires --sim-external-manifest"):
         runtime.create_frame_source()
+
+
+def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_manifest(tmp_path: Path) -> None:
+    factory_calls: list[tuple[str, str | None]] = []
+
+    def _factory(*, config: AppConfig, scenario, camera_rig, asset_manifest, report_path):
+        _ = (scenario, camera_rig, asset_manifest, report_path)
+        factory_calls.append((config.render_profile, config.blender_exec))
+        return _FakePhotorealRealtimeSource()
+
+    runtime = SimulationRuntime(
+        config=_config(
+            render_profile="photoreal",
+            blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+            sim_external_manifest=None,
+        ),
+        report_path=tmp_path / "report.json",
+        photoreal_frame_source_factory=_factory,
+    )
+
+    source = runtime.create_frame_source()
+    packet = source.next_frame()
+
+    assert packet is not None
+    assert factory_calls == [("photoreal", "/Applications/Blender.app/Contents/MacOS/Blender")]
+    assert packet.scenario_state.render_profile == "photoreal"
+    assert packet.scenario_state.render_backend == "blender-realtime"
 
 
 def test_simulation_runtime_llm_selector_falls_back_when_api_key_missing(

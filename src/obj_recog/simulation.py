@@ -1190,6 +1190,16 @@ class ExternalManifestFrameSource:
         return None
 
 
+class RealtimePhotorealFrameSource(Protocol):
+    backend_name: str
+
+    def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
 class SimulationFrameSource:
     def __init__(
         self,
@@ -1201,7 +1211,7 @@ class SimulationFrameSource:
         camera_rig: CameraRigSpec | None = None,
         refine_intrinsics=refine_focal_lengths,
         renderer: SceneRenderer | None = None,
-        external_frame_source: ExternalManifestFrameSource | None = None,
+        external_frame_source: ExternalManifestFrameSource | RealtimePhotorealFrameSource | None = None,
     ) -> None:
         self._config = config
         self._report_path = Path(report_path)
@@ -1479,7 +1489,7 @@ class SimulationFrameSource:
             packet=source_packet,
             intrinsics=intrinsics,
         )
-        self._render_backend = "external-manifest"
+        self._render_backend = str(getattr(self._external_frame_source, "backend_name", "external-manifest"))
         self._previous_frame_bgr = np.asarray(source_packet.frame_bgr, dtype=np.uint8).copy()
         self._last_visible_objects = visible_objects
         scenario_state = SimulationScenarioState(
@@ -1951,9 +1961,11 @@ class SimulationRuntime:
     cv2_module: object | None = None
     open3d_module: object | None = None
     renderer: SceneRenderer | None = None
+    photoreal_frame_source_factory: object | None = None
 
     def create_frame_source(self) -> SimulationFrameSource:
         scenario = _get_scenario_spec(str(self.config.scenario))
+        camera_rig = CameraRigSpec.from_config(self.config)
         goal_selector = self.goal_selector
         if goal_selector is None:
             if self.config.sim_goal_selector == "llm":
@@ -1970,43 +1982,59 @@ class SimulationRuntime:
             if not self.config.sim_external_manifest:
                 if self.config.sim_profile == "external":
                     raise RuntimeError("sim_profile=external requires --sim-external-manifest")
-                scene_manifest_path = write_blender_scene_manifest(
-                    scenario=scenario,
-                    asset_manifest=build_scenario_asset_manifest(
+                if self.photoreal_frame_source_factory is not None:
+                    asset_manifest = build_scenario_asset_manifest(
                         scenario,
                         seed=int(self.config.sim_seed),
                         cache_dir=self.config.asset_cache_dir,
                         quality=self.config.asset_quality,
-                    ),
-                    rig=CameraRigSpec.from_config(self.config),
-                    output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
+                    )
+                    external_frame_source = self.photoreal_frame_source_factory(
+                        config=self.config,
+                        scenario=scenario,
+                        camera_rig=camera_rig,
+                        asset_manifest=asset_manifest,
+                        report_path=self.report_path,
+                    )
+                else:
+                    scene_manifest_path = write_blender_scene_manifest(
+                        scenario=scenario,
+                        asset_manifest=build_scenario_asset_manifest(
+                            scenario,
+                            seed=int(self.config.sim_seed),
+                            cache_dir=self.config.asset_cache_dir,
+                            quality=self.config.asset_quality,
+                        ),
+                        rig=camera_rig,
+                        output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
+                    )
+                    raise RuntimeError(
+                        "render_profile=photoreal requires --sim-external-manifest; scene manifest prepared at "
+                        f"{scene_manifest_path}"
+                    )
+            if external_frame_source is None:
+                external_frame_source = ExternalManifestFrameSource(
+                    manifest_path=self.config.sim_external_manifest,
+                    cv2_module=self.cv2_module,
                 )
-                raise RuntimeError(
-                    "render_profile=photoreal requires --sim-external-manifest; scene manifest prepared at "
-                    f"{scene_manifest_path}"
-                )
-            external_frame_source = ExternalManifestFrameSource(
-                manifest_path=self.config.sim_external_manifest,
-                cv2_module=self.cv2_module,
-            )
 
         renderer = self.renderer
         if renderer is None and external_frame_source is None:
             if self.open3d_module is not None:
                 renderer = Open3DSceneRenderer(
-                    rig=CameraRigSpec.from_config(self.config),
+                    rig=camera_rig,
                     environment=scenario.environment,
                     o3d_module=self.open3d_module,
                 )
             else:
                 try:
                     renderer = Open3DSceneRenderer(
-                        rig=CameraRigSpec.from_config(self.config),
+                        rig=camera_rig,
                         environment=scenario.environment,
                     )
                 except Exception:
                     renderer = AnalyticSceneRenderer(
-                        rig=CameraRigSpec.from_config(self.config),
+                        rig=camera_rig,
                         environment=scenario.environment,
                         lighting=scenario.lighting,
                         material_variant=scenario.material_variant,
@@ -2018,7 +2046,7 @@ class SimulationRuntime:
             report_path=self.report_path,
             goal_selector=goal_selector,
             fallback_goal_selector=self.fallback_goal_selector,
-            camera_rig=CameraRigSpec.from_config(self.config),
+            camera_rig=camera_rig,
             refine_intrinsics=self.refine_intrinsics,
             renderer=renderer,
             external_frame_source=external_frame_source,

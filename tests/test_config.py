@@ -238,6 +238,28 @@ def test_parse_config_accepts_custom_values(monkeypatch: pytest.MonkeyPatch) -> 
     assert config.max_mesh_triangles == 10_000
 
 
+def test_parse_config_accepts_photoreal_blender_exec_without_external_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
+
+    config = parse_config(
+        [
+            "--input-source",
+            "sim",
+            "--render-profile",
+            "photoreal",
+            "--blender-exec",
+            "/Applications/Blender.app/Contents/MacOS/Blender",
+        ]
+    )
+
+    assert config.input_source == "sim"
+    assert config.render_profile == "photoreal"
+    assert config.blender_exec == "/Applications/Blender.app/Contents/MacOS/Blender"
+    assert config.sim_external_manifest is None
+
+
 def test_parse_config_uses_camera_calibration_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
