@@ -7,6 +7,8 @@ import pytest
 
 from obj_recog.camera import CameraDevice, CameraSession, open_camera
 from obj_recog.config import AppConfig, parse_config
+from obj_recog.frame_source import FramePacket
+from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
 from obj_recog.main import _load_app_dotenv, main, process_frame, run
@@ -1210,6 +1212,99 @@ def test_run_exits_when_opencv_window_is_closed_and_cleans_up_resources() -> Non
     assert fake_cv2.destroyed is True
     assert fake_cv2.imshow_calls == 2
     assert fake_cv2.imshow_windows == ["Object Recognition", "Situation Explanation"]
+
+
+def test_run_shows_isometric_environment_window_for_sim_input() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        sim_perception_mode="runtime",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+    )
+    fake_cv2 = FakeCV2()
+    viewer = FakeViewer()
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    scenario_state = type(
+        "ScenarioState",
+        (),
+        {
+            "environment_objects": (
+                {
+                    "label": "backpack",
+                    "center_world": (1.0, 0.4, 2.0),
+                    "size_xyz": (0.4, 0.5, 0.3),
+                    "color_bgr": (0, 255, 0),
+                    "target_role": True,
+                    "visible": True,
+                },
+            ),
+            "rig_x": 0.0,
+            "rig_z": 0.0,
+            "yaw_deg": 0.0,
+        },
+    )()
+    packet = FramePacket(
+        frame_bgr=np.full((16, 16, 3), 127, dtype=np.uint8),
+        timestamp_sec=0.0,
+        depth_map=np.full((16, 16), 1.0, dtype=np.float32),
+        pose_world_gt=np.eye(4, dtype=np.float32),
+        intrinsics_gt=CameraIntrinsics(fx=8.0, fy=8.0, cx=8.0, cy=8.0),
+        detections=[
+            Detection(
+                xyxy=(1, 1, 8, 8),
+                class_id=0,
+                label="backpack",
+                confidence=0.9,
+                color=(0, 255, 0),
+            )
+        ],
+        scenario_state=scenario_state,
+        tracking_state="TRACKING",
+        keyframe_inserted=True,
+        keyframe_id=1,
+    )
+
+    class _SinglePacketSource:
+        def __init__(self) -> None:
+            self._packets = [packet]
+            self.closed = False
+
+        def next_frame(self, *, timeout_sec: float | None = 1.0):
+            _ = timeout_sec
+            if not self._packets:
+                return None
+            return self._packets.pop(0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = _SinglePacketSource()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        environment_model_renderer=lambda state, **_kwargs: np.zeros((64, 64, 3), dtype=np.uint8),
+    )
+
+    assert source.closed is True
+    assert "Environment Model" in fake_cv2.imshow_windows
 
 
 def test_run_releases_camera_if_viewer_creation_fails() -> None:

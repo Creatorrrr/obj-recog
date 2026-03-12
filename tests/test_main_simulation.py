@@ -275,6 +275,68 @@ def _packet(timestamp_sec: float) -> FramePacket:
     )
 
 
+def test_run_shows_environment_model_window_for_sim_scenario_state() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        sim_perception_mode="runtime",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+    )
+    scenario_state = type(
+        "ScenarioState",
+        (),
+        {
+            "environment_objects": (
+                {
+                    "label": "backpack",
+                    "center_world": (1.0, 0.4, 2.0),
+                    "size_xyz": (0.4, 0.5, 0.3),
+                    "color_bgr": (0, 255, 0),
+                    "target_role": True,
+                    "visible": True,
+                },
+            ),
+            "rig_x": 0.0,
+            "rig_z": 0.0,
+            "yaw_deg": 0.0,
+        },
+    )()
+    packet = _packet(0.0)
+    packet.scenario_state = scenario_state
+    source = _FakeFrameSource([packet])
+    fake_cv2 = _FakeCV2()
+    rendered_states: list[object] = []
+
+    def environment_model_renderer(current_state, **_kwargs) -> np.ndarray:
+        rendered_states.append(current_state)
+        return np.zeros((32, 32, 3), dtype=np.uint8)
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_kwargs: _CountingDetector(),
+        depth_estimator_factory=lambda **_kwargs: _CountingDepthEstimator(),
+        tracker_factory=lambda **_kwargs: _CountingTracker(),
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: _FakeViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+        environment_model_renderer=environment_model_renderer,
+    )
+
+    assert rendered_states == [scenario_state]
+    assert "Environment Model" in fake_cv2.imshow_calls
+
+
 def test_run_uses_frame_source_for_sim_input_without_opening_camera() -> None:
     config = AppConfig(
         camera_index=0,

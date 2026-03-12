@@ -216,6 +216,7 @@ class SimulationScenarioState:
     render_profile: str
     semantic_target_class: str
     asset_manifest_id: str
+    environment_objects: tuple[dict[str, object], ...] = ()
     semantic_mask_path: str | None = None
     instance_mask_path: str | None = None
     worker_state: str | None = None
@@ -715,6 +716,35 @@ def _scene_object_from_specs(
         preview_sprite_path=preview_sprite_path,
         target_role=target_role,
     )
+
+
+def _environment_object_snapshots(
+    scene_objects: list[object] | tuple[object, ...],
+    *,
+    visible_objects: list[_VisibleObject] | tuple[_VisibleObject, ...] = (),
+) -> tuple[dict[str, object], ...]:
+    visible_keys = {
+        (str(item.label), bool(getattr(item, "target_role", False)))
+        for item in visible_objects
+    }
+    snapshots: list[dict[str, object]] = []
+    for item in scene_objects:
+        raw_label = getattr(item, "label", None)
+        if raw_label is None:
+            raw_label = getattr(item, "semantic_class")
+        label = str(raw_label)
+        target_role = bool(getattr(item, "target_role", False))
+        snapshots.append(
+            {
+                "label": label,
+                "center_world": tuple(float(value) for value in getattr(item, "center_world")),
+                "size_xyz": tuple(float(value) for value in getattr(item, "size_xyz")),
+                "color_bgr": tuple(int(value) for value in getattr(item, "color_bgr")),
+                "target_role": target_role,
+                "visible": (label, target_role) in visible_keys,
+            }
+        )
+    return tuple(snapshots)
 
 
 def _get_scenario_spec(scene_id: str) -> ScenarioSpec:
@@ -1329,6 +1359,7 @@ class BlenderRealtimeFrameSource:
             render_profile="photoreal",
             semantic_target_class=str(self._asset_manifest.semantic_target_class),
             asset_manifest_id=str(self._asset_manifest.manifest_id),
+            environment_objects=_environment_object_snapshots(list(self._asset_manifest.placements)),
             semantic_mask_path=response.semantic_mask_path,
             instance_mask_path=response.instance_mask_path,
             worker_state=response.worker_state,
@@ -1611,6 +1642,10 @@ class SimulationFrameSource:
             render_profile=self._render_profile,
             semantic_target_class=self._asset_manifest.semantic_target_class,
             asset_manifest_id=self._asset_manifest.manifest_id,
+            environment_objects=_environment_object_snapshots(
+                self._active_scene_objects,
+                visible_objects=render_output.visible_objects,
+            ),
         )
         return FramePacket(
             frame_bgr=np.asarray(render_output.frame_bgr, dtype=np.uint8),
@@ -1669,6 +1704,10 @@ class SimulationFrameSource:
             render_profile=self._render_profile,
             semantic_target_class=self._asset_manifest.semantic_target_class,
             asset_manifest_id=self._asset_manifest.manifest_id,
+            environment_objects=_environment_object_snapshots(
+                self._active_scene_objects,
+                visible_objects=visible_objects,
+            ),
             semantic_mask_path=getattr(source_packet.scenario_state, "semantic_mask_path", None),
             instance_mask_path=getattr(source_packet.scenario_state, "instance_mask_path", None),
             worker_state=getattr(source_packet.scenario_state, "worker_state", None),

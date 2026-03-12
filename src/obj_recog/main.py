@@ -38,6 +38,7 @@ from obj_recog.visualization import (
     draw_detections,
     explanation_button_rect,
     point_in_rect,
+    render_environment_model_panel,
     render_explanation_panel,
 )
 
@@ -551,6 +552,7 @@ def run(
     overlay_renderer=draw_detections,
     explanation_snapshot_builder=build_explanation_snapshot,
     explanation_panel_renderer=render_explanation_panel,
+    environment_model_renderer=render_environment_model_panel,
     scene_graph_memory_factory=SceneGraphMemory,
     frame_source_factory=None,
     time_source=time.perf_counter,
@@ -1175,6 +1177,12 @@ def run(
                 cv2_module=cv2,
             )
             cv2.imshow("Object Recognition", overlay)
+            if frame_packet.scenario_state is not None:
+                environment_panel = environment_model_renderer(
+                    frame_packet.scenario_state,
+                    cv2_module=cv2,
+                )
+                cv2.imshow("Environment Model", environment_panel)
             explanation_button_state["rect"] = (
                 explanation_button_rect(
                     frame_width=overlay.shape[1],

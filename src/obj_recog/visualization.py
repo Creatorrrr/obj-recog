@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -655,6 +656,184 @@ def highlight_detected_points(
         if np.any(inside):
             highlighted[inside] = np.asarray(detection.color, dtype=np.float32) / 255.0
     return highlighted
+
+
+def render_environment_model_panel(
+    scenario_state,
+    *,
+    panel_width: int = 520,
+    panel_height: int = 420,
+    cv2_module=None,
+) -> np.ndarray:
+    cv2 = load_cv2(cv2_module)
+    canvas = np.full((panel_height, panel_width, 3), (18, 20, 24), dtype=np.uint8)
+    objects = tuple(getattr(scenario_state, "environment_objects", ()) or ())
+    _draw_rectangle(cv2, canvas, (18, 18), (panel_width - 18, panel_height - 18), (46, 54, 70), 1)
+    cv2.putText(
+        canvas,
+        "Environment Model",
+        (24, 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (235, 240, 250),
+        1,
+        cv2.LINE_AA,
+    )
+    if not objects:
+        cv2.putText(
+            canvas,
+            "No environment objects",
+            (24, 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (170, 176, 188),
+            1,
+            cv2.LINE_AA,
+        )
+        return canvas
+
+    scale = min(panel_width, panel_height) * 0.065
+    center_x = int(panel_width * 0.5)
+    center_y = int(panel_height * 0.64)
+    _draw_isometric_floor_grid(cv2, canvas, center_x=center_x, center_y=center_y, scale=scale)
+    for obj in sorted(objects, key=lambda item: float(item["center_world"][1]) + float(item["center_world"][2])):
+        _draw_isometric_object(cv2, canvas, obj, center_x=center_x, center_y=center_y, scale=scale)
+    _draw_isometric_camera(cv2, canvas, scenario_state, center_x=center_x, center_y=center_y, scale=scale)
+    return canvas
+
+
+def _iso_project(x: float, y: float, z: float, *, center_x: int, center_y: int, scale: float) -> tuple[int, int]:
+    iso_x = center_x + ((x - z) * scale)
+    iso_y = center_y + (((x + z) * scale * 0.5) - (y * scale * 1.35))
+    return int(round(iso_x)), int(round(iso_y))
+
+
+def _draw_isometric_floor_grid(cv2, canvas: np.ndarray, *, center_x: int, center_y: int, scale: float) -> None:
+    line = getattr(cv2, "line", None)
+    if not callable(line):
+        return
+    grid_color = (42, 50, 62)
+    for offset in range(-6, 7):
+        start = _iso_project(-6.0, 0.0, float(offset), center_x=center_x, center_y=center_y, scale=scale)
+        end = _iso_project(6.0, 0.0, float(offset), center_x=center_x, center_y=center_y, scale=scale)
+        line(canvas, start, end, grid_color, 1)
+        start = _iso_project(float(offset), 0.0, -6.0, center_x=center_x, center_y=center_y, scale=scale)
+        end = _iso_project(float(offset), 0.0, 6.0, center_x=center_x, center_y=center_y, scale=scale)
+        line(canvas, start, end, grid_color, 1)
+
+
+def _shade_color(color_bgr: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    return tuple(int(max(0, min(255, round(channel * factor)))) for channel in color_bgr)
+
+
+def _draw_isometric_object(
+    cv2,
+    canvas: np.ndarray,
+    obj: dict[str, object],
+    *,
+    center_x: int,
+    center_y: int,
+    scale: float,
+) -> None:
+    fill_poly = getattr(cv2, "fillConvexPoly", None)
+    polylines = getattr(cv2, "polylines", None)
+    line = getattr(cv2, "line", None)
+    center_world = tuple(float(value) for value in obj["center_world"])
+    size_xyz = tuple(float(value) for value in obj["size_xyz"])
+    half_x = size_xyz[0] * 0.5
+    half_y = size_xyz[1] * 0.5
+    half_z = size_xyz[2] * 0.5
+    color_bgr = tuple(int(value) for value in obj["color_bgr"])
+    if bool(obj.get("target_role")):
+        color_bgr = (40, 210, 245)
+    elif bool(obj.get("visible")):
+        color_bgr = _shade_color(color_bgr, 1.15)
+
+    x, y, z = center_world
+    top = np.array(
+        [
+            _iso_project(x - half_x, y + half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y + half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x - half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+        ],
+        dtype=np.int32,
+    )
+    right = np.array(
+        [
+            _iso_project(x + half_x, y + half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y - half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y - half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+        ],
+        dtype=np.int32,
+    )
+    left = np.array(
+        [
+            _iso_project(x - half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x - half_x, y - half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y - half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+            _iso_project(x + half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+        ],
+        dtype=np.int32,
+    )
+    if callable(fill_poly):
+        fill_poly(canvas, top, _shade_color(color_bgr, 1.1))
+        fill_poly(canvas, left, _shade_color(color_bgr, 0.88))
+        fill_poly(canvas, right, _shade_color(color_bgr, 0.72))
+    elif callable(line):
+        x1, y1 = top.min(axis=0)
+        x2, y2 = top.max(axis=0)
+        _draw_rectangle(cv2, canvas, (int(x1), int(y1)), (int(x2), int(y2)), color_bgr, -1)
+    if callable(polylines):
+        polylines(canvas, [top, right, left], True, (16, 18, 22), 1)
+    cv2.putText(
+        canvas,
+        str(obj["label"]),
+        (int(top[0][0]) - 8, int(top[0][1]) - 6),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        (235, 240, 250),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_isometric_camera(cv2, canvas: np.ndarray, scenario_state, *, center_x: int, center_y: int, scale: float) -> None:
+    line = getattr(cv2, "line", None)
+    if not callable(line):
+        return
+    rig_x = float(getattr(scenario_state, "rig_x", 0.0))
+    rig_z = float(getattr(scenario_state, "rig_z", 0.0))
+    yaw_rad = math.radians(float(getattr(scenario_state, "yaw_deg", 0.0)))
+    camera_point = _iso_project(rig_x, 0.0, rig_z, center_x=center_x, center_y=center_y, scale=scale)
+    forward = _iso_project(
+        rig_x + (math.sin(yaw_rad) * 0.8),
+        0.0,
+        rig_z + (math.cos(yaw_rad) * 0.8),
+        center_x=center_x,
+        center_y=center_y,
+        scale=scale,
+    )
+    left = _iso_project(
+        rig_x + (math.sin(yaw_rad - 0.5) * 0.55),
+        0.0,
+        rig_z + (math.cos(yaw_rad - 0.5) * 0.55),
+        center_x=center_x,
+        center_y=center_y,
+        scale=scale,
+    )
+    right = _iso_project(
+        rig_x + (math.sin(yaw_rad + 0.5) * 0.55),
+        0.0,
+        rig_z + (math.cos(yaw_rad + 0.5) * 0.55),
+        center_x=center_x,
+        center_y=center_y,
+        scale=scale,
+    )
+    line(canvas, camera_point, forward, (255, 255, 255), 2)
+    line(canvas, camera_point, left, (180, 210, 255), 1)
+    line(canvas, camera_point, right, (180, 210, 255), 1)
 
 
 class Open3DMeshViewer:
