@@ -10,6 +10,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from obj_recog.auto_calibration import create_approximate_calibration, refine_focal_lengths
+from obj_recog.blender_worker import BlenderFrameRequest, BlenderFrameResponse, BlenderWorkerClient, build_blender_worker_command
 from obj_recog.config import AppConfig, SIM_SCENARIO_CHOICES
 from obj_recog.frame_source import FramePacket
 from obj_recog.opencv_runtime import load_cv2
@@ -210,6 +211,10 @@ class SimulationScenarioState:
     render_profile: str
     semantic_target_class: str
     asset_manifest_id: str
+    semantic_mask_path: str | None = None
+    instance_mask_path: str | None = None
+    worker_state: str | None = None
+    render_time_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1175,16 +1180,11 @@ class ExternalManifestFrameSource:
         )
 
     def _load_array_or_image(self, relative_or_absolute_path: str) -> np.ndarray:
-        path = Path(relative_or_absolute_path)
-        if not path.is_absolute():
-            path = self._root / path
-        if path.suffix == ".npy":
-            return np.load(path)
-        cv2 = load_cv2(self._cv2_module)
-        frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if frame is None:
-            raise RuntimeError(f"failed to load external sim asset: {path}")
-        return np.asarray(frame)
+        return _load_array_or_image(
+            relative_or_absolute_path,
+            root=self._root,
+            cv2_module=self._cv2_module,
+        )
 
     def close(self) -> None:
         return None
@@ -1198,6 +1198,123 @@ class RealtimePhotorealFrameSource(Protocol):
 
     def close(self) -> None:
         ...
+
+
+class BlenderRealtimeFrameSource:
+    backend_name = "blender-realtime"
+
+    def __init__(
+        self,
+        *,
+        config: AppConfig,
+        scenario: ScenarioSpec,
+        camera_rig: CameraRigSpec,
+        asset_manifest: object,
+        report_path: str | Path | None = None,
+        worker_client,
+        cv2_module=None,
+    ) -> None:
+        _ = report_path
+        if scenario.scene_id != "studio_open_v1":
+            raise RuntimeError("BlenderRealtimeFrameSource currently supports only studio_open_v1")
+        self._config = config
+        self._scenario = scenario
+        self._camera_rig = camera_rig
+        self._asset_manifest = asset_manifest
+        self._worker_client = worker_client
+        self._cv2_module = cv2_module
+        self._frame_index = 0
+        self._started = False
+        self._pose_world = _pose_world_matrix(
+            float(scenario.environment.start_x),
+            float(scenario.environment.start_z),
+            math.radians(float(scenario.environment.start_yaw_deg)),
+        )
+        self._intrinsics = _intrinsics_from_rig(camera_rig)
+
+    def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
+        if not self._started:
+            start = getattr(self._worker_client, "start", None)
+            if callable(start):
+                start()
+            self._started = True
+        request = BlenderFrameRequest(
+            frame_index=self._frame_index,
+            timestamp_sec=self._elapsed_sec,
+            scenario_id=self._scenario.scene_id,
+            camera_pose_world=self._pose_world,
+            intrinsics={
+                "fx": float(self._intrinsics.fx),
+                "fy": float(self._intrinsics.fy),
+                "cx": float(self._intrinsics.cx),
+                "cy": float(self._intrinsics.cy),
+            },
+            dynamic_actor_transforms={},
+            lighting_seed=int(self._config.sim_seed),
+        )
+        response = self._worker_client.request_frame(request, timeout_sec=timeout_sec)
+        if isinstance(response, dict):
+            response = BlenderFrameResponse.from_payload(response)
+        if not isinstance(response, BlenderFrameResponse):
+            raise RuntimeError("Blender realtime worker returned an unsupported response type")
+        frame_bgr = np.asarray(
+            _load_array_or_image(response.rgb_path, cv2_module=self._cv2_module),
+            dtype=np.uint8,
+        )
+        depth_map = np.asarray(
+            _load_array_or_image(response.depth_path, cv2_module=self._cv2_module),
+            dtype=np.float32,
+        )
+        pose_world_gt = np.asarray(response.pose_world_gt, dtype=np.float32)
+        intrinsics_gt = CameraIntrinsics(
+            fx=float(response.intrinsics_gt["fx"]),
+            fy=float(response.intrinsics_gt["fy"]),
+            cx=float(response.intrinsics_gt["cx"]),
+            cy=float(response.intrinsics_gt["cy"]),
+        )
+        scenario_state = SimulationScenarioState(
+            scene_id=self._scenario.scene_id,
+            difficulty_level=self._scenario.difficulty_level,
+            phase="PHOTOREAL_PREVIEW",
+            step_index=self._frame_index,
+            elapsed_sec=self._elapsed_sec,
+            selfcal_converged=False,
+            rig_x=float(self._pose_world[0, 3]),
+            rig_z=float(self._pose_world[2, 3]),
+            yaw_deg=float(self._scenario.environment.start_yaw_deg),
+            visible_labels=tuple(),
+            active_goal=None,
+            target_motion_state="static",
+            render_backend=self.backend_name,
+            render_profile="photoreal",
+            semantic_target_class=str(self._asset_manifest.semantic_target_class),
+            asset_manifest_id=str(self._asset_manifest.manifest_id),
+            semantic_mask_path=response.semantic_mask_path,
+            instance_mask_path=response.instance_mask_path,
+            worker_state=response.worker_state,
+            render_time_ms=response.render_time_ms,
+        )
+        packet = FramePacket(
+            frame_bgr=frame_bgr,
+            timestamp_sec=self._elapsed_sec,
+            depth_map=depth_map,
+            pose_world_gt=pose_world_gt,
+            intrinsics_gt=intrinsics_gt,
+            scenario_state=scenario_state,
+            calibration_source="blender-ground-truth",
+        )
+        self._frame_index += 1
+        return packet
+
+    def close(self) -> None:
+        close = getattr(self._worker_client, "close", None)
+        if callable(close):
+            close()
+
+    @property
+    def _elapsed_sec(self) -> float:
+        fps = max(float(self._camera_rig.fps), 1.0)
+        return float(self._frame_index) / fps
 
 
 class SimulationFrameSource:
@@ -1509,6 +1626,10 @@ class SimulationFrameSource:
             render_profile=self._render_profile,
             semantic_target_class=self._asset_manifest.semantic_target_class,
             asset_manifest_id=self._asset_manifest.manifest_id,
+            semantic_mask_path=getattr(source_packet.scenario_state, "semantic_mask_path", None),
+            instance_mask_path=getattr(source_packet.scenario_state, "instance_mask_path", None),
+            worker_state=getattr(source_packet.scenario_state, "worker_state", None),
+            render_time_ms=getattr(source_packet.scenario_state, "render_time_ms", None),
         )
         detections = list(source_packet.detections or [])
         if not detections:
@@ -1962,6 +2083,7 @@ class SimulationRuntime:
     open3d_module: object | None = None
     renderer: SceneRenderer | None = None
     photoreal_frame_source_factory: object | None = None
+    blender_worker_client_factory: object | None = None
 
     def create_frame_source(self) -> SimulationFrameSource:
         scenario = _get_scenario_spec(str(self.config.scenario))
@@ -1997,20 +2119,47 @@ class SimulationRuntime:
                         report_path=self.report_path,
                     )
                 else:
-                    scene_manifest_path = write_blender_scene_manifest(
-                        scenario=scenario,
-                        asset_manifest=build_scenario_asset_manifest(
-                            scenario,
-                            seed=int(self.config.sim_seed),
-                            cache_dir=self.config.asset_cache_dir,
-                            quality=self.config.asset_quality,
-                        ),
-                        rig=camera_rig,
-                        output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
+                    if not self.config.blender_exec:
+                        scene_manifest_path = write_blender_scene_manifest(
+                            scenario=scenario,
+                            asset_manifest=build_scenario_asset_manifest(
+                                scenario,
+                                seed=int(self.config.sim_seed),
+                                cache_dir=self.config.asset_cache_dir,
+                                quality=self.config.asset_quality,
+                            ),
+                            rig=camera_rig,
+                            output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
+                        )
+                        raise RuntimeError(
+                            "render_profile=photoreal requires --blender-exec or --sim-external-manifest; "
+                            f"scene manifest prepared at {scene_manifest_path}"
+                        )
+                    asset_manifest = build_scenario_asset_manifest(
+                        scenario,
+                        seed=int(self.config.sim_seed),
+                        cache_dir=self.config.asset_cache_dir,
+                        quality=self.config.asset_quality,
                     )
-                    raise RuntimeError(
-                        "render_profile=photoreal requires --sim-external-manifest; scene manifest prepared at "
-                        f"{scene_manifest_path}"
+                    worker_client = (
+                        self.blender_worker_client_factory(
+                            config=self.config,
+                            scenario=scenario,
+                            camera_rig=camera_rig,
+                            asset_manifest=asset_manifest,
+                            report_path=self.report_path,
+                        )
+                        if self.blender_worker_client_factory is not None
+                        else _build_default_blender_worker_client(self.config)
+                    )
+                    external_frame_source = BlenderRealtimeFrameSource(
+                        config=self.config,
+                        scenario=scenario,
+                        camera_rig=camera_rig,
+                        asset_manifest=asset_manifest,
+                        report_path=self.report_path,
+                        worker_client=worker_client,
+                        cv2_module=self.cv2_module,
                     )
             if external_frame_source is None:
                 external_frame_source = ExternalManifestFrameSource(
@@ -2051,3 +2200,43 @@ class SimulationRuntime:
             renderer=renderer,
             external_frame_source=external_frame_source,
         )
+
+
+def _intrinsics_from_rig(rig: CameraRigSpec) -> CameraIntrinsics:
+    width = float(rig.image_width)
+    height = float(rig.image_height)
+    fov_rad = math.radians(float(rig.horizontal_fov_deg))
+    focal = (width * 0.5) / max(math.tan(fov_rad * 0.5), 1e-6)
+    return CameraIntrinsics(
+        fx=focal,
+        fy=focal,
+        cx=width * 0.5,
+        cy=height * 0.5,
+    )
+
+
+def _load_array_or_image(
+    relative_or_absolute_path: str | Path,
+    *,
+    root: str | Path | None = None,
+    cv2_module=None,
+) -> np.ndarray:
+    path = Path(relative_or_absolute_path)
+    if not path.is_absolute() and root is not None:
+        path = Path(root) / path
+    if path.suffix == ".npy":
+        return np.load(path)
+    cv2 = load_cv2(cv2_module)
+    frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if frame is None:
+        raise RuntimeError(f"failed to load external sim asset: {path}")
+    return np.asarray(frame)
+
+
+def _build_default_blender_worker_client(config: AppConfig) -> BlenderWorkerClient:
+    worker_script = Path(__file__).resolve().parents[2] / "scripts" / "blender" / "realtime_worker.py"
+    command = build_blender_worker_command(
+        blender_exec=str(config.blender_exec),
+        worker_script=worker_script,
+    )
+    return BlenderWorkerClient(command=command)

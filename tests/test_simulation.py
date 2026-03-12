@@ -6,11 +6,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from obj_recog.blender_worker import BlenderFrameResponse
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.sim_assets import build_scenario_asset_manifest
 from obj_recog.simulation import (
+    BlenderRealtimeFrameSource,
+    CameraRigSpec,
     SCENARIO_SPECS,
     ExternalManifestFrameSource,
     HeuristicGoalSelector,
@@ -90,12 +93,141 @@ class _FakePhotorealRealtimeSource:
         self.closed = True
 
 
+class _FakeBlenderWorker:
+    def __init__(self, response: BlenderFrameResponse) -> None:
+        self.response = response
+        self.requests = []
+        self.closed = False
+
+    def start(self) -> None:
+        return None
+
+    def request_frame(self, request, *, timeout_sec: float | None = None) -> BlenderFrameResponse:
+        self.requests.append((request, timeout_sec))
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBlenderWorker:
+    def __init__(self, response) -> None:
+        self._response = response
+        self.started = False
+        self.closed = False
+        self.requests = []
+
+    def start(self) -> None:
+        self.started = True
+
+    def request_frame(self, request, *, timeout_sec: float | None = None):
+        self.requests.append((request, timeout_sec))
+        return self._response
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_scenario_registry_contains_expected_specs() -> None:
     assert tuple(SCENARIO_SPECS) == _SCENARIO_IDS
     assert SCENARIO_SPECS["studio_open_v1"].difficulty_level == 1
     assert len(SCENARIO_SPECS["studio_open_v1"].dynamic_actors) == 0
     assert len(SCENARIO_SPECS["office_crossflow_v1"].dynamic_actors) == 2
     assert len(SCENARIO_SPECS["warehouse_moving_target_v1"].dynamic_actors) == 4
+
+
+def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp_path: Path) -> None:
+    rgb = np.full((5, 7, 3), 129, dtype=np.uint8)
+    depth = np.full((5, 7), 2.75, dtype=np.float32)
+    rgb_path = tmp_path / "rgb.npy"
+    depth_path = tmp_path / "depth.npy"
+    np.save(rgb_path, rgb)
+    np.save(depth_path, depth)
+    worker = _FakeBlenderWorker(
+        response={
+            "rgb_path": str(rgb_path),
+            "depth_path": str(depth_path),
+            "semantic_mask_path": str(tmp_path / "semantic.png"),
+            "instance_mask_path": str(tmp_path / "instance.png"),
+            "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
+            "intrinsics_gt": {"fx": 12.0, "fy": 13.0, "cx": 3.5, "cy": 2.5},
+            "render_time_ms": 16.4,
+            "worker_state": "ready",
+        }
+    )
+    config = _config(render_profile="photoreal", blender_exec="/Applications/Blender.app/Contents/MacOS/Blender")
+    source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=SCENARIO_SPECS["studio_open_v1"],
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=build_scenario_asset_manifest(
+            SCENARIO_SPECS["studio_open_v1"],
+            seed=7,
+            cache_dir=tmp_path,
+            quality="low",
+        ),
+        report_path=tmp_path / "photoreal-report.json",
+        worker_client=worker,
+    )
+
+    packet = source.next_frame(timeout_sec=0.75)
+
+    assert packet is not None
+    assert packet.frame_bgr.shape == (5, 7, 3)
+    assert packet.depth_map is not None
+    assert packet.depth_map.shape == (5, 7)
+    np.testing.assert_allclose(packet.pose_world_gt, np.eye(4, dtype=np.float32))
+    assert packet.intrinsics_gt == CameraIntrinsics(fx=12.0, fy=13.0, cx=3.5, cy=2.5)
+    assert packet.scenario_state.render_backend == "blender-realtime"
+    assert packet.scenario_state.render_profile == "photoreal"
+    assert packet.scenario_state.scene_id == "studio_open_v1"
+    assert packet.scenario_state.semantic_mask_path == str(tmp_path / "semantic.png")
+    assert packet.scenario_state.instance_mask_path == str(tmp_path / "instance.png")
+    assert packet.scenario_state.worker_state == "ready"
+    assert packet.scenario_state.render_time_ms == pytest.approx(16.4)
+    assert worker.started is True
+    assert len(worker.requests) == 1
+    assert worker.requests[0][1] == pytest.approx(0.75)
+    source.close()
+    assert worker.closed is True
+
+
+def test_simulation_runtime_routes_photoreal_to_blender_realtime_frame_source(tmp_path: Path) -> None:
+    rgb = np.full((4, 6, 3), 117, dtype=np.uint8)
+    depth = np.full((4, 6), 2.1, dtype=np.float32)
+    rgb_path = tmp_path / "runtime-rgb.npy"
+    depth_path = tmp_path / "runtime-depth.npy"
+    np.save(rgb_path, rgb)
+    np.save(depth_path, depth)
+    worker = _FakeBlenderWorker(
+        response={
+            "rgb_path": str(rgb_path),
+            "depth_path": str(depth_path),
+            "semantic_mask_path": str(tmp_path / "runtime-semantic.png"),
+            "instance_mask_path": str(tmp_path / "runtime-instance.png"),
+            "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
+            "intrinsics_gt": {"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
+            "render_time_ms": 12.0,
+            "worker_state": "ready",
+        }
+    )
+    runtime = SimulationRuntime(
+        config=_config(
+            render_profile="photoreal",
+            blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+        ),
+        report_path=tmp_path / "runtime-report.json",
+        blender_worker_client_factory=lambda **_kwargs: worker,
+    )
+
+    source = runtime.create_frame_source()
+    packet = source.next_frame()
+
+    assert packet is not None
+    assert packet.scenario_state.render_backend == "blender-realtime"
+    assert packet.scenario_state.scene_id == "studio_open_v1"
+    assert packet.scenario_state.semantic_mask_path == str(tmp_path / "runtime-semantic.png")
+    assert packet.scenario_state.instance_mask_path == str(tmp_path / "runtime-instance.png")
 
 
 @pytest.mark.parametrize("scenario_name", _SCENARIO_IDS)
@@ -597,23 +729,49 @@ def test_simulation_runtime_photoreal_profile_uses_external_manifest_bundle(tmp_
     assert packet.scenario_state.semantic_target_class == "backpack"
 
 
-def test_simulation_runtime_photoreal_profile_requires_render_bundle_manifest(tmp_path: Path) -> None:
+def test_simulation_runtime_photoreal_profile_requires_blender_exec_or_render_bundle_manifest(
+    tmp_path: Path,
+) -> None:
     runtime = SimulationRuntime(
         config=_config(render_profile="photoreal", sim_external_manifest=None),
         report_path=tmp_path / "report.json",
     )
 
-    with pytest.raises(RuntimeError, match="render_profile=photoreal requires --sim-external-manifest"):
+    with pytest.raises(
+        RuntimeError,
+        match="render_profile=photoreal requires --blender-exec or --sim-external-manifest",
+    ):
         runtime.create_frame_source()
 
 
 def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_manifest(tmp_path: Path) -> None:
+    rgb_path = tmp_path / "frame.npy"
+    depth_path = tmp_path / "depth.npy"
+    np.save(rgb_path, np.full((4, 6, 3), 121, dtype=np.uint8))
+    np.save(depth_path, np.full((4, 6), 2.0, dtype=np.float32))
     factory_calls: list[tuple[str, str | None]] = []
 
     def _factory(*, config: AppConfig, scenario, camera_rig, asset_manifest, report_path):
-        _ = (scenario, camera_rig, asset_manifest, report_path)
+        _ = report_path
         factory_calls.append((config.render_profile, config.blender_exec))
-        return _FakePhotorealRealtimeSource()
+        return BlenderRealtimeFrameSource(
+            config=config,
+            scenario=scenario,
+            camera_rig=camera_rig,
+            asset_manifest=asset_manifest,
+            worker_client=_FakeBlenderWorker(
+                BlenderFrameResponse(
+                    rgb_path=str(rgb_path),
+                    depth_path=str(depth_path),
+                    semantic_mask_path=str(tmp_path / "semantic.png"),
+                    instance_mask_path=str(tmp_path / "instance.png"),
+                    pose_world_gt=np.eye(4, dtype=np.float32),
+                    intrinsics_gt={"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
+                    render_time_ms=12.5,
+                    worker_state="ready",
+                )
+            ),
+        )
 
     runtime = SimulationRuntime(
         config=_config(
@@ -632,6 +790,74 @@ def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_mani
     assert factory_calls == [("photoreal", "/Applications/Blender.app/Contents/MacOS/Blender")]
     assert packet.scenario_state.render_profile == "photoreal"
     assert packet.scenario_state.render_backend == "blender-realtime"
+
+
+def test_blender_realtime_frame_source_emits_frame_packet_for_studio_scenario(tmp_path: Path) -> None:
+    rgb_path = tmp_path / "rgb.npy"
+    depth_path = tmp_path / "depth.npy"
+    semantic_path = tmp_path / "semantic.png"
+    instance_path = tmp_path / "instance.png"
+    np.save(rgb_path, np.full((5, 7, 3), 88, dtype=np.uint8))
+    np.save(depth_path, np.full((5, 7), 1.75, dtype=np.float32))
+    semantic_path.write_bytes(b"semantic")
+    instance_path.write_bytes(b"instance")
+    config = _config(
+        render_profile="photoreal",
+        blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+    )
+    scenario = SCENARIO_SPECS["studio_open_v1"]
+    asset_manifest = build_scenario_asset_manifest(
+        scenario,
+        seed=int(config.sim_seed),
+        cache_dir=tmp_path / "assets",
+        quality="low",
+    )
+    fake_worker = _FakeBlenderWorker(
+        BlenderFrameResponse(
+            rgb_path=str(rgb_path),
+            depth_path=str(depth_path),
+            semantic_mask_path=str(semantic_path),
+            instance_mask_path=str(instance_path),
+            pose_world_gt=np.eye(4, dtype=np.float32),
+            intrinsics_gt={"fx": 12.0, "fy": 12.0, "cx": 3.5, "cy": 2.5},
+            render_time_ms=15.0,
+            worker_state="ready",
+        )
+    )
+
+    source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=scenario,
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=asset_manifest,
+        worker_client=fake_worker,
+    )
+
+    packet = source.next_frame(timeout_sec=0.25)
+
+    assert packet is not None
+    assert packet.timestamp_sec == pytest.approx(0.0)
+    assert packet.frame_bgr.shape == (5, 7, 3)
+    assert packet.depth_map is not None
+    assert packet.pose_world_gt is not None
+    assert packet.intrinsics_gt is not None
+    assert packet.intrinsics_gt.fx == pytest.approx(12.0)
+    assert packet.scenario_state.scene_id == "studio_open_v1"
+    assert packet.scenario_state.render_backend == "blender-realtime"
+    assert packet.scenario_state.render_profile == "photoreal"
+    assert packet.scenario_state.semantic_mask_path == str(semantic_path)
+    assert packet.scenario_state.instance_mask_path == str(instance_path)
+    assert packet.scenario_state.worker_state == "ready"
+    assert packet.scenario_state.render_time_ms == pytest.approx(15.0)
+    assert packet.calibration_source == "blender-ground-truth"
+    assert len(fake_worker.requests) == 1
+    request, timeout_sec = fake_worker.requests[0]
+    assert request.scenario_id == "studio_open_v1"
+    assert timeout_sec == pytest.approx(0.25)
+    assert fake_worker.closed is False
+
+    source.close()
+    assert fake_worker.closed is True
 
 
 def test_simulation_runtime_llm_selector_falls_back_when_api_key_missing(
