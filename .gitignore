@@ -1,4 +1,5 @@
 .DS_Store
+.env
 .worktrees/
 
 # Python environment and caches

@@ -515,6 +515,7 @@ def render_explanation_panel(
     model: str,
     latency_ms: float | None,
     timestamp_label: str,
+    refresh_status: str = "idle",
     width: int = 960,
     height: int = 360,
     scroll_offset: int = 0,
@@ -527,6 +528,7 @@ def render_explanation_panel(
     canvas = np.zeros((max(320, height), max(720, width), 3), dtype=np.uint8)
     header_lines = [
         f"Status: {str(status).upper()} | {timestamp_label}",
+        f"Refresh: {str(refresh_status)}",
         f"Model: {model}",
         f"Latency: {'-' if latency_ms is None else int(round(latency_ms))}ms",
     ]

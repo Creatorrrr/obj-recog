@@ -794,14 +794,14 @@ def test_render_explanation_panel_renders_status_and_truncates_wrapped_body() ->
         else:
             sys.modules["cv2"] = previous_cv2
 
-    assert panel.shape[0] >= 240
-    assert fake_cv2.text_calls[0].startswith("Status: READY")
-    assert any(text.startswith("Model: gpt-4.1-mini") for text in fake_cv2.text_calls)
-    assert any(text.startswith("Latency: 321") for text in fake_cv2.text_calls)
-    body_lines = fake_cv2.text_calls[3:]
-    assert len(body_lines) <= 8
-    if body_lines:
-        assert body_lines[-1].endswith("...") or "불확실성:" in body_lines[-1]
+        assert panel.shape[0] >= 240
+        assert fake_cv2.text_calls[0].startswith("Status: READY")
+        assert any(text.startswith("Model: gpt-4.1-mini") for text in fake_cv2.text_calls)
+        assert any(text.startswith("Latency: 321") for text in fake_cv2.text_calls)
+        body_lines = fake_cv2.text_calls[4:]
+        assert len(body_lines) <= 8
+        if body_lines:
+            assert body_lines[-1].endswith("...") or "불확실성:" in body_lines[-1]
 
 
 def test_render_explanation_panel_uses_injected_cv2_module() -> None:
@@ -859,13 +859,15 @@ def test_render_explanation_panel_uses_unicode_text_renderer_for_body_lines() ->
         model="gpt-5-mini",
         latency_ms=12.0,
         timestamp_label="12:34:56",
+        refresh_status="updating",
         cv2_module=fake_cv2,
         unicode_text_renderer=_fake_unicode_renderer,
     )
 
     assert panel.shape[0] >= 240
-    assert fake_cv2.text_calls[:3] == [
+    assert fake_cv2.text_calls[:4] == [
         "Status: READY | 12:34:56",
+        "Refresh: updating",
         "Model: gpt-5-mini",
         "Latency: 12ms",
     ]
@@ -903,6 +905,33 @@ def test_render_explanation_panel_shows_ready_empty_response_message() -> None:
 
     assert panel.shape[1] >= 320
     assert unicode_calls == [["모델이 비어 있는 설명을 반환했습니다. 다시 시도해 주세요."]]
+
+
+def test_render_explanation_panel_renders_refresh_status_line() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    fake_cv2 = _FakeCV2()
+    render_explanation_panel(
+        status="ready",
+        text="기존 분석",
+        model="gpt-5-mini",
+        latency_ms=42.0,
+        timestamp_label="12:34:56",
+        refresh_status="failed",
+        cv2_module=fake_cv2,
+        unicode_text_renderer=lambda canvas, lines, **_: canvas,
+    )
+
+    assert "Refresh: failed" in fake_cv2.text_calls
 
 
 def test_render_explanation_panel_supports_scroll_offset_and_returns_layout_metadata() -> None:

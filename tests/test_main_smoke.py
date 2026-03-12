@@ -2086,6 +2086,267 @@ def test_run_auto_refreshes_explanation_while_toggle_is_on(
     assert [snapshot_id for snapshot_id, _payload in worker.submissions] == [1, 2]
 
 
+def test_run_preserves_previous_explanation_body_while_auto_refresh_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+        explanation_refresh_interval_sec=1.0,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, -1, -1, ord("q")],
+        mouse_events=[("Object Recognition", FakeCV2.EVENT_LBUTTONDOWN, 620, 460)],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            None,
+            (
+                1,
+                ExplanationResult(
+                    text="기존 분석 본문",
+                    status=ExplanationStatus.READY,
+                    latency_ms=12.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+            None,
+            None,
+        ]
+    )
+    panel_calls: list[dict[str, object]] = []
+
+    def _fake_explanation_panel_renderer(
+        *,
+        status,
+        text,
+        model,
+        latency_ms,
+        timestamp_label,
+        refresh_status="idle",
+        scroll_offset=0,
+        cv2_module=None,
+        return_metadata=False,
+        **_,
+    ):
+        panel_calls.append(
+            {
+                "status": status,
+                "text": text,
+                "refresh_status": refresh_status,
+            }
+        )
+        panel = np.zeros((360, 960, 3), dtype=np.uint8)
+        metadata = {
+            "scroll_offset": int(scroll_offset),
+            "max_scroll_offset": 0,
+            "up_rect": None,
+            "down_rect": None,
+        }
+        if return_metadata:
+            return panel, metadata
+        return panel
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        explanation_worker_factory=lambda **_: worker,
+        explanation_panel_renderer=_fake_explanation_panel_renderer,
+        time_source=FakeClock([0.0, 0.0, 0.0, 0.5, 0.5, 0.8, 0.8, 1.6, 1.6, 1.8]),
+    )
+
+    assert panel_calls[-1]["text"] == "기존 분석 본문"
+    assert panel_calls[-1]["refresh_status"] == "updating"
+
+
+def test_run_preserves_previous_explanation_body_when_auto_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+        explanation_refresh_interval_sec=1.0,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, -1, -1, ord("q")],
+        mouse_events=[("Object Recognition", FakeCV2.EVENT_LBUTTONDOWN, 620, 460)],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            None,
+            (
+                1,
+                ExplanationResult(
+                    text="기존 분석 본문",
+                    status=ExplanationStatus.READY,
+                    latency_ms=12.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+            None,
+            (
+                2,
+                ExplanationResult(
+                    text="",
+                    status=ExplanationStatus.ERROR,
+                    latency_ms=None,
+                    model="fake-model",
+                    error_message="refresh failed",
+                ),
+            ),
+        ]
+    )
+    panel_calls: list[dict[str, object]] = []
+
+    def _fake_explanation_panel_renderer(
+        *,
+        status,
+        text,
+        model,
+        latency_ms,
+        timestamp_label,
+        refresh_status="idle",
+        scroll_offset=0,
+        cv2_module=None,
+        return_metadata=False,
+        **_,
+    ):
+        panel_calls.append(
+            {
+                "status": status,
+                "text": text,
+                "refresh_status": refresh_status,
+            }
+        )
+        panel = np.zeros((360, 960, 3), dtype=np.uint8)
+        metadata = {
+            "scroll_offset": int(scroll_offset),
+            "max_scroll_offset": 0,
+            "up_rect": None,
+            "down_rect": None,
+        }
+        if return_metadata:
+            return panel, metadata
+        return panel
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        explanation_worker_factory=lambda **_: worker,
+        explanation_panel_renderer=_fake_explanation_panel_renderer,
+        time_source=FakeClock([0.0, 0.0, 0.0, 0.5, 0.5, 0.8, 0.8, 1.6, 1.6, 1.8]),
+    )
+
+    assert panel_calls[-1]["text"] == "기존 분석 본문"
+    assert panel_calls[-1]["refresh_status"] == "failed"
+
+
 def test_run_updates_explanation_scroll_offset_on_panel_button_click(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

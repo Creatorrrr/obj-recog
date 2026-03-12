@@ -494,6 +494,7 @@ def run(
     explanation_snapshot_id = 0
     latest_explanation_request_id: int | None = None
     latest_explanation_timestamp = "-"
+    explanation_refresh_status = "idle"
     explanation_auto_refresh_enabled = False
     last_explanation_request_time: float | None = None
     explanation_button_state = {
@@ -548,35 +549,42 @@ def run(
         nonlocal latest_explanation_timestamp
         nonlocal explanation_status
         nonlocal explanation_result
+        nonlocal explanation_refresh_status
         nonlocal last_explanation_request_time
         if not config.explanation_enabled or explanation_worker is None:
             return False
-        explanation_status = ExplanationStatus.CAPTURING
+        preserve_displayed_explanation = bool((explanation_result.text or "").strip()) and (
+            explanation_status == ExplanationStatus.READY
+        )
+        request_timestamp_label = time.strftime("%H:%M:%S")
         explanation_snapshot_id += 1
         latest_explanation_request_id = explanation_snapshot_id
         last_explanation_request_time = (
             float(requested_at) if requested_at is not None else float(time_source())
         )
-        latest_explanation_timestamp = time.strftime("%H:%M:%S")
+        explanation_refresh_status = "updating"
+        if not preserve_displayed_explanation:
+            latest_explanation_timestamp = request_timestamp_label
         snapshot = explanation_snapshot_builder(
             artifacts,
             snapshot_id=explanation_snapshot_id,
             max_detections=config.explanation_max_detections,
             max_graph_nodes=config.explanation_max_graph_nodes,
             max_graph_edges=config.explanation_max_graph_edges,
-            timestamp_label=latest_explanation_timestamp,
+            timestamp_label=request_timestamp_label,
         )
         explanation_worker.submit(snapshot.snapshot_id, snapshot)
-        explanation_status = ExplanationStatus.LOADING
-        explanation_result = ExplanationResult(
-            text="",
-            status=ExplanationStatus.LOADING,
-            latency_ms=None,
-            model=config.explanation_model,
-            error_message=None,
-        )
-        explanation_panel_state["scroll_offset"] = 0
-        explanation_panel_state["pending_scroll"] = 0
+        if not preserve_displayed_explanation:
+            explanation_status = ExplanationStatus.LOADING
+            explanation_result = ExplanationResult(
+                text="",
+                status=ExplanationStatus.LOADING,
+                latency_ms=None,
+                model=config.explanation_model,
+                error_message=None,
+            )
+            explanation_panel_state["scroll_offset"] = 0
+            explanation_panel_state["pending_scroll"] = 0
         return True
 
     def _toggle_explanation_auto_refresh(
@@ -585,12 +593,16 @@ def run(
         toggled_at: float | None = None,
     ) -> None:
         nonlocal explanation_auto_refresh_enabled
+        nonlocal explanation_refresh_status
         if not config.explanation_enabled or explanation_worker is None:
             explanation_auto_refresh_enabled = False
+            explanation_refresh_status = "idle"
             return
         explanation_auto_refresh_enabled = not explanation_auto_refresh_enabled
         if explanation_auto_refresh_enabled:
             _submit_explanation_request(artifacts, requested_at=toggled_at)
+        else:
+            explanation_refresh_status = "idle"
 
     if config.list_cameras:
         for device in camera_lister():
@@ -698,6 +710,7 @@ def run(
                         model=config.explanation_model,
                         error_message=str(exc),
                     )
+                    explanation_refresh_status = "failed"
                     debug_log(f"explanation disabled ({exc})")
         tracker = None
         if use_slam_bridge:
@@ -781,6 +794,7 @@ def run(
                     map_builder.reset()
                 cached_detections = []
                 latest_explanation_request_id = None
+                explanation_refresh_status = "idle"
                 last_explanation_request_time = None
                 explanation_button_state["pending_toggle"] = False
                 if config.explanation_enabled:
@@ -918,10 +932,25 @@ def run(
                 if explanation_poll_result is not None:
                     result_snapshot_id, result = explanation_poll_result
                     if latest_explanation_request_id is not None and result_snapshot_id == latest_explanation_request_id:
-                        explanation_result = result
-                        explanation_status = result.status
-                        explanation_panel_state["scroll_offset"] = 0
-                        explanation_panel_state["pending_scroll"] = 0
+                        preserve_previous_explanation = bool((explanation_result.text or "").strip()) and (
+                            explanation_status == ExplanationStatus.READY
+                        )
+                        received_valid_text = bool((result.text or "").strip())
+                        if result.status == ExplanationStatus.READY and received_valid_text:
+                            explanation_result = result
+                            explanation_status = result.status
+                            latest_explanation_timestamp = time.strftime("%H:%M:%S")
+                            explanation_refresh_status = "idle"
+                            explanation_panel_state["scroll_offset"] = 0
+                            explanation_panel_state["pending_scroll"] = 0
+                        elif preserve_previous_explanation:
+                            explanation_refresh_status = "failed"
+                        else:
+                            explanation_result = result
+                            explanation_status = result.status
+                            explanation_refresh_status = "failed"
+                            explanation_panel_state["scroll_offset"] = 0
+                            explanation_panel_state["pending_scroll"] = 0
 
             now = time_source()
             fps = 1.0 / max(now - last_frame_time, 1e-6)
@@ -977,6 +1006,7 @@ def run(
                         model=explanation_result.model or config.explanation_model,
                         latency_ms=explanation_result.latency_ms,
                         timestamp_label=latest_explanation_timestamp,
+                        refresh_status=explanation_refresh_status,
                         scroll_offset=int(explanation_panel_state["scroll_offset"]),
                         cv2_module=cv2,
                         return_metadata=True,
@@ -988,6 +1018,7 @@ def run(
                         model=explanation_result.model or config.explanation_model,
                         latency_ms=explanation_result.latency_ms,
                         timestamp_label=latest_explanation_timestamp,
+                        refresh_status=explanation_refresh_status,
                         cv2_module=cv2,
                     )
                 if isinstance(panel_render_result, tuple):
@@ -1030,6 +1061,7 @@ def run(
                 cached_detections = []
                 cached_segmentation = None
                 latest_explanation_request_id = None
+                explanation_refresh_status = "idle"
                 last_explanation_request_time = None
                 if config.explanation_enabled:
                     explanation_result = ExplanationResult(
