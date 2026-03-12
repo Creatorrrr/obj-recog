@@ -14,8 +14,7 @@ __pycache__/
 config/*.yaml
 
 # Downloaded model weights
-yolo26n.pt
-yolov8n.pt
+models/*.pt
 
 # Native build outputs
 native/orbslam3_bridge/build/

@@ -18,4 +18,4 @@ def test_object_detector_uses_yolo26n_by_default(monkeypatch) -> None:
 
     ObjectDetector(conf_threshold=0.35, device="cpu")
 
-    assert captured["model_name"] == "yolo26n.pt"
+    assert captured["model_name"] == "models/yolo26n.pt"

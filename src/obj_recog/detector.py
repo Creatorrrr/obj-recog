@@ -26,7 +26,7 @@ class ObjectDetector:
         except ImportError as exc:  # pragma: no cover - depends on local install.
             raise RuntimeError("ultralytics is required for object detection") from exc
 
-        self._model = YOLO("yolo26n.pt")
+        self._model = YOLO("models/yolo26n.pt")
         self._conf_threshold = conf_threshold
         self._device = device
 
