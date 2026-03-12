@@ -4,14 +4,26 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from obj_recog.config import AppConfig
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
-from obj_recog.simulation import SimulationScenarioState
+from obj_recog.sim_assets import build_scenario_asset_manifest
+from obj_recog.simulation import SCENARIO_SPECS, SimulationScenarioState
 from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
 from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, PanopticSegment
 from obj_recog.validation import RuntimeValidationProbe, run_validation_suite
+
+
+_PHOTOREAL_SCENARIO_IDS = (
+    "studio_open_v1",
+    "office_clutter_v1",
+    "lab_corridor_v1",
+    "showroom_occlusion_v1",
+    "office_crossflow_v1",
+    "warehouse_moving_target_v1",
+)
 
 
 def _base_config(**overrides) -> AppConfig:
@@ -162,6 +174,8 @@ def _artifacts(
 def _scenario_state(
     *,
     selfcal_converged: bool,
+    scene_id: str = "studio_open_v1",
+    difficulty_level: int = 1,
     render_backend: str = "analytic",
     render_profile: str = "fast",
     asset_manifest_id: str = "asset-manifest-01",
@@ -172,8 +186,8 @@ def _scenario_state(
     render_time_ms: float | None = None,
 ) -> SimulationScenarioState:
     return SimulationScenarioState(
-        scene_id="studio_open_v1",
-        difficulty_level=1,
+        scene_id=scene_id,
+        difficulty_level=difficulty_level,
         phase="VERIFY_VIEW",
         step_index=4,
         elapsed_sec=9.5,
@@ -567,3 +581,94 @@ def test_runtime_validation_probe_marks_photoreal_worker_failures() -> None:
     assert report.subsystems["frame_latency"].status == "fail"
     assert report.subsystems["pass_output_presence"].status == "fail"
     assert report.subsystems["pass_output_presence"].key_metrics["rgb_pass_frames"] == 1
+
+
+@pytest.mark.parametrize("scenario_name", _PHOTOREAL_SCENARIO_IDS)
+def test_runtime_validation_probe_marks_mesh_backed_environment_for_photoreal_scenarios(
+    tmp_path: Path,
+    scenario_name: str,
+) -> None:
+    scenario = SCENARIO_SPECS[scenario_name]
+    asset_manifest = build_scenario_asset_manifest(
+        scenario,
+        seed=7,
+        cache_dir=tmp_path / "assets",
+        quality="low",
+    )
+    environment_objects = tuple(
+        {
+            "label": placement.semantic_class,
+            "asset_id": placement.asset_id,
+            "render_representation": placement.render_representation,
+            "target_role": placement.target_role,
+        }
+        for placement in asset_manifest.placements
+    )
+    target_label = asset_manifest.semantic_target_class
+    probe = RuntimeValidationProbe(_base_config(render_profile="photoreal", scenario=scenario_name))
+    probe.on_start(explanation_api_available=False)
+
+    frame_packet = type(
+        "Packet",
+        (),
+        {
+            "scenario_state": _scenario_state(
+                selfcal_converged=True,
+                scene_id=scenario_name,
+                difficulty_level=int(scenario.difficulty_level),
+                render_backend="blender-realtime",
+                render_profile="photoreal",
+                asset_manifest_id=asset_manifest.manifest_id,
+                environment_objects=environment_objects,
+                semantic_mask_path="/tmp/semantic-mask.png",
+                instance_mask_path="/tmp/instance-mask.png",
+                worker_state="ready",
+                render_time_ms=16.0,
+            ),
+            "calibration_source": "blender-ground-truth",
+            "semantic_mask": np.ones((24, 32), dtype=np.uint8),
+            "instance_mask": np.ones((24, 32), dtype=np.uint8),
+            "depth_map": np.full((24, 32), 3.0, dtype=np.float32),
+        },
+    )()
+
+    probe.record_frame(
+        frame_index=0,
+        frame_packet=frame_packet,
+        artifacts=_artifacts(
+            mesh_vertices_xyz=np.array(
+                [[0.0, 0.0, 3.2], [0.2, 0.0, 3.4], [0.0, 0.2, 3.6], [0.1, 0.1, 3.5]],
+                dtype=np.float32,
+            ),
+            mesh_triangles=np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32),
+            mesh_vertex_colors=np.full((4, 3), 0.6, dtype=np.float32),
+            detections=[
+                Detection(
+                    xyxy=(8, 5, 26, 22),
+                    class_id=1,
+                    label=target_label,
+                    confidence=0.91,
+                    color=(40, 80, 225),
+                )
+            ],
+            segments=[],
+            scene_graph_snapshot=None,
+            segmentation_overlay_bgr=np.zeros((24, 32, 3), dtype=np.uint8),
+            calibration_source="blender-ground-truth",
+        ),
+        explanation_status=ExplanationStatus.DISABLED,
+        explanation_result=ExplanationResult(
+            text="",
+            status=ExplanationStatus.DISABLED,
+            latency_ms=None,
+            model="gpt-5-mini",
+            error_message=None,
+        ),
+        viewer_active=True,
+    )
+
+    report = probe.build_report()
+
+    assert report.scenario == scenario_name
+    assert report.difficulty_level == int(scenario.difficulty_level)
+    assert report.subsystems["mesh_backed_environment"].status == "pass"

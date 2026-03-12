@@ -543,6 +543,22 @@ def _pose_world_matrix(x: float, z: float, yaw_rad: float) -> np.ndarray:
     return pose
 
 
+def _translation_pose_matrix(center_world: tuple[float, float, float], *, yaw_rad: float = 0.0) -> np.ndarray:
+    c = math.cos(yaw_rad)
+    s = math.sin(yaw_rad)
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = np.array(
+        [
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ],
+        dtype=np.float32,
+    )
+    pose[:3, 3] = np.asarray(center_world, dtype=np.float32)
+    return pose
+
+
 def _object_corners(item: _SceneObject) -> np.ndarray:
     center = np.asarray(item.center_world, dtype=np.float32)
     half = np.asarray(item.size_xyz, dtype=np.float32) * 0.5
@@ -1264,8 +1280,6 @@ class BlenderRealtimeFrameSource:
         cv2_module=None,
     ) -> None:
         _ = report_path
-        if scenario.scene_id != "studio_open_v1":
-            raise RuntimeError("BlenderRealtimeFrameSource currently supports only studio_open_v1")
         self._config = config
         self._scenario = scenario
         self._camera_rig = camera_rig
@@ -1298,7 +1312,7 @@ class BlenderRealtimeFrameSource:
                 "cx": float(self._intrinsics.cx),
                 "cy": float(self._intrinsics.cy),
             },
-            dynamic_actor_transforms={},
+            dynamic_actor_transforms=self._dynamic_actor_transforms(),
             lighting_seed=int(self._config.sim_seed),
         )
         response = self._worker_client.request_frame(request, timeout_sec=timeout_sec)
@@ -1352,14 +1366,16 @@ class BlenderRealtimeFrameSource:
             rig_x=float(self._pose_world[0, 3]),
             rig_z=float(self._pose_world[2, 3]),
             yaw_deg=float(self._scenario.environment.start_yaw_deg),
-            visible_labels=tuple(),
+            visible_labels=tuple(item.label for item in (detections or ())),
             active_goal=None,
-            target_motion_state="static",
+            target_motion_state=(
+                "moving" if any(item.actor_type == "moving_target" for item in self._scenario.dynamic_actors) else "static"
+            ),
             render_backend=self.backend_name,
             render_profile="photoreal",
             semantic_target_class=str(self._asset_manifest.semantic_target_class),
             asset_manifest_id=str(self._asset_manifest.manifest_id),
-            environment_objects=_environment_object_snapshots(list(self._asset_manifest.placements)),
+            environment_objects=self._environment_object_snapshots(),
             semantic_mask_path=response.semantic_mask_path,
             instance_mask_path=response.instance_mask_path,
             worker_state=response.worker_state,
@@ -1384,6 +1400,29 @@ class BlenderRealtimeFrameSource:
         close = getattr(self._worker_client, "close", None)
         if callable(close):
             close()
+
+    def _dynamic_actor_transforms(self) -> dict[str, np.ndarray]:
+        transforms: dict[str, np.ndarray] = {}
+        for actor in self._scenario.dynamic_actors:
+            if self._elapsed_sec < float(actor.start_time_sec):
+                center_world = actor.base_center_world
+            else:
+                center_world = _resolve_waypoint_loop_position(actor, elapsed_sec=self._elapsed_sec)
+            transforms[str(actor.actor_id)] = _translation_pose_matrix(center_world)
+        return transforms
+
+    def _environment_object_snapshots(self) -> tuple[dict[str, object], ...]:
+        dynamic_centers = {
+            actor_id: tuple(float(value) for value in transform[:3, 3])
+            for actor_id, transform in self._dynamic_actor_transforms().items()
+        }
+        placements: list[object] = []
+        for placement in self._asset_manifest.placements:
+            if placement.source_kind == "dynamic" and str(placement.source_key) in dynamic_centers:
+                placements.append(replace(placement, center_world=dynamic_centers[str(placement.source_key)]))
+            else:
+                placements.append(placement)
+        return _environment_object_snapshots(placements)
 
     @property
     def _elapsed_sec(self) -> float:

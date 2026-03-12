@@ -34,6 +34,7 @@ _SCENARIO_IDS = (
     "office_crossflow_v1",
     "warehouse_moving_target_v1",
 )
+_NON_STUDIO_SCENARIO_IDS = _SCENARIO_IDS[1:]
 
 
 def _config(**overrides: object) -> AppConfig:
@@ -216,6 +217,86 @@ def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp
     assert worker.started is True
     assert len(worker.requests) == 1
     assert worker.requests[0][1] == pytest.approx(0.75)
+    source.close()
+    assert worker.closed is True
+
+
+@pytest.mark.parametrize("scenario_name", _NON_STUDIO_SCENARIO_IDS)
+def test_blender_realtime_frame_source_supports_remaining_photoreal_scenarios_and_dynamic_actor_requests(
+    tmp_path: Path,
+    scenario_name: str,
+) -> None:
+    rgb_path = tmp_path / f"{scenario_name}-rgb.npy"
+    depth_path = tmp_path / f"{scenario_name}-depth.npy"
+    semantic_path = tmp_path / f"{scenario_name}-semantic.npy"
+    instance_path = tmp_path / f"{scenario_name}-instance.npy"
+    np.save(rgb_path, np.full((5, 7, 3), 96, dtype=np.uint8))
+    np.save(depth_path, np.full((5, 7), 2.2, dtype=np.float32))
+    np.save(semantic_path, np.ones((5, 7), dtype=np.uint8))
+    np.save(instance_path, np.full((5, 7), 2, dtype=np.uint8))
+
+    config = _config(
+        scenario=scenario_name,
+        render_profile="photoreal",
+        blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+    )
+    scenario = SCENARIO_SPECS[scenario_name]
+    asset_manifest = build_scenario_asset_manifest(
+        scenario,
+        seed=int(config.sim_seed),
+        cache_dir=tmp_path / "assets",
+        quality="low",
+    )
+    worker = _FakeBlenderWorker(
+        BlenderFrameResponse(
+            rgb_path=str(rgb_path),
+            depth_path=str(depth_path),
+            semantic_mask_path=str(semantic_path),
+            instance_mask_path=str(instance_path),
+            pose_world_gt=np.eye(4, dtype=np.float32),
+            intrinsics_gt={"fx": 12.0, "fy": 12.0, "cx": 3.5, "cy": 2.5},
+            render_time_ms=15.0,
+            worker_state="ready",
+            detections=(
+                {
+                    "xyxy": [1, 0, 6, 5],
+                    "class_id": 24,
+                    "label": asset_manifest.semantic_target_class,
+                    "confidence": 0.98,
+                    "color": [0, 255, 0],
+                },
+            ),
+        )
+    )
+
+    source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=scenario,
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=asset_manifest,
+        worker_client=worker,
+    )
+
+    packet = source.next_frame(timeout_sec=0.25)
+
+    assert packet is not None
+    assert packet.scenario_state.scene_id == scenario_name
+    assert packet.scenario_state.render_profile == "photoreal"
+    assert packet.scenario_state.semantic_target_class == asset_manifest.semantic_target_class
+    assert len(packet.scenario_state.environment_objects) == len(asset_manifest.placements)
+    assert packet.detections is not None
+    assert packet.detections[0].label == asset_manifest.semantic_target_class
+    assert len(worker.requests) == 1
+    request, timeout_sec = worker.requests[0]
+    assert timeout_sec == pytest.approx(0.25)
+    assert request.scenario_id == scenario_name
+    assert set(request.dynamic_actor_transforms) == {
+        str(actor.actor_id) for actor in scenario.dynamic_actors
+    }
+    for actor_id, transform in request.dynamic_actor_transforms.items():
+        assert actor_id
+        assert np.asarray(transform, dtype=np.float32).shape == (4, 4)
+
     source.close()
     assert worker.closed is True
 
