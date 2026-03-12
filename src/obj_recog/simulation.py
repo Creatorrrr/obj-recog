@@ -1155,6 +1155,18 @@ class ExternalManifestFrameSource:
         frame_bgr = self._load_array_or_image(frame_entry["rgb_path"])
         depth_path = frame_entry.get("depth_path")
         depth_map = None if depth_path is None else np.asarray(self._load_array_or_image(depth_path), dtype=np.float32)
+        semantic_mask_path = frame_entry.get("semantic_mask_path")
+        semantic_mask = (
+            None
+            if semantic_mask_path is None
+            else np.asarray(self._load_array_or_image(semantic_mask_path), dtype=np.uint8)
+        )
+        instance_mask_path = frame_entry.get("instance_mask_path")
+        instance_mask = (
+            None
+            if instance_mask_path is None
+            else np.asarray(self._load_array_or_image(instance_mask_path), dtype=np.uint8)
+        )
         pose_world_gt = frame_entry.get("pose_world_gt")
         intrinsics_gt = frame_entry.get("intrinsics_gt")
         detections = [
@@ -1172,6 +1184,8 @@ class ExternalManifestFrameSource:
             frame_bgr=np.asarray(frame_bgr, dtype=np.uint8),
             timestamp_sec=None if frame_entry.get("timestamp_sec") is None else float(frame_entry["timestamp_sec"]),
             depth_map=depth_map,
+            semantic_mask=semantic_mask,
+            instance_mask=instance_mask,
             pose_world_gt=None if pose_world_gt is None else np.asarray(pose_world_gt, dtype=np.float32),
             intrinsics_gt=None if intrinsics_gt is None else CameraIntrinsics(
                 fx=float(intrinsics_gt["fx"]),
@@ -1270,6 +1284,16 @@ class BlenderRealtimeFrameSource:
             _load_array_or_image(response.depth_path, cv2_module=self._cv2_module),
             dtype=np.float32,
         )
+        semantic_mask = (
+            None
+            if response.semantic_mask_path is None
+            else np.asarray(_load_array_or_image(response.semantic_mask_path, cv2_module=self._cv2_module), dtype=np.uint8)
+        )
+        instance_mask = (
+            None
+            if response.instance_mask_path is None
+            else np.asarray(_load_array_or_image(response.instance_mask_path, cv2_module=self._cv2_module), dtype=np.uint8)
+        )
         pose_world_gt = np.asarray(response.pose_world_gt, dtype=np.float32)
         intrinsics_gt = CameraIntrinsics(
             fx=float(response.intrinsics_gt["fx"]),
@@ -1277,6 +1301,17 @@ class BlenderRealtimeFrameSource:
             cx=float(response.intrinsics_gt["cx"]),
             cy=float(response.intrinsics_gt["cy"]),
         )
+        detections = [
+            Detection(
+                xyxy=tuple(int(value) for value in detection["xyxy"]),
+                class_id=int(detection["class_id"]),
+                label=str(detection["label"]),
+                confidence=float(detection["confidence"]),
+                color=tuple(int(value) for value in detection.get("color", (0, 255, 0))),
+            )
+            for detection in response.detections
+            if "xyxy" in detection and "class_id" in detection and "label" in detection and "confidence" in detection
+        ] or None
         scenario_state = SimulationScenarioState(
             scene_id=self._scenario.scene_id,
             difficulty_level=self._scenario.difficulty_level,
@@ -1303,8 +1338,11 @@ class BlenderRealtimeFrameSource:
             frame_bgr=frame_bgr,
             timestamp_sec=self._elapsed_sec,
             depth_map=depth_map,
+            semantic_mask=semantic_mask,
+            instance_mask=instance_mask,
             pose_world_gt=pose_world_gt,
             intrinsics_gt=intrinsics_gt,
+            detections=detections,
             scenario_state=scenario_state,
             calibration_source="blender-ground-truth",
         )

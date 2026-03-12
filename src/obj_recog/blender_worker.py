@@ -92,6 +92,7 @@ class BlenderFrameResponse:
     intrinsics_gt: dict[str, float]
     render_time_ms: float | None
     worker_state: str | None
+    detections: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> BlenderFrameResponse:
@@ -105,6 +106,11 @@ class BlenderFrameResponse:
             ),
             instance_mask_path=(
                 None if payload.get("instance_mask_path") in (None, "") else str(payload["instance_mask_path"])
+            ),
+            detections=tuple(
+                dict(item)
+                for item in (payload.get("detections") or [])
+                if isinstance(item, dict)
             ),
             pose_world_gt=np.asarray(pose_world_gt, dtype=np.float32).reshape(4, 4),
             intrinsics_gt={

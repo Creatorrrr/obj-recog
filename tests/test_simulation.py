@@ -139,20 +139,44 @@ def test_scenario_registry_contains_expected_specs() -> None:
 def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp_path: Path) -> None:
     rgb = np.full((5, 7, 3), 129, dtype=np.uint8)
     depth = np.full((5, 7), 2.75, dtype=np.float32)
+    semantic_mask = np.array(
+        [
+            [0, 0, 1, 1, 1, 0, 0],
+            [0, 1, 1, 1, 1, 1, 0],
+            [0, 1, 1, 1, 1, 1, 0],
+            [0, 1, 1, 1, 1, 1, 0],
+            [0, 0, 1, 1, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    instance_mask = semantic_mask.copy()
     rgb_path = tmp_path / "rgb.npy"
     depth_path = tmp_path / "depth.npy"
+    semantic_path = tmp_path / "semantic.npy"
+    instance_path = tmp_path / "instance.npy"
     np.save(rgb_path, rgb)
     np.save(depth_path, depth)
+    np.save(semantic_path, semantic_mask)
+    np.save(instance_path, instance_mask)
     worker = _FakeBlenderWorker(
         response={
             "rgb_path": str(rgb_path),
             "depth_path": str(depth_path),
-            "semantic_mask_path": str(tmp_path / "semantic.png"),
-            "instance_mask_path": str(tmp_path / "instance.png"),
+            "semantic_mask_path": str(semantic_path),
+            "instance_mask_path": str(instance_path),
             "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
             "intrinsics_gt": {"fx": 12.0, "fy": 13.0, "cx": 3.5, "cy": 2.5},
             "render_time_ms": 16.4,
             "worker_state": "ready",
+            "detections": [
+                {
+                    "xyxy": [1, 0, 6, 5],
+                    "class_id": 24,
+                    "label": "backpack",
+                    "confidence": 0.98,
+                    "color": [0, 255, 0],
+                }
+            ],
         }
     )
     config = _config(render_profile="photoreal", blender_exec="/Applications/Blender.app/Contents/MacOS/Blender")
@@ -176,13 +200,17 @@ def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp
     assert packet.frame_bgr.shape == (5, 7, 3)
     assert packet.depth_map is not None
     assert packet.depth_map.shape == (5, 7)
+    assert packet.semantic_mask is not None
+    assert packet.instance_mask is not None
     np.testing.assert_allclose(packet.pose_world_gt, np.eye(4, dtype=np.float32))
     assert packet.intrinsics_gt == CameraIntrinsics(fx=12.0, fy=13.0, cx=3.5, cy=2.5)
+    assert packet.detections is not None
+    assert packet.detections[0].label == "backpack"
     assert packet.scenario_state.render_backend == "blender-realtime"
     assert packet.scenario_state.render_profile == "photoreal"
     assert packet.scenario_state.scene_id == "studio_open_v1"
-    assert packet.scenario_state.semantic_mask_path == str(tmp_path / "semantic.png")
-    assert packet.scenario_state.instance_mask_path == str(tmp_path / "instance.png")
+    assert packet.scenario_state.semantic_mask_path == str(semantic_path)
+    assert packet.scenario_state.instance_mask_path == str(instance_path)
     assert packet.scenario_state.worker_state == "ready"
     assert packet.scenario_state.render_time_ms == pytest.approx(16.4)
     assert worker.started is True
@@ -195,20 +223,42 @@ def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp
 def test_simulation_runtime_routes_photoreal_to_blender_realtime_frame_source(tmp_path: Path) -> None:
     rgb = np.full((4, 6, 3), 117, dtype=np.uint8)
     depth = np.full((4, 6), 2.1, dtype=np.float32)
+    semantic_mask = np.array(
+        [
+            [0, 0, 1, 1, 0, 0],
+            [0, 1, 1, 1, 1, 0],
+            [0, 1, 1, 1, 1, 0],
+            [0, 0, 1, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
     rgb_path = tmp_path / "runtime-rgb.npy"
     depth_path = tmp_path / "runtime-depth.npy"
+    semantic_path = tmp_path / "runtime-semantic.npy"
+    instance_path = tmp_path / "runtime-instance.npy"
     np.save(rgb_path, rgb)
     np.save(depth_path, depth)
+    np.save(semantic_path, semantic_mask)
+    np.save(instance_path, semantic_mask)
     worker = _FakeBlenderWorker(
         response={
             "rgb_path": str(rgb_path),
             "depth_path": str(depth_path),
-            "semantic_mask_path": str(tmp_path / "runtime-semantic.png"),
-            "instance_mask_path": str(tmp_path / "runtime-instance.png"),
+            "semantic_mask_path": str(semantic_path),
+            "instance_mask_path": str(instance_path),
             "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
             "intrinsics_gt": {"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
             "render_time_ms": 12.0,
             "worker_state": "ready",
+            "detections": [
+                {
+                    "xyxy": [1, 0, 5, 4],
+                    "class_id": 24,
+                    "label": "backpack",
+                    "confidence": 0.96,
+                    "color": [0, 255, 0],
+                }
+            ],
         }
     )
     runtime = SimulationRuntime(
@@ -226,8 +276,12 @@ def test_simulation_runtime_routes_photoreal_to_blender_realtime_frame_source(tm
     assert packet is not None
     assert packet.scenario_state.render_backend == "blender-realtime"
     assert packet.scenario_state.scene_id == "studio_open_v1"
-    assert packet.scenario_state.semantic_mask_path == str(tmp_path / "runtime-semantic.png")
-    assert packet.scenario_state.instance_mask_path == str(tmp_path / "runtime-instance.png")
+    assert packet.scenario_state.semantic_mask_path == str(semantic_path)
+    assert packet.scenario_state.instance_mask_path == str(instance_path)
+    assert packet.detections is not None
+    assert packet.detections[0].label == "backpack"
+    assert packet.semantic_mask is not None
+    assert packet.instance_mask is not None
 
 
 @pytest.mark.parametrize("scenario_name", _SCENARIO_IDS)
@@ -747,8 +801,12 @@ def test_simulation_runtime_photoreal_profile_requires_blender_exec_or_render_bu
 def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_manifest(tmp_path: Path) -> None:
     rgb_path = tmp_path / "frame.npy"
     depth_path = tmp_path / "depth.npy"
+    semantic_path = tmp_path / "semantic.npy"
+    instance_path = tmp_path / "instance.npy"
     np.save(rgb_path, np.full((4, 6, 3), 121, dtype=np.uint8))
     np.save(depth_path, np.full((4, 6), 2.0, dtype=np.float32))
+    np.save(semantic_path, np.ones((4, 6), dtype=np.uint8))
+    np.save(instance_path, np.ones((4, 6), dtype=np.uint8))
     factory_calls: list[tuple[str, str | None]] = []
 
     def _factory(*, config: AppConfig, scenario, camera_rig, asset_manifest, report_path):
@@ -763,12 +821,21 @@ def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_mani
                 BlenderFrameResponse(
                     rgb_path=str(rgb_path),
                     depth_path=str(depth_path),
-                    semantic_mask_path=str(tmp_path / "semantic.png"),
-                    instance_mask_path=str(tmp_path / "instance.png"),
+                    semantic_mask_path=str(semantic_path),
+                    instance_mask_path=str(instance_path),
                     pose_world_gt=np.eye(4, dtype=np.float32),
                     intrinsics_gt={"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
                     render_time_ms=12.5,
                     worker_state="ready",
+                    detections=(
+                        {
+                            "xyxy": [1, 0, 5, 4],
+                            "class_id": 24,
+                            "label": "backpack",
+                            "confidence": 0.96,
+                            "color": [0, 255, 0],
+                        },
+                    ),
                 )
             ),
         )
@@ -790,17 +857,23 @@ def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_mani
     assert factory_calls == [("photoreal", "/Applications/Blender.app/Contents/MacOS/Blender")]
     assert packet.scenario_state.render_profile == "photoreal"
     assert packet.scenario_state.render_backend == "blender-realtime"
+    assert packet.scenario_state.semantic_mask_path == str(semantic_path)
+    assert packet.scenario_state.instance_mask_path == str(instance_path)
+    assert packet.semantic_mask is not None
+    assert packet.instance_mask is not None
+    assert packet.detections is not None
+    assert packet.detections[0].label == "backpack"
 
 
 def test_blender_realtime_frame_source_emits_frame_packet_for_studio_scenario(tmp_path: Path) -> None:
     rgb_path = tmp_path / "rgb.npy"
     depth_path = tmp_path / "depth.npy"
-    semantic_path = tmp_path / "semantic.png"
-    instance_path = tmp_path / "instance.png"
+    semantic_path = tmp_path / "semantic.npy"
+    instance_path = tmp_path / "instance.npy"
     np.save(rgb_path, np.full((5, 7, 3), 88, dtype=np.uint8))
     np.save(depth_path, np.full((5, 7), 1.75, dtype=np.float32))
-    semantic_path.write_bytes(b"semantic")
-    instance_path.write_bytes(b"instance")
+    np.save(semantic_path, np.ones((5, 7), dtype=np.uint8))
+    np.save(instance_path, np.full((5, 7), 3, dtype=np.uint8))
     config = _config(
         render_profile="photoreal",
         blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
@@ -822,6 +895,15 @@ def test_blender_realtime_frame_source_emits_frame_packet_for_studio_scenario(tm
             intrinsics_gt={"fx": 12.0, "fy": 12.0, "cx": 3.5, "cy": 2.5},
             render_time_ms=15.0,
             worker_state="ready",
+            detections=(
+                {
+                    "xyxy": [1, 0, 6, 5],
+                    "class_id": 24,
+                    "label": "backpack",
+                    "confidence": 0.98,
+                    "color": [0, 255, 0],
+                },
+            ),
         )
     )
 
@@ -839,9 +921,13 @@ def test_blender_realtime_frame_source_emits_frame_packet_for_studio_scenario(tm
     assert packet.timestamp_sec == pytest.approx(0.0)
     assert packet.frame_bgr.shape == (5, 7, 3)
     assert packet.depth_map is not None
+    assert packet.semantic_mask is not None
+    assert packet.instance_mask is not None
     assert packet.pose_world_gt is not None
     assert packet.intrinsics_gt is not None
     assert packet.intrinsics_gt.fx == pytest.approx(12.0)
+    assert packet.detections is not None
+    assert packet.detections[0].label == "backpack"
     assert packet.scenario_state.scene_id == "studio_open_v1"
     assert packet.scenario_state.render_backend == "blender-realtime"
     assert packet.scenario_state.render_profile == "photoreal"

@@ -16,6 +16,8 @@ class FramePacket:
     frame_bgr: np.ndarray
     timestamp_sec: float | None
     depth_map: np.ndarray | None = None
+    semantic_mask: np.ndarray | None = None
+    instance_mask: np.ndarray | None = None
     pose_world_gt: np.ndarray | None = None
     intrinsics_gt: CameraIntrinsics | None = None
     detections: list[Detection] | None = None
