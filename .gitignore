@@ -1,20 +1,55 @@
+# OS and local environment files
 .DS_Store
+Thumbs.db
 .env
+.env.*
+!.env.example
 .worktrees/
 
-# Python environment and caches
+# Python environments, caches, and coverage
 .venv/
 .venv*/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
 __pycache__/
 *.py[cod]
+*.pyd
+.python-version
+
+# Python packaging outputs
+build/
+dist/
+site/
+.eggs/
 *.egg-info/
+pip-wheel-metadata/
+
+# Notebook and runtime scratch files
+.ipynb_checkpoints/
+*.log
 
 # Local calibration outputs
 config/*.yaml
 
-# Downloaded model weights
+# Downloaded model weights and exported artifacts
 models/*.pt
+models/*.pth
+models/*.onnx
+models/*.engine
+
+# Runtime reports and diagnostic runs
+reports/sim/diag-*/
+reports/sim/diagnostic*/
+reports/sim/*/20*/
+reports/**/planner_turns.jsonl
+reports/**/self_calibration.json
 
 # Native build outputs
 native/orbslam3_bridge/build/

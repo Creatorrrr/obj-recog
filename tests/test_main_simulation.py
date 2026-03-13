@@ -299,3 +299,41 @@ def test_run_sim_mode_uses_relaxed_tracker_thresholds_for_sensor_rendering() -> 
     assert tracker_factory.calls
     assert tracker_factory.calls[0]["min_correspondences"] == 4
     assert tracker_factory.calls[0]["min_inliers"] == 4
+
+
+def test_run_sim_mode_skips_depth_estimator_initialization_when_sensor_depth_is_available() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+    )
+    source = _FakeFrameSource([_packet(0.0)])
+    depth_factory_calls: list[dict[str, object]] = []
+
+    def _depth_factory(**kwargs):
+        depth_factory_calls.append(dict(kwargs))
+        raise AssertionError("sim mode should use sensor depth without initializing the runtime depth estimator")
+
+    run(
+        config,
+        cv2_module=_FakeCV2(),
+        detector_factory=lambda **_kwargs: _CountingDetector(),
+        depth_estimator_factory=_depth_factory,
+        tracker_factory=lambda **_kwargs: _CountingTracker(),
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: _FakeViewer(),
+        environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+    )
+
+    assert depth_factory_calls == []

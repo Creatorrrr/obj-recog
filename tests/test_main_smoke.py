@@ -1418,10 +1418,7 @@ def test_run_positions_runtime_windows_on_first_show_for_sim_input() -> None:
 
     assert source.closed is True
     assert len(environment_viewer.states) == 2
-    assert fake_cv2.move_window_calls == [
-        ("Object Recognition", 32, 48),
-        ("Situation Explanation", 32, 440),
-    ]
+    assert fake_cv2.move_window_calls == [("Object Recognition", 32, 48)]
 
 
 def test_run_releases_camera_if_viewer_creation_fails() -> None:

@@ -18,11 +18,14 @@ if str(_SRC_ROOT) not in sys.path:
 from obj_recog.sim_materials import material_alpha, material_color_rgb
 from obj_recog.sim_protocol import LivingRoomLightSpec, LivingRoomObjectSpec, LivingRoomSceneSpec, RobotPose
 from obj_recog.sim_scene import build_scene_mesh_components
+from obj_recog.array_transport import SharedMemoryArrayWriter
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerConfig:
     output_root: Path
+    render_backend: str
+    transport: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,9 +50,15 @@ class _RenderPrimitive:
 
 
 class SoftwareRendererRuntime:
-    def __init__(self, *, output_root: Path) -> None:
+    def __init__(self, *, output_root: Path, transport: str = "filesystem") -> None:
         self._output_root = Path(output_root)
         self._output_root.mkdir(parents=True, exist_ok=True)
+        self._transport = str(transport)
+        self._shared_memory_writer = (
+            SharedMemoryArrayWriter(prefix="obj-recog-render")
+            if self._transport == "shared_memory"
+            else None
+        )
         self._scene_id = "uninitialized"
         self._image_width = 64
         self._image_height = 48
@@ -57,6 +66,7 @@ class SoftwareRendererRuntime:
         self._near_plane_m = 0.2
         self._far_plane_m = 8.0
         self._intrinsics = {"fx": 32.0, "fy": 32.0, "cx": 32.0, "cy": 24.0}
+        self._scene_spec: LivingRoomSceneSpec | None = None
         self._scene_center = np.zeros(3, dtype=np.float32)
         self._primitives: tuple[_RenderPrimitive, ...] = ()
         self._lights: tuple[_RenderLight, ...] = ()
@@ -72,6 +82,7 @@ class SoftwareRendererRuntime:
     def _build_scene(self, payload: dict[str, object]) -> dict[str, object]:
         scene_spec = dict(payload["scene_spec"])
         living_room_scene = _coerce_scene_spec(scene_spec)
+        self._scene_spec = living_room_scene
         self._scene_id = str(living_room_scene.scene_id)
         self._image_width = int(payload["image_width"])
         self._image_height = int(payload["image_height"])
@@ -119,25 +130,22 @@ class SoftwareRendererRuntime:
             dirs_camera=dirs_camera,
             dirs_world=dirs_world,
         )
-
-        rgb_path = self._output_root / f"frame-{frame_index:04d}.npy"
-        depth_path = self._output_root / f"frame-{frame_index:04d}-depth.npy"
-        semantic_path = self._output_root / f"frame-{frame_index:04d}-semantic.npy"
-        instance_path = self._output_root / f"frame-{frame_index:04d}-instance.npy"
-        np.save(rgb_path, rgb_bgr)
-        np.save(depth_path, depth_map)
-        np.save(semantic_path, semantic_mask)
-        np.save(instance_path, instance_mask)
-        return {
-            "rgb_path": str(rgb_path),
-            "depth_path": str(depth_path),
-            "semantic_mask_path": str(semantic_path),
-            "instance_mask_path": str(instance_path),
-            "camera_pose_world": camera_pose_world.tolist(),
-            "intrinsics": dict(self._intrinsics),
-            "render_time_ms": (time.perf_counter() - started) * 1000.0,
-            "worker_state": "ready",
-        }
+        response = self._persist_render_outputs(
+            frame_index=frame_index,
+            rgb_bgr=rgb_bgr,
+            depth_map=depth_map,
+            semantic_mask=semantic_mask,
+            instance_mask=instance_mask,
+        )
+        response.update(
+            {
+                "camera_pose_world": camera_pose_world.tolist(),
+                "intrinsics": dict(self._intrinsics),
+                "render_time_ms": (time.perf_counter() - started) * 1000.0,
+                "worker_state": "ready",
+            }
+        )
+        return response
 
     def _camera_rays(self, total_yaw_deg: float) -> tuple[np.ndarray, np.ndarray]:
         xs = np.arange(self._image_width, dtype=np.float32)
@@ -312,17 +320,278 @@ class SoftwareRendererRuntime:
         instance_mask = instance.reshape(self._image_height, self._image_width)
         return rgb_bgr, depth_map, semantic_mask, instance_mask
 
+    def close(self) -> None:
+        if self._shared_memory_writer is not None:
+            self._shared_memory_writer.close()
 
-def create_worker_runtime(*, output_root: str | Path, force_python_fallback: bool = False):
-    _ = force_python_fallback
-    return SoftwareRendererRuntime(output_root=Path(output_root))
+    def _persist_render_outputs(
+        self,
+        *,
+        frame_index: int,
+        rgb_bgr: np.ndarray,
+        depth_map: np.ndarray,
+        semantic_mask: np.ndarray,
+        instance_mask: np.ndarray,
+    ) -> dict[str, object]:
+        if self._shared_memory_writer is not None:
+            return {
+                "rgb_shared_memory": self._shared_memory_writer.write("rgb", rgb_bgr).to_payload(),
+                "depth_shared_memory": self._shared_memory_writer.write("depth", depth_map).to_payload(),
+                "semantic_mask_shared_memory": self._shared_memory_writer.write(
+                    "semantic",
+                    semantic_mask,
+                ).to_payload(),
+                "instance_mask_shared_memory": self._shared_memory_writer.write(
+                    "instance",
+                    instance_mask,
+                ).to_payload(),
+            }
+
+        rgb_path = self._output_root / f"frame-{frame_index:04d}.npy"
+        depth_path = self._output_root / f"frame-{frame_index:04d}-depth.npy"
+        semantic_path = self._output_root / f"frame-{frame_index:04d}-semantic.npy"
+        instance_path = self._output_root / f"frame-{frame_index:04d}-instance.npy"
+        np.save(rgb_path, rgb_bgr)
+        np.save(depth_path, depth_map)
+        np.save(semantic_path, semantic_mask)
+        np.save(instance_path, instance_mask)
+        return {
+            "rgb_path": str(rgb_path),
+            "depth_path": str(depth_path),
+            "semantic_mask_path": str(semantic_path),
+            "instance_mask_path": str(instance_path),
+        }
+
+
+class BlenderGpuRendererRuntime(SoftwareRendererRuntime):
+    def __init__(self, *, output_root: Path, transport: str = "shared_memory") -> None:
+        super().__init__(output_root=output_root, transport=transport)
+        import bpy
+
+        self._bpy = bpy
+        self._scene = bpy.context.scene
+        self._camera = None
+        self._runtime_collection_name = "obj_recog_runtime"
+        self._runtime_material_prefix = "obj_recog_mat_"
+        self._configure_render_settings()
+
+    def _build_scene(self, payload: dict[str, object]) -> dict[str, object]:
+        response = super()._build_scene(payload)
+        self._rebuild_blender_scene()
+        return response
+
+    def _render_frame(self, payload: dict[str, object]) -> dict[str, object]:
+        started = time.perf_counter()
+        frame_index = int(payload["frame_index"])
+        robot_pose = dict(payload["robot_pose"])
+        origin_world = np.array(
+            [
+                float(robot_pose["x"]),
+                float(robot_pose["y"]),
+                float(robot_pose["z"]),
+            ],
+            dtype=np.float32,
+        )
+        total_yaw_deg = float(robot_pose["yaw_deg"]) + float(robot_pose.get("camera_pan_deg", 0.0))
+        camera_pose_world = _camera_pose_world(origin_world, total_yaw_deg)
+        dirs_camera, dirs_world = self._camera_rays(total_yaw_deg)
+        _analytic_rgb, depth_map, semantic_mask, instance_mask = self._trace_scene(
+            origin_world=origin_world,
+            dirs_camera=dirs_camera,
+            dirs_world=dirs_world,
+        )
+        rgb_bgr = self._render_rgb_with_blender(origin_world=origin_world, total_yaw_deg=total_yaw_deg)
+        response = self._persist_render_outputs(
+            frame_index=frame_index,
+            rgb_bgr=rgb_bgr,
+            depth_map=depth_map,
+            semantic_mask=semantic_mask,
+            instance_mask=instance_mask,
+        )
+        response.update(
+            {
+                "camera_pose_world": camera_pose_world.tolist(),
+                "intrinsics": dict(self._intrinsics),
+                "render_time_ms": (time.perf_counter() - started) * 1000.0,
+                "worker_state": "ready",
+            }
+        )
+        return response
+
+    def _configure_render_settings(self) -> None:
+        render = self._scene.render
+        render.engine = "CYCLES"
+        render.resolution_percentage = 100
+        render.film_transparent = False
+        cycles = getattr(self._scene, "cycles", None)
+        if cycles is not None:
+            cycles.device = "GPU"
+            cycles.samples = 16
+            cycles.use_denoising = False
+        addon = getattr(self._bpy.context.preferences, "addons", {}).get("cycles")
+        preferences = getattr(addon, "preferences", None)
+        if preferences is None:
+            return
+        compute_order = ("OPTIX", "CUDA")
+        for compute_type in compute_order:
+            try:
+                preferences.compute_device_type = compute_type
+                preferences.get_devices()
+            except Exception:
+                continue
+            devices = getattr(preferences, "devices", ())
+            enabled = False
+            for device in devices:
+                device_type = str(getattr(device, "type", "")).upper()
+                if device_type in {"OPTIX", "CUDA"}:
+                    device.use = True
+                    enabled = True
+            if enabled:
+                return
+
+    def _rebuild_blender_scene(self) -> None:
+        bpy = self._bpy
+        scene = self._scene
+        collection = bpy.data.collections.get(self._runtime_collection_name)
+        if collection is None:
+            collection = bpy.data.collections.new(self._runtime_collection_name)
+            scene.collection.children.link(collection)
+        for obj in list(collection.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+        for light in list(getattr(scene, "objects", ())):
+            if getattr(light, "name", "").startswith("obj_recog_light_"):
+                bpy.data.objects.remove(light, do_unlink=True)
+
+        if self._camera is None or self._camera.name not in bpy.data.objects:
+            camera_data = bpy.data.cameras.new("obj_recog_camera")
+            self._camera = bpy.data.objects.new("obj_recog_camera", camera_data)
+            collection.objects.link(self._camera)
+            scene.camera = self._camera
+
+        for primitive in self._primitives:
+            bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0.0, 0.0, 0.0))
+            obj = bpy.context.active_object
+            collection.objects.link(obj)
+            if obj.name in scene.collection.objects:
+                scene.collection.objects.unlink(obj)
+            obj.name = f"obj_recog_{primitive.primitive_id}"
+            obj.location = (
+                float(primitive.center_xyz[0]),
+                float(primitive.center_xyz[2]),
+                float(primitive.center_xyz[1]),
+            )
+            obj.scale = (
+                float(primitive.half_size_xyz[0]),
+                float(primitive.half_size_xyz[2]),
+                float(primitive.half_size_xyz[1]),
+            )
+            obj.rotation_mode = "QUATERNION"
+            rotation_matrix = np.array(
+                [
+                    [primitive.rotation_local_to_world[0, 0], primitive.rotation_local_to_world[0, 2], primitive.rotation_local_to_world[0, 1]],
+                    [primitive.rotation_local_to_world[2, 0], primitive.rotation_local_to_world[2, 2], primitive.rotation_local_to_world[2, 1]],
+                    [primitive.rotation_local_to_world[1, 0], primitive.rotation_local_to_world[1, 2], primitive.rotation_local_to_world[1, 1]],
+                ],
+                dtype=np.float32,
+            )
+            obj.rotation_quaternion = _matrix_to_quaternion(rotation_matrix)
+            obj.data.materials.clear()
+            obj.data.materials.append(
+                self._material_for(
+                    material_key=primitive.material_key,
+                    semantic_label=primitive.semantic_label,
+                )
+            )
+
+        for index, light in enumerate(self._lights):
+            light_data = bpy.data.lights.new(f"obj_recog_light_data_{index}", type=str(light.light_type).upper())
+            light_data.energy = float(light.energy)
+            light_data.color = tuple(float(channel) for channel in light.color_rgb)
+            light_object = bpy.data.objects.new(f"obj_recog_light_{index}", light_data)
+            light_object.location = (
+                float(light.location_xyz[0]),
+                float(light.location_xyz[2]),
+                float(light.location_xyz[1]),
+            )
+            collection.objects.link(light_object)
+
+    def _material_for(self, *, material_key: str, semantic_label: str):
+        bpy = self._bpy
+        material_name = f"{self._runtime_material_prefix}{material_key}_{semantic_label}"
+        material = bpy.data.materials.get(material_name)
+        if material is None:
+            material = bpy.data.materials.new(material_name)
+            material.use_nodes = True
+        nodes = material.node_tree.nodes
+        principled = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if principled is None:
+            principled = nodes.new(type="ShaderNodeBsdfPrincipled")
+        color = tuple(float(channel) for channel in material_color_rgb(material_key))
+        principled.inputs["Base Color"].default_value = (*color, 1.0)
+        principled.inputs["Roughness"].default_value = 0.65
+        alpha = float(material_alpha(material_key))
+        principled.inputs["Alpha"].default_value = alpha
+        material.blend_method = "BLEND" if alpha < 0.999 else "OPAQUE"
+        return material
+
+    def _render_rgb_with_blender(self, *, origin_world: np.ndarray, total_yaw_deg: float) -> np.ndarray:
+        render = self._scene.render
+        render.resolution_x = int(self._image_width)
+        render.resolution_y = int(self._image_height)
+        if self._camera is None:
+            raise RuntimeError("camera not initialized")
+        self._camera.location = (
+            float(origin_world[0]),
+            float(origin_world[2]),
+            float(origin_world[1]),
+        )
+        self._camera.rotation_mode = "XYZ"
+        self._camera.rotation_euler = (
+            math.radians(90.0),
+            0.0,
+            math.radians(180.0 - float(total_yaw_deg)),
+        )
+        camera_data = self._camera.data
+        camera_data.angle = math.radians(float(self._horizontal_fov_deg))
+        self._bpy.ops.render.render(write_still=False)
+        image = self._bpy.data.images.get("Render Result")
+        if image is None:
+            raise RuntimeError("Blender render result image is unavailable")
+        pixels = np.array(image.pixels[:], dtype=np.float32).reshape(self._image_height, self._image_width, 4)
+        rgb = np.flipud(pixels[:, :, :3])
+        return np.clip(rgb[:, :, ::-1] * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def create_worker_runtime(
+    *,
+    output_root: str | Path,
+    render_backend: str = "software",
+    transport: str = "filesystem",
+    force_python_fallback: bool = False,
+):
+    backend = str(render_backend)
+    if not force_python_fallback and backend == "blender-gpu":
+        try:
+            import bpy  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            return BlenderGpuRendererRuntime(output_root=Path(output_root), transport=transport)
+    return SoftwareRendererRuntime(output_root=Path(output_root), transport=transport)
 
 
 def parse_config(argv: list[str] | None = None) -> WorkerConfig:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--render-backend", choices=("software", "blender-gpu"), default="software")
+    parser.add_argument("--transport", choices=("filesystem", "shared_memory"), default="filesystem")
     args = parser.parse_args(_argv_after_double_dash(argv or sys.argv))
-    return WorkerConfig(output_root=Path(args.output_root))
+    return WorkerConfig(
+        output_root=Path(args.output_root),
+        render_backend=str(args.render_backend),
+        transport=str(args.transport),
+    )
 
 
 def run_worker_loop(
@@ -337,16 +606,26 @@ def run_worker_loop(
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
     config = parse_config(argv)
-    runtime = create_worker_runtime(output_root=config.output_root, force_python_fallback=force_python_fallback)
+    runtime = create_worker_runtime(
+        output_root=config.output_root,
+        render_backend=config.render_backend,
+        transport=config.transport,
+        force_python_fallback=force_python_fallback,
+    )
     print(json.dumps({"worker_state": "bootstrapping"}), file=stderr, flush=True)
-    for raw_line in stdin:
-        stripped = str(raw_line).strip()
-        if not stripped:
-            continue
-        payload = json.loads(stripped)
-        response = runtime.process_request(payload)
-        print(json.dumps(response), file=stdout, flush=True)
-    return 0
+    try:
+        for raw_line in stdin:
+            stripped = str(raw_line).strip()
+            if not stripped:
+                continue
+            payload = json.loads(stripped)
+            response = runtime.process_request(payload)
+            print(json.dumps(response), file=stdout, flush=True)
+        return 0
+    finally:
+        runtime_close = getattr(runtime, "close", None)
+        if callable(runtime_close):
+            runtime_close()
 
 
 def _argv_after_double_dash(argv: list[str]) -> list[str]:
@@ -473,7 +752,7 @@ def _extract_box_component(component) -> tuple[np.ndarray, np.ndarray, np.ndarra
         raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: expected near-vertical local Y axis")
 
     local_axes = [axis for idx, axis in enumerate(axes) if idx != up_axis_index]
-    local_spans = [float((centered @ axis).ptp()) for axis in local_axes]
+    local_spans = [float(np.ptp(centered @ axis)) for axis in local_axes]
     order = np.argsort(local_spans)
     local_x_axis = np.asarray(local_axes[int(order[1])], dtype=np.float32)
     local_z_axis = np.asarray(local_axes[int(order[0])], dtype=np.float32)
@@ -590,6 +869,38 @@ def _rotation_y_matrix(yaw_deg: float) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+def _matrix_to_quaternion(rotation_matrix: np.ndarray) -> tuple[float, float, float, float]:
+    matrix = np.asarray(rotation_matrix, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (matrix[2, 1] - matrix[1, 2]) / s
+        y = (matrix[0, 2] - matrix[2, 0]) / s
+        z = (matrix[1, 0] - matrix[0, 1]) / s
+        return (float(w), float(x), float(y), float(z))
+    if matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = math.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        w = (matrix[2, 1] - matrix[1, 2]) / s
+        x = 0.25 * s
+        y = (matrix[0, 1] + matrix[1, 0]) / s
+        z = (matrix[0, 2] + matrix[2, 0]) / s
+        return (float(w), float(x), float(y), float(z))
+    if matrix[1, 1] > matrix[2, 2]:
+        s = math.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        w = (matrix[0, 2] - matrix[2, 0]) / s
+        x = (matrix[0, 1] + matrix[1, 0]) / s
+        y = 0.25 * s
+        z = (matrix[1, 2] + matrix[2, 1]) / s
+        return (float(w), float(x), float(y), float(z))
+    s = math.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+    w = (matrix[1, 0] - matrix[0, 1]) / s
+    x = (matrix[0, 2] + matrix[2, 0]) / s
+    y = (matrix[1, 2] + matrix[2, 1]) / s
+    z = 0.25 * s
+    return (float(w), float(x), float(y), float(z))
 
 
 def _camera_pose_world(origin_world: np.ndarray, total_yaw_deg: float) -> np.ndarray:

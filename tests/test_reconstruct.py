@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from obj_recog.reconstruct import CameraIntrinsics, depth_to_point_cloud, transform_points
+from obj_recog.reconstruct import (
+    CameraIntrinsics,
+    depth_to_point_cloud,
+    depth_to_point_cloud_torch,
+    transform_points,
+)
 
 
 def test_depth_to_point_cloud_returns_expected_shapes() -> None:
@@ -73,3 +78,21 @@ def test_transform_points_applies_camera_pose_world() -> None:
         transformed,
         np.array([[1.0, 0.5, 1.0], [1.1, 0.5, 1.0]], dtype=np.float32),
     )
+
+
+def test_depth_to_point_cloud_torch_matches_numpy_shapes() -> None:
+    frame_bgr = np.full((4, 4, 3), 90, dtype=np.uint8)
+    depth_map = np.linspace(0.3, 1.2, 16, dtype=np.float32).reshape(4, 4)
+    intrinsics = CameraIntrinsics(fx=3.6, fy=3.6, cx=2.0, cy=2.0)
+
+    points_xyz, points_rgb, point_pixels = depth_to_point_cloud_torch(
+        frame_bgr=frame_bgr,
+        depth_map=depth_map,
+        intrinsics=intrinsics,
+        stride=1,
+        max_points=32,
+    )
+
+    assert points_xyz.shape == (16, 3)
+    assert points_rgb.shape == (16, 3)
+    assert point_pixels.shape == (16, 2)

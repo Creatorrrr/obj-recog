@@ -10,6 +10,7 @@ import sys
 import pytest
 import numpy as np
 
+from obj_recog.array_transport import SharedMemoryArrayRef, load_shared_memory_array
 from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.sim_scene import build_living_room_scene_spec, build_scene_mesh_components
 
@@ -141,6 +142,50 @@ def test_realtime_worker_python_runtime_handles_build_then_render(tmp_path: Path
     assert Path(render_response["semantic_mask_path"]).is_file()
     assert Path(render_response["instance_mask_path"]).is_file()
     assert np.load(render_response["rgb_path"]).shape == (24, 32, 3)
+
+
+def test_realtime_worker_shared_memory_transport_returns_array_refs(tmp_path: Path) -> None:
+    module = _load_worker_module()
+    runtime = module.create_worker_runtime(
+        output_root=tmp_path,
+        transport="shared_memory",
+        force_python_fallback=True,
+    )
+    scene = build_living_room_scene_spec()
+    runtime.process_request(
+        {
+            "kind": "build_scene",
+            "scene_spec": _scene_payload(scene),
+            "image_width": 32,
+            "image_height": 24,
+            "horizontal_fov_deg": 72.0,
+            "near_plane_m": 0.2,
+            "far_plane_m": 8.0,
+        }
+    )
+
+    render_response = runtime.process_request(
+        {
+            "kind": "render_frame",
+            "frame_index": 1,
+            "timestamp_sec": 0.5,
+            "robot_pose": {
+                "x": scene.start_pose.x,
+                "y": scene.start_pose.y,
+                "z": scene.start_pose.z,
+                "yaw_deg": scene.start_pose.yaw_deg,
+                "camera_pan_deg": scene.start_pose.camera_pan_deg,
+            },
+            "camera_pose_world": np.eye(4, dtype=np.float32).tolist(),
+        }
+    )
+
+    rgb_reference = SharedMemoryArrayRef.from_payload(dict(render_response["rgb_shared_memory"]))
+    depth_reference = SharedMemoryArrayRef.from_payload(dict(render_response["depth_shared_memory"]))
+
+    assert load_shared_memory_array(rgb_reference).shape == (24, 32, 3)
+    assert load_shared_memory_array(depth_reference).shape == (24, 32)
+    runtime.close()
 
 
 def test_realtime_worker_python_runtime_build_scene_uses_shared_mesh_components(tmp_path: Path) -> None:

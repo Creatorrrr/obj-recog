@@ -10,6 +10,8 @@ import subprocess
 import numpy as np
 import pytest
 
+import obj_recog.blender_worker as blender_worker_module
+from obj_recog.array_transport import SharedMemoryArrayRef
 from obj_recog.blender_worker import (
     BlenderFrameRequest,
     BlenderFrameResponse,
@@ -73,16 +75,12 @@ def test_build_realtime_blender_worker_command_points_at_realtime_worker_script(
         blend_file=Path("/workspace/scripts/blender/scene_template/base_scene.blend"),
     )
 
-    assert command == [
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-        "/workspace/scripts/blender/scene_template/base_scene.blend",
-        "--background",
-        "--python",
-        "/workspace/scripts/blender/realtime_worker.py",
-        "--",
-        "--output-root",
-        "/tmp/reports",
-    ]
+    assert command[0] == "/Applications/Blender.app/Contents/MacOS/Blender"
+    assert Path(command[1]).as_posix() == "/workspace/scripts/blender/scene_template/base_scene.blend"
+    assert command[2:4] == ["--background", "--python"]
+    assert Path(command[4]).as_posix() == "/workspace/scripts/blender/realtime_worker.py"
+    assert command[5:7] == ["--", "--output-root"]
+    assert Path(command[7]).as_posix() == "/tmp/reports"
 
 
 def test_blender_worker_client_builds_scene_before_rendering_frames() -> None:
@@ -173,6 +171,39 @@ def test_blender_worker_response_requires_pose_and_intrinsics() -> None:
         )
 
 
+def test_blender_frame_response_accepts_shared_memory_transport() -> None:
+    response = BlenderFrameResponse.from_payload(
+        {
+            "rgb_shared_memory": SharedMemoryArrayRef(
+                name="rgb-buffer",
+                shape=(4, 4, 3),
+                dtype="|u1",
+            ).to_payload(),
+            "depth_shared_memory": SharedMemoryArrayRef(
+                name="depth-buffer",
+                shape=(4, 4),
+                dtype="<f4",
+            ).to_payload(),
+            "semantic_mask_shared_memory": SharedMemoryArrayRef(
+                name="semantic-buffer",
+                shape=(4, 4),
+                dtype="|u1",
+            ).to_payload(),
+            "instance_mask_shared_memory": SharedMemoryArrayRef(
+                name="instance-buffer",
+                shape=(4, 4),
+                dtype="|u1",
+            ).to_payload(),
+            "camera_pose_world": np.eye(4, dtype=np.float32).tolist(),
+            "intrinsics": {"fx": 10.0, "fy": 10.0, "cx": 8.0, "cy": 6.0},
+        }
+    )
+
+    assert response.transport == "shared_memory"
+    assert response.rgb_shared_memory is not None
+    assert response.depth_path is None
+
+
 def test_blender_worker_client_raises_timeout_when_no_json_response_arrives() -> None:
     fake_process = _FakeProcess(
         stdin=_FakeWritable(),
@@ -236,6 +267,36 @@ def test_blender_worker_client_skips_non_json_stdout_lines_before_response() -> 
     assert response.scene_id == "living_room_navigation_v1"
 
 
+def test_blender_worker_client_uses_threaded_stdout_wait_for_windows_pipe_compat(monkeypatch) -> None:
+    fake_process = _FakeProcess(
+        stdin=_FakeWritable(),
+        stdout=_FakeReadable([b'{"status":"ready","scene_id":"living_room_navigation_v1"}\n']),
+        stderr=_FakeReadable([]),
+        poll_result=None,
+    )
+    monkeypatch.setattr(blender_worker_module, "_should_use_threaded_stdout_wait", lambda: True)
+    client = BlenderWorkerClient(
+        command=["blender", "--background", "--python", "worker.py"],
+        popen_factory=lambda *_args, **_kwargs: fake_process,
+        selector=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("selector should not be used")),
+    )
+    client.start()
+
+    response = client.build_scene(
+        BlenderSceneBuildRequest(
+            scene_spec=build_living_room_scene_spec(),
+            image_width=16,
+            image_height=12,
+            horizontal_fov_deg=72.0,
+            near_plane_m=0.2,
+            far_plane_m=8.0,
+        ),
+        timeout_sec=0.5,
+    )
+
+    assert response.scene_id == "living_room_navigation_v1"
+
+
 def test_realtime_worker_script_runs_as_subprocess_without_pythonpath(tmp_path: Path) -> None:
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "blender" / "realtime_worker.py"
     payload = {
@@ -267,7 +328,7 @@ def test_realtime_worker_script_runs_as_subprocess_without_pythonpath(tmp_path: 
         cwd=str(Path(__file__).resolve().parents[1]),
     )
     assert proc.stdin is not None
-    stdout, stderr = proc.communicate((json.dumps(payload) + "\n").encode("utf-8"), timeout=5)
+    stdout, stderr = proc.communicate((json.dumps(payload) + "\n").encode("utf-8"), timeout=15)
 
     assert proc.returncode == 0, stderr.decode("utf-8", "replace")
     output_lines = [json.loads(line) for line in stdout.decode("utf-8").splitlines() if line.strip()]

@@ -62,6 +62,82 @@ def depth_to_point_cloud(
     return points_xyz, points_rgb, point_pixels
 
 
+def depth_to_point_cloud_torch(
+    frame_bgr,
+    depth_map,
+    intrinsics: CameraIntrinsics,
+    stride: int,
+    max_points: int,
+    *,
+    min_depth: float = 0.3,
+    max_depth: float = 6.0,
+    device: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    try:
+        import torch
+    except ImportError:
+        return depth_to_point_cloud(
+            frame_bgr=np.asarray(frame_bgr),
+            depth_map=np.asarray(depth_map),
+            intrinsics=intrinsics,
+            stride=stride,
+            max_points=max_points,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
+
+    frame_tensor = torch.as_tensor(frame_bgr)
+    depth_tensor = torch.as_tensor(depth_map)
+    target_device = device or (
+        str(depth_tensor.device)
+        if isinstance(depth_tensor, torch.Tensor)
+        else str(frame_tensor.device)
+    )
+    frame_tensor = frame_tensor.to(device=target_device)
+    depth_tensor = depth_tensor.to(device=target_device, dtype=torch.float32)
+    if frame_tensor.ndim != 3 or tuple(frame_tensor.shape[:2]) != tuple(depth_tensor.shape):
+        raise ValueError("frame and depth map must share the same height and width")
+
+    ys, xs = torch.meshgrid(
+        torch.arange(0, depth_tensor.shape[0], stride, device=target_device, dtype=torch.float32),
+        torch.arange(0, depth_tensor.shape[1], stride, device=target_device, dtype=torch.float32),
+        indexing="ij",
+    )
+    sampled_depth = torch.clamp(depth_tensor[::stride, ::stride], min=min_depth, max=max_depth)
+    xs_flat = xs.reshape(-1)
+    ys_flat = ys.reshape(-1)
+    depth_flat = sampled_depth.reshape(-1)
+    if int(depth_flat.numel()) > int(max_points):
+        keep = torch.linspace(
+            0,
+            int(depth_flat.numel()) - 1,
+            steps=int(max_points),
+            device=target_device,
+            dtype=torch.int64,
+        )
+        xs_flat = xs_flat.index_select(0, keep)
+        ys_flat = ys_flat.index_select(0, keep)
+        depth_flat = depth_flat.index_select(0, keep)
+
+    x = (xs_flat - float(intrinsics.cx)) * depth_flat / float(intrinsics.fx)
+    y = (ys_flat - float(intrinsics.cy)) * depth_flat / float(intrinsics.fy)
+    points_xyz = torch.stack((x, y, depth_flat), dim=1).to(dtype=torch.float32)
+
+    pixel_x = xs_flat.to(dtype=torch.int64)
+    pixel_y = ys_flat.to(dtype=torch.int64)
+    sampled_bgr = frame_tensor.index_select(0, pixel_y).gather(
+        1,
+        pixel_x.view(-1, 1, 1).expand(-1, 1, int(frame_tensor.shape[2])),
+    ).squeeze(1)
+    points_rgb = sampled_bgr[:, [2, 1, 0]].to(dtype=torch.float32) / 255.0
+    point_pixels = torch.stack((pixel_x, pixel_y), dim=1)
+    return (
+        points_xyz.detach().cpu().numpy().astype(np.float32, copy=False),
+        points_rgb.detach().cpu().numpy().astype(np.float32, copy=False),
+        point_pixels.detach().cpu().numpy().astype(np.int32, copy=False),
+    )
+
+
 def back_project_pixels(
     pixel_xy: np.ndarray,
     depth_values: np.ndarray,

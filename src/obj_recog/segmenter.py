@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from obj_recog.opencv_runtime import cvt_color, resize_image
+from obj_recog.runtime_accel import device_is_cuda, resolve_precision
 from obj_recog.types import PanopticSegment, SegmentationResult
 
 
@@ -34,6 +36,10 @@ class PanopticSegmenter:
         *,
         device: str,
         input_size: int,
+        backend: str = "torch",
+        precision: str = "auto",
+        opencv_cuda: str = "off",
+        debug_log=None,
         model_id: str = "facebook/mask2former-swin-tiny-coco-panoptic",
         min_area_ratio: float = 0.005,
         processor=None,
@@ -41,6 +47,11 @@ class PanopticSegmenter:
     ) -> None:
         self._device = device
         self._input_size = int(input_size)
+        self._backend = str(backend)
+        self._precision = resolve_precision(precision, device)
+        self._use_cuda = device_is_cuda(device)
+        self._opencv_cuda = str(opencv_cuda)
+        self._debug_log = debug_log or (lambda _message: None)
         self._min_area_ratio = float(min_area_ratio)
 
         if processor is None or model is None:
@@ -52,10 +63,19 @@ class PanopticSegmenter:
             processor = AutoImageProcessor.from_pretrained(model_id)
             model = Mask2FormerForUniversalSegmentation.from_pretrained(model_id)
 
+        import torch
+
         self._processor = processor
-        self._model = model.to(device)
+        if self._use_cuda:
+            self._model = model.to(device=device, memory_format=torch.channels_last)
+        else:
+            self._model = model.to(device)
         self._model.eval()
+        self._torch = torch
+        self._stream = torch.cuda.Stream(device=device) if self._use_cuda else None
+        self._autocast_enabled = self._use_cuda and self._precision == "fp16"
         self._id2label = dict(getattr(getattr(self._model, "config", None), "id2label", {}) or {})
+        self._warmup()
 
     def _resize_for_inference(self, frame_bgr: np.ndarray) -> np.ndarray:
         import cv2
@@ -63,35 +83,60 @@ class PanopticSegmenter:
         height, width = frame_bgr.shape[:2]
         long_edge = max(height, width)
         if long_edge <= self._input_size:
-            return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            return cvt_color(
+                frame_bgr,
+                cv2.COLOR_BGR2RGB,
+                cv2_module=cv2,
+                prefer_cuda=(self._use_cuda and self._opencv_cuda != "off"),
+            )
 
         scale = self._input_size / float(long_edge)
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))
-        resized_bgr = cv2.resize(
+        resized_bgr = resize_image(
             frame_bgr,
             (resized_width, resized_height),
             interpolation=cv2.INTER_AREA,
+            cv2_module=cv2,
+            prefer_cuda=(self._use_cuda and self._opencv_cuda != "off"),
         )
-        return cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+        return cvt_color(
+            resized_bgr,
+            cv2.COLOR_BGR2RGB,
+            cv2_module=cv2,
+            prefer_cuda=(self._use_cuda and self._opencv_cuda != "off"),
+        )
 
     def segment(self, frame_bgr: np.ndarray) -> SegmentationResult:
-        import torch
-
         frame_bgr = np.asarray(frame_bgr, dtype=np.uint8)
         frame_height, frame_width = frame_bgr.shape[:2]
         input_rgb = self._resize_for_inference(frame_bgr)
         inputs = self._processor(images=input_rgb, return_tensors="pt")
         if hasattr(inputs, "to"):
             inputs = inputs.to(self._device)
+            pixel_values = getattr(inputs, "pixel_values", None)
+            if self._use_cuda and hasattr(pixel_values, "to"):
+                inputs["pixel_values"] = pixel_values.to(memory_format=self._torch.channels_last)
         else:
             inputs = {
                 key: value.to(self._device) if hasattr(value, "to") else value
                 for key, value in inputs.items()
             }
+            if self._use_cuda and hasattr(inputs.get("pixel_values"), "to"):
+                inputs["pixel_values"] = inputs["pixel_values"].to(
+                    memory_format=self._torch.channels_last
+                )
 
-        with torch.no_grad():
-            outputs = self._model(**inputs)
+        if self._stream is not None:
+            with self._torch.cuda.stream(self._stream):
+                with self._torch.inference_mode():
+                    with self._autocast():
+                        outputs = self._model(**inputs)
+            self._stream.synchronize()
+        else:
+            with self._torch.inference_mode():
+                with self._autocast():
+                    outputs = self._model(**inputs)
 
         processed = self._processor.post_process_panoptic_segmentation(
             outputs,
@@ -134,6 +179,29 @@ class PanopticSegmenter:
             segment_id_map=segment_id_map,
             segments=segments,
         )
+
+    def _warmup(self) -> None:
+        if not self._use_cuda:
+            return
+        try:
+            dummy = self._torch.zeros(
+                (1, 3, self._input_size, self._input_size),
+                device=self._device,
+                dtype=self._torch.float32,
+            ).to(memory_format=self._torch.channels_last)
+            with self._torch.inference_mode():
+                with self._autocast():
+                    _ = self._model(pixel_values=dummy)
+            synchronize = getattr(self._torch.cuda, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+        except Exception as exc:
+            self._debug_log(f"segmentation warmup skipped ({exc})")
+
+    def _autocast(self):
+        if self._autocast_enabled:
+            return self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
+        return self._torch.autocast(device_type="cpu", enabled=False)
 
 
 @dataclass(slots=True)

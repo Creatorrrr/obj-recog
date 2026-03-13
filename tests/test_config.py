@@ -13,6 +13,7 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     bundled_vocabulary = (
         Path(__file__).resolve().parents[1] / "third_party" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
     )
+    expected_vocabulary = str(bundled_vocabulary) if bundled_vocabulary.is_file() else None
 
     assert config.input_source == "live"
     assert config.scenario == "living_room_navigation_v1"
@@ -23,9 +24,10 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     assert config.sim_action_batch_size == 6
     assert config.sim_headless is False
     assert config.sim_open3d_view is True
+    assert config.sim_render_backend == "software"
     assert config.blender_exec is None
     assert config.camera_calibration is None
-    assert config.slam_vocabulary == str(bundled_vocabulary)
+    assert config.slam_vocabulary == expected_vocabulary
     assert config.explanation_enabled is True
 
 
@@ -65,6 +67,7 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
     assert config.sim_action_batch_size == 4
     assert config.sim_headless is True
     assert config.sim_open3d_view is True
+    assert config.sim_render_backend == "software"
     assert config.blender_exec == "/Applications/Blender.app/Contents/MacOS/Blender"
     assert config.camera_calibration == "/tmp/camera.yaml"
 
@@ -143,7 +146,13 @@ def test_parser_rejects_invalid_choices() -> None:
     parser = build_parser()
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["--device", "cuda"])
+        parser.parse_args(["--device", "metal"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--precision", "fp8"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--detector-backend", "onnx"])
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--segmentation-mode", "semantic"])
@@ -162,6 +171,7 @@ def test_parser_rejects_invalid_choices() -> None:
 
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("obj_recog.config.torch.cuda.is_available", lambda: False)
     monkeypatch.setattr("obj_recog.config.torch.backends.mps.is_available", lambda: True)
 
     assert resolve_device("auto") == "mps"
@@ -170,9 +180,26 @@ def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -
 def test_resolve_device_falls_back_to_cpu_when_mps_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("obj_recog.config.torch.cuda.is_available", lambda: False)
     monkeypatch.setattr("obj_recog.config.torch.backends.mps.is_available", lambda: False)
 
     assert resolve_device("auto") == "cpu"
+
+
+def test_resolve_device_prefers_cuda_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("obj_recog.config.torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("obj_recog.config.torch.backends.mps.is_available", lambda: False)
+
+    assert resolve_device("auto") == "cuda"
+
+
+def test_resolve_device_raises_when_cuda_is_requested_without_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("obj_recog.config.torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="CUDA requested"):
+        resolve_device("cuda")
 
 
 def test_app_config_direct_defaults_keep_sim_open3d_enabled() -> None:

@@ -15,6 +15,7 @@ from obj_recog.blender_worker import (
     BlenderWorkerClient,
     build_realtime_blender_worker_command,
 )
+from obj_recog.array_transport import SharedMemoryArrayRef, load_shared_memory_array
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
@@ -39,6 +40,8 @@ SCENARIO_SPECS = {
 }
 
 _ROBOT_COLLISION_RADIUS_M = 0.22
+_BLENDER_SCENE_BUILD_TIMEOUT_SEC = 30.0
+_BLENDER_FRAME_TIMEOUT_SEC = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +103,7 @@ class BlenderLivingRoomSensorBackend:
                 near_plane_m=self._camera_rig.near_plane_m,
                 far_plane_m=self._camera_rig.far_plane_m,
             ),
-            timeout_sec=15.0,
+            timeout_sec=_BLENDER_SCENE_BUILD_TIMEOUT_SEC,
         )
 
     def render_frame(self, *, world_state: HiddenWorldState, frame_index: int, timestamp_sec: float) -> SensorFrame:
@@ -112,15 +115,27 @@ class BlenderLivingRoomSensorBackend:
                 robot_pose=world_state.robot_pose,
                 camera_pose_world=pose_world,
             ),
-            timeout_sec=10.0,
+            timeout_sec=_BLENDER_FRAME_TIMEOUT_SEC,
         )
         return SensorFrame(
             frame_index=frame_index,
             timestamp_sec=timestamp_sec,
-            frame_bgr=np.asarray(_load_sensor_array(response.rgb_path), dtype=np.uint8),
-            depth_map=np.asarray(_load_sensor_array(response.depth_path), dtype=np.float32),
-            semantic_mask=np.asarray(_load_sensor_array(response.semantic_mask_path), dtype=np.uint8),
-            instance_mask=np.asarray(_load_sensor_array(response.instance_mask_path), dtype=np.uint8),
+            frame_bgr=np.asarray(
+                _load_sensor_array(response.rgb_shared_memory or response.rgb_path),
+                dtype=np.uint8,
+            ),
+            depth_map=np.asarray(
+                _load_sensor_array(response.depth_shared_memory or response.depth_path),
+                dtype=np.float32,
+            ),
+            semantic_mask=np.asarray(
+                _load_sensor_array(response.semantic_mask_shared_memory or response.semantic_mask_path),
+                dtype=np.uint8,
+            ),
+            instance_mask=np.asarray(
+                _load_sensor_array(response.instance_mask_shared_memory or response.instance_mask_path),
+                dtype=np.uint8,
+            ),
             camera_pose_world=np.asarray(response.camera_pose_world, dtype=np.float32),
             intrinsics=dict(response.intrinsics),
             render_time_ms=response.render_time_ms,
@@ -619,6 +634,8 @@ def _default_blender_worker_client(*, config: AppConfig, report_path: str | Path
         repo_root=repo_root,
         output_root=Path(report_path).parent,
         blend_file=scene_spec.blend_file_path,
+        render_backend=str(config.sim_render_backend),
+        transport=("shared_memory" if str(config.sim_render_backend) == "blender-gpu" else "filesystem"),
     )
     return BlenderWorkerClient(command=command)
 
@@ -652,8 +669,12 @@ def _pose_matrix(pose: RobotPose) -> np.ndarray:
     return matrix
 
 
-def _load_sensor_array(path: str | Path) -> np.ndarray:
-    array_path = Path(path)
+def _load_sensor_array(path_or_reference: str | Path | SharedMemoryArrayRef | None) -> np.ndarray:
+    if path_or_reference is None:
+        raise RuntimeError("sensor artifact reference is missing")
+    if isinstance(path_or_reference, SharedMemoryArrayRef):
+        return load_shared_memory_array(path_or_reference)
+    array_path = Path(path_or_reference)
     if array_path.suffix == ".npy":
         return np.load(array_path)
     raise RuntimeError(f"unsupported sensor artifact: {array_path}")

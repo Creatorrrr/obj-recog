@@ -38,3 +38,20 @@ def test_load_cv2_sets_opencl_runtime_env_and_configures_import(monkeypatch) -> 
     assert loaded is fake_cv2
     assert os.environ["OPENCV_OPENCL_RUNTIME"] == "disabled"
     assert calls == [False]
+
+
+def test_configure_opencv_runtime_preserves_opencl_when_cuda_is_requested() -> None:
+    calls: list[bool] = []
+    fake_cv2 = SimpleNamespace(
+        ocl=SimpleNamespace(
+            setUseOpenCL=lambda enabled: calls.append(enabled),
+        ),
+        cuda=SimpleNamespace(
+            getCudaEnabledDeviceCount=lambda: 1,
+        ),
+    )
+
+    configured = configure_opencv_runtime(fake_cv2, cuda_mode="auto")
+
+    assert configured is fake_cv2
+    assert calls == []

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from obj_recog.runtime_accel import detect_runtime_capabilities
+
 try:
     import torch as _torch
 except ImportError:  # pragma: no cover - exercised only without torch installed.
@@ -33,6 +35,11 @@ class AppConfig:
     conf_threshold: float
     point_stride: int
     max_points: int
+    precision: str = "auto"
+    detector_backend: str = "torch"
+    depth_backend: str = "torch"
+    segmentation_backend: str = "torch"
+    opencv_cuda: str = "auto"
     detection_interval: int = 2
     inference_width: int = 640
     orb_features: int = 1200
@@ -88,6 +95,7 @@ class AppConfig:
     sim_action_batch_size: int = 6
     sim_headless: bool = False
     sim_open3d_view: bool = True
+    sim_render_backend: str = "software"
     blender_exec: str | None = None
     episode_output_dir: str | None = None
     sim_goal_selector: str = "llm"
@@ -165,6 +173,12 @@ DEFAULT_SIM_PLANNER_TIMEOUT_SEC = 8.0
 DEFAULT_SIM_REPLAN_INTERVAL_SEC = 4.0
 DEFAULT_SIM_SELFCAL_MAX_SEC = 6.0
 DEFAULT_SIM_ACTION_BATCH_SIZE = 6
+DEFAULT_PRECISION = "auto"
+DEFAULT_DETECTOR_BACKEND = "tensorrt" if os.name == "nt" else "torch"
+DEFAULT_DEPTH_BACKEND = "torch"
+DEFAULT_SEGMENTATION_BACKEND = "torch"
+DEFAULT_OPENCV_CUDA = "auto"
+DEFAULT_SIM_RENDER_BACKEND = "software"
 
 DEPTH_PROFILE_SETTINGS: dict[str, DepthProfileSettings] = {
     "fast": DepthProfileSettings(
@@ -232,7 +246,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-name", type=str, default=None)
     parser.add_argument("--width", type=_positive_int, default=1280)
     parser.add_argument("--height", type=_positive_int, default=720)
-    parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
+    parser.add_argument("--precision", choices=("auto", "fp16", "fp32"), default=DEFAULT_PRECISION)
+    parser.add_argument(
+        "--detector-backend",
+        choices=("torch", "tensorrt"),
+        default=DEFAULT_DETECTOR_BACKEND,
+    )
+    parser.add_argument("--depth-backend", choices=("torch",), default=DEFAULT_DEPTH_BACKEND)
+    parser.add_argument(
+        "--segmentation-backend",
+        choices=("torch",),
+        default=DEFAULT_SEGMENTATION_BACKEND,
+    )
+    parser.add_argument("--opencv-cuda", choices=("auto", "on", "off"), default=DEFAULT_OPENCV_CUDA)
     parser.add_argument("--conf-threshold", type=_confidence, default=0.35)
     parser.add_argument("--point-stride", type=_positive_int, default=4)
     parser.add_argument("--max-points", type=_positive_int, default=60_000)
@@ -261,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sim-action-batch-size", type=_positive_int, default=DEFAULT_SIM_ACTION_BATCH_SIZE)
     parser.add_argument("--sim-headless", action="store_true")
     parser.add_argument("--sim-open3d-view", choices=("on", "off"), default="on")
+    parser.add_argument(
+        "--sim-render-backend",
+        choices=("software", "blender-gpu"),
+        default=DEFAULT_SIM_RENDER_BACKEND,
+    )
     parser.add_argument("--blender-exec", type=str, default=None)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
     parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
@@ -288,6 +320,11 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         width=args.width,
         height=args.height,
         device=args.device,
+        precision=args.precision,
+        detector_backend=args.detector_backend,
+        depth_backend=args.depth_backend,
+        segmentation_backend=args.segmentation_backend,
+        opencv_cuda=args.opencv_cuda,
         conf_threshold=args.conf_threshold,
         point_stride=args.point_stride,
         max_points=args.max_points,
@@ -342,6 +379,7 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         sim_action_batch_size=args.sim_action_batch_size,
         sim_headless=bool(args.sim_headless),
         sim_open3d_view=(args.sim_open3d_view == "on"),
+        sim_render_backend=args.sim_render_backend,
         blender_exec=args.blender_exec,
         sim_goal_selector="llm",
         sim_goal_model=args.sim_planner_model,
@@ -360,15 +398,23 @@ def resolve_depth_profile(profile_name: str) -> DepthProfileSettings:
 
 
 def resolve_device(requested_device: str) -> str:
+    capabilities = detect_runtime_capabilities(torch_module=torch)
     if requested_device == "cpu":
         return "cpu"
 
-    has_mps = hasattr(torch, "backends") and hasattr(torch.backends, "mps")
-    mps_available = has_mps and torch.backends.mps.is_available()
+    cuda_available = bool(capabilities.cuda_available)
+    mps_available = bool(capabilities.mps_available)
+
+    if requested_device == "cuda":
+        if cuda_available:
+            return "cuda"
+        raise RuntimeError("CUDA requested but the current torch runtime does not expose a CUDA device")
 
     if requested_device == "mps":
         return "mps" if mps_available else "cpu"
 
+    if cuda_available:
+        return "cuda"
     if mps_available:
         return "mps"
     return "cpu"

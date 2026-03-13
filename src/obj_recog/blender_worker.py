@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import select
 import subprocess
+import threading
 import time
 from typing import Any, Callable
 
 import numpy as np
 
+from obj_recog.array_transport import SharedMemoryArrayRef
 from obj_recog.sim_protocol import LivingRoomSceneSpec, RobotPose
 
 
@@ -19,6 +22,8 @@ def build_realtime_blender_worker_command(
     repo_root: str | Path,
     output_root: str | Path,
     blend_file: str | Path | None = None,
+    render_backend: str = "software",
+    transport: str = "filesystem",
 ) -> list[str]:
     root = Path(repo_root)
     worker_script = root / "scripts" / "blender" / "realtime_worker.py"
@@ -33,6 +38,10 @@ def build_realtime_blender_worker_command(
             "--",
             "--output-root",
             str(output_root),
+            "--render-backend",
+            str(render_backend),
+            "--transport",
+            str(transport),
         ]
     )
     return command
@@ -91,10 +100,14 @@ class BlenderFrameRequest:
 
 @dataclass(frozen=True, slots=True)
 class BlenderFrameResponse:
-    rgb_path: str
-    depth_path: str
-    semantic_mask_path: str
-    instance_mask_path: str
+    rgb_path: str | None
+    depth_path: str | None
+    semantic_mask_path: str | None
+    instance_mask_path: str | None
+    rgb_shared_memory: SharedMemoryArrayRef | None
+    depth_shared_memory: SharedMemoryArrayRef | None
+    semantic_mask_shared_memory: SharedMemoryArrayRef | None
+    instance_mask_shared_memory: SharedMemoryArrayRef | None
     camera_pose_world: np.ndarray
     intrinsics: dict[str, float]
     render_time_ms: float | None
@@ -105,15 +118,29 @@ class BlenderFrameResponse:
         camera_pose_world = _require_payload_field(payload, "camera_pose_world")
         intrinsics = _require_payload_field(payload, "intrinsics")
         return cls(
-            rgb_path=str(payload["rgb_path"]),
-            depth_path=str(payload["depth_path"]),
-            semantic_mask_path=str(payload["semantic_mask_path"]),
-            instance_mask_path=str(payload["instance_mask_path"]),
+            rgb_path=None if payload.get("rgb_path") is None else str(payload["rgb_path"]),
+            depth_path=None if payload.get("depth_path") is None else str(payload["depth_path"]),
+            semantic_mask_path=(
+                None if payload.get("semantic_mask_path") is None else str(payload["semantic_mask_path"])
+            ),
+            instance_mask_path=(
+                None if payload.get("instance_mask_path") is None else str(payload["instance_mask_path"])
+            ),
+            rgb_shared_memory=_shared_memory_field(payload, "rgb_shared_memory"),
+            depth_shared_memory=_shared_memory_field(payload, "depth_shared_memory"),
+            semantic_mask_shared_memory=_shared_memory_field(payload, "semantic_mask_shared_memory"),
+            instance_mask_shared_memory=_shared_memory_field(payload, "instance_mask_shared_memory"),
             camera_pose_world=np.asarray(camera_pose_world, dtype=np.float32).reshape(4, 4),
             intrinsics={str(key): float(value) for key, value in dict(intrinsics).items()},
             render_time_ms=None if payload.get("render_time_ms") is None else float(payload["render_time_ms"]),
             worker_state=None if payload.get("worker_state") is None else str(payload["worker_state"]),
         )
+
+    @property
+    def transport(self) -> str:
+        if self.rgb_shared_memory is not None:
+            return "shared_memory"
+        return "filesystem"
 
 
 class BlenderWorkerClient:
@@ -232,11 +259,48 @@ class BlenderWorkerClient:
 
 
 def _read_stdout_line(stdout, *, timeout_sec: float | None, selector) -> bytes | None:
+    if _should_use_threaded_stdout_wait():
+        return _read_stdout_line_threaded(stdout, timeout_sec=timeout_sec)
     if timeout_sec is not None:
         readable, _, _ = selector([stdout], [], [], timeout_sec)
         if not readable:
             return None
     line = stdout.readline()
+    return None if not line else line
+
+
+def _should_use_threaded_stdout_wait() -> bool:
+    return os.name == "nt"
+
+
+def _read_stdout_line_threaded(stdout, *, timeout_sec: float | None) -> bytes | None:
+    if timeout_sec is None:
+        line = stdout.readline()
+        return None if not line else line
+
+    result: dict[str, object] = {}
+    finished = threading.Event()
+
+    def _reader() -> None:
+        try:
+            result["line"] = stdout.readline()
+        except Exception as exc:  # pragma: no cover - depends on process pipe behavior.
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(
+        target=_reader,
+        name="blender-worker-stdout-reader",
+        daemon=True,
+    )
+    thread.start()
+    if not finished.wait(timeout=float(timeout_sec)):
+        return None
+    error = result.get("error")
+    if error is not None:
+        raise error
+    line = result.get("line", b"")
     return None if not line else line
 
 
@@ -259,6 +323,13 @@ def _require_payload_field(payload: dict[str, object], key: str) -> object:
     if key not in payload or payload[key] is None:
         raise ValueError(f"Blender worker response is missing required field '{key}'")
     return payload[key]
+
+
+def _shared_memory_field(payload: dict[str, object], key: str) -> SharedMemoryArrayRef | None:
+    raw_value = payload.get(key)
+    if raw_value is None:
+        return None
+    return SharedMemoryArrayRef.from_payload(dict(raw_value))
 
 
 def _json_ready(value: Any) -> Any:

@@ -18,8 +18,9 @@ from obj_recog.depth import DepthEstimator
 from obj_recog.detector import ObjectDetector
 from obj_recog.frame_source import FramePacket, LiveCameraFrameSource
 from obj_recog.mapping import LocalMapBuilder, TsdfMeshMapBuilder
-from obj_recog.opencv_runtime import load_cv2
-from obj_recog.reconstruct import depth_to_point_cloud, intrinsics_for_frame
+from obj_recog.opencv_runtime import cvt_color, load_cv2, resize_image
+from obj_recog.reconstruct import depth_to_point_cloud, depth_to_point_cloud_torch, intrinsics_for_frame
+from obj_recog.runtime_accel import detect_runtime_capabilities, device_is_cuda, resolve_precision
 from obj_recog.scene_graph import SceneGraphMemory
 from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
 from obj_recog.slam_bridge import OrbSlam3Bridge, SlamFrameResult
@@ -48,16 +49,28 @@ def _default_debug_log(message: str) -> None:
     print(f"[obj-recog] {message}", file=sys.stderr, flush=True)
 
 
-def resize_for_inference(frame_bgr: np.ndarray, inference_width: int) -> tuple[np.ndarray, float, float]:
+def resize_for_inference(
+    frame_bgr: np.ndarray,
+    inference_width: int,
+    *,
+    cv2_module=None,
+    prefer_cuda: bool = False,
+) -> tuple[np.ndarray, float, float]:
     height, width = frame_bgr.shape[:2]
     if width <= inference_width:
         return frame_bgr, 1.0, 1.0
 
-    cv2 = load_cv2()
+    cv2 = load_cv2(cv2_module)
 
     scale = inference_width / float(width)
     resized_height = max(1, int(round(height * scale)))
-    resized = cv2.resize(frame_bgr, (inference_width, resized_height), interpolation=cv2.INTER_AREA)
+    resized = resize_image(
+        frame_bgr,
+        (inference_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+        cv2_module=cv2,
+        prefer_cuda=prefer_cuda,
+    )
     return resized, width / float(inference_width), height / float(resized_height)
 
 
@@ -77,10 +90,28 @@ def _scale_detection(detection: Detection, scale_x: float, scale_y: float) -> De
     )
 
 
-def resize_for_slam(frame_bgr: np.ndarray, slam_width: int, slam_height: int, *, cv2_module=None) -> np.ndarray:
+def resize_for_slam(
+    frame_bgr: np.ndarray,
+    slam_width: int,
+    slam_height: int,
+    *,
+    cv2_module=None,
+    prefer_cuda: bool = False,
+) -> np.ndarray:
     cv2 = load_cv2(cv2_module)
-    resized = cv2.resize(frame_bgr, (slam_width, slam_height), interpolation=cv2.INTER_AREA)
-    return cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    resized = resize_image(
+        frame_bgr,
+        (slam_width, slam_height),
+        interpolation=cv2.INTER_AREA,
+        cv2_module=cv2,
+        prefer_cuda=prefer_cuda,
+    )
+    return cvt_color(
+        resized,
+        cv2.COLOR_BGR2GRAY,
+        cv2_module=cv2,
+        prefer_cuda=prefer_cuda,
+    )
 
 
 def _legacy_tracking_to_slam_result(tracking_result, *, frame_index: int | None = None) -> SlamFrameResult:
@@ -186,6 +217,19 @@ def _build_map_builder(map_builder_factory, *candidate_kwargs_sets):
     return map_builder_factory(**candidate_kwargs_sets[0])
 
 
+def _call_factory_compat(factory, **kwargs):
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return factory(**kwargs)
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return factory(**kwargs)
+    filtered_kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return factory(**filtered_kwargs)
+
+
 class _FramePacketOnlyDetector:
     def detect(self, _frame_bgr):
         raise RuntimeError("runtime detector path disabled while sim ground-truth perception is enabled")
@@ -230,10 +274,18 @@ def process_frame(
     prefer_frame_packet_ground_truth: bool = False,
     prefer_frame_packet_depth_sensor: bool = False,
     assist_frame_packet_ground_truth: bool = False,
+    effective_device: str | None = None,
     cv2_module=None,
 ) -> tuple[FrameArtifacts, list[Detection]]:
     cv2 = load_cv2(cv2_module)
-    inference_frame, scale_x, scale_y = resize_for_inference(frame_bgr, config.inference_width)
+    resolved_device = effective_device or resolve_device(config.device)
+    prefer_opencv_cuda = bool(device_is_cuda(resolved_device) and config.opencv_cuda != "off")
+    inference_frame, scale_x, scale_y = resize_for_inference(
+        frame_bgr,
+        config.inference_width,
+        cv2_module=cv2,
+        prefer_cuda=prefer_opencv_cuda,
+    )
 
     packet_detections = None if frame_packet is None else frame_packet.detections
     used_detection_fallback = False
@@ -260,10 +312,12 @@ def process_frame(
         else depth_estimator.estimate(inference_frame)
     )
     if depth_map.shape != frame_bgr.shape[:2]:
-        depth_map = cv2.resize(
+        depth_map = resize_image(
             depth_map,
             (frame_bgr.shape[1], frame_bgr.shape[0]),
             interpolation=cv2.INTER_CUBIC,
+            cv2_module=cv2,
+            prefer_cuda=prefer_opencv_cuda,
         )
 
     if calibration is not None:
@@ -278,14 +332,25 @@ def process_frame(
         intrinsics = intrinsics_for_frame(frame_bgr.shape[1], frame_bgr.shape[0])
     depth_profile = resolve_depth_profile(config.depth_profile)
     if getattr(map_builder, "requires_point_cloud", True):
-        points_xyz, point_colors, _point_pixels = depth_to_point_cloud(
-            frame_bgr=frame_bgr,
-            depth_map=depth_map,
-            intrinsics=intrinsics,
-            stride=config.point_stride,
-            max_points=config.max_points,
-            max_depth=depth_profile.max_depth,
-        )
+        if device_is_cuda(resolved_device):
+            points_xyz, point_colors, _point_pixels = depth_to_point_cloud_torch(
+                frame_bgr=frame_bgr,
+                depth_map=depth_map,
+                intrinsics=intrinsics,
+                stride=config.point_stride,
+                max_points=config.max_points,
+                max_depth=depth_profile.max_depth,
+                device=resolved_device,
+            )
+        else:
+            points_xyz, point_colors, _point_pixels = depth_to_point_cloud(
+                frame_bgr=frame_bgr,
+                depth_map=depth_map,
+                intrinsics=intrinsics,
+                stride=config.point_stride,
+                max_points=config.max_points,
+                max_depth=depth_profile.max_depth,
+            )
         map_point_colors = point_colors
     else:
         points_xyz = np.empty((0, 3), dtype=np.float32)
@@ -296,7 +361,13 @@ def process_frame(
     elif slam_bridge is not None:
         if timestamp_sec is None:
             raise RuntimeError("SLAM bridge requires a real frame timestamp in seconds")
-        slam_gray = resize_for_slam(frame_bgr, config.slam_width, config.slam_height, cv2_module=cv2)
+        slam_gray = resize_for_slam(
+            frame_bgr,
+            config.slam_width,
+            config.slam_height,
+            cv2_module=cv2,
+            prefer_cuda=prefer_opencv_cuda,
+        )
         slam_result = slam_bridge.track(slam_gray, float(timestamp_sec))
     elif tracker is not None:
         tracking_result = tracker.update(
@@ -695,10 +766,23 @@ def run(
     debug_log=_default_debug_log,
     validation_probe=None,
 ) -> None:
-    cv2 = load_cv2(cv2_module)
+    cv2 = load_cv2(cv2_module, cuda_mode=config.opencv_cuda)
     _load_app_dotenv()
+    runtime_capabilities = detect_runtime_capabilities(cv2_module=cv2)
     effective_device = resolve_device(config.device)
+    effective_precision = resolve_precision(config.precision, effective_device)
     depth_profile = resolve_depth_profile(config.depth_profile)
+    debug_log(
+        "runtime accel "
+        f"device={effective_device} precision={effective_precision} "
+        f"torch_cuda={runtime_capabilities.cuda_available} "
+        f"opencv_cuda={runtime_capabilities.opencv_cuda_available} "
+        f"tensorrt={runtime_capabilities.tensorrt_available} "
+        f"detector_backend={config.detector_backend} "
+        f"depth_backend={config.depth_backend} "
+        f"segmentation_backend={config.segmentation_backend} "
+        f"sim_render_backend={config.sim_render_backend}"
+    )
     camera_session: CameraSession | None = None
     viewer = None
     environment_viewer = None
@@ -958,17 +1042,40 @@ def run(
             depth_estimator = _FramePacketOnlyDepthEstimator()
         elif assist_frame_packet_ground_truth:
             debug_log("detector init start")
-            detector = detector_factory(conf_threshold=config.conf_threshold, device=effective_device)
+            detector = _call_factory_compat(
+                detector_factory,
+                conf_threshold=config.conf_threshold,
+                device=effective_device,
+                backend=config.detector_backend,
+                precision=effective_precision,
+                input_size=config.inference_width,
+                debug_log=debug_log,
+            )
             debug_log("detector init done")
             depth_estimator = _FramePacketOnlyDepthEstimator()
         else:
             debug_log("detector init start")
-            detector = detector_factory(conf_threshold=config.conf_threshold, device=effective_device)
+            detector = _call_factory_compat(
+                detector_factory,
+                conf_threshold=config.conf_threshold,
+                device=effective_device,
+                backend=config.detector_backend,
+                precision=effective_precision,
+                input_size=config.inference_width,
+                debug_log=debug_log,
+            )
             debug_log("detector init done")
-            debug_log("depth init start")
-            try:
-                depth_estimator = depth_estimator_factory(
+            if config.input_source == "sim" and prefer_frame_packet_depth_sensor:
+                depth_estimator = _FramePacketOnlyDepthEstimator()
+            else:
+                debug_log("depth init start")
+                depth_estimator = _call_factory_compat(
+                    depth_estimator_factory,
                     device=effective_device,
+                    backend=config.depth_backend,
+                    precision=effective_precision,
+                    opencv_cuda=config.opencv_cuda,
+                    debug_log=debug_log,
                     profile=depth_profile.name,
                     low_percentile=depth_profile.low_percentile,
                     high_percentile=depth_profile.high_percentile,
@@ -976,16 +1083,19 @@ def run(
                     max_depth=depth_profile.max_depth,
                     gamma=depth_profile.gamma,
                 )
-            except TypeError:
-                depth_estimator = depth_estimator_factory(device=effective_device)
-            debug_log("depth init done")
+                debug_log("depth init done")
         if config.segmentation_mode != "off":
             try:
                 debug_log("segmentation init start")
                 segmentation_worker = segmentation_worker_factory(
-                    segmenter=segmenter_factory(
+                    segmenter=_call_factory_compat(
+                        segmenter_factory,
                         device=effective_device,
                         input_size=config.segmentation_input_size,
+                        backend=config.segmentation_backend,
+                        precision=effective_precision,
+                        opencv_cuda=config.opencv_cuda,
+                        debug_log=debug_log,
                     )
                 )
                 debug_log("segmentation init done")
@@ -1198,6 +1308,7 @@ def run(
                 prefer_frame_packet_ground_truth=use_frame_packet_ground_truth,
                 prefer_frame_packet_depth_sensor=prefer_frame_packet_depth_sensor,
                 assist_frame_packet_ground_truth=assist_frame_packet_ground_truth,
+                effective_device=effective_device,
                 cv2_module=cv2,
             )
             record_runtime_observation = getattr(frame_source, "record_runtime_observation", None)
