@@ -30,6 +30,8 @@ _CAMERA_HEIGHT_METERS = 1.4
 _ROOM_WIDTH_METERS = 6.0
 _ROOM_DEPTH_METERS = 8.0
 _ROOM_HEIGHT_METERS = 3.0
+_PHOTOREAL_STARTUP_TIMEOUT_SEC = 15.0
+_PHOTOREAL_FRAME_TIMEOUT_SEC = 5.0
 _GOAL_SELECTOR_SYSTEM_INSTRUCTIONS = (
     "You are a camera navigation goal selector. "
     "Return JSON only with keys target_label, desired_bearing, desired_distance_band, reason, confidence. "
@@ -1301,6 +1303,7 @@ class BlenderRealtimeFrameSource:
             if callable(start):
                 start()
             self._started = True
+        effective_timeout = self._effective_worker_timeout(timeout_sec)
         request = BlenderFrameRequest(
             frame_index=self._frame_index,
             timestamp_sec=self._elapsed_sec,
@@ -1315,7 +1318,7 @@ class BlenderRealtimeFrameSource:
             dynamic_actor_transforms=self._dynamic_actor_transforms(),
             lighting_seed=int(self._config.sim_seed),
         )
-        response = self._worker_client.request_frame(request, timeout_sec=timeout_sec)
+        response = self._worker_client.request_frame(request, timeout_sec=effective_timeout)
         if isinstance(response, dict):
             response = BlenderFrameResponse.from_payload(response)
         if not isinstance(response, BlenderFrameResponse):
@@ -1400,6 +1403,16 @@ class BlenderRealtimeFrameSource:
         close = getattr(self._worker_client, "close", None)
         if callable(close):
             close()
+
+    def _effective_worker_timeout(self, timeout_sec: float | None) -> float | None:
+        requested = None if timeout_sec is None else float(timeout_sec)
+        if self._frame_index == 0:
+            floor = _PHOTOREAL_STARTUP_TIMEOUT_SEC
+        else:
+            floor = _PHOTOREAL_FRAME_TIMEOUT_SEC
+        if requested is None:
+            return floor
+        return max(requested, floor)
 
     def _dynamic_actor_transforms(self) -> dict[str, np.ndarray]:
         transforms: dict[str, np.ndarray] = {}

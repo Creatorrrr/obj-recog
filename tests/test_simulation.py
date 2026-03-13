@@ -129,6 +129,26 @@ class _FakeBlenderWorker:
         self.closed = True
 
 
+class _QueuedFakeBlenderWorker:
+    def __init__(self, responses) -> None:
+        self._responses = list(responses)
+        self.started = False
+        self.closed = False
+        self.requests = []
+
+    def start(self) -> None:
+        self.started = True
+
+    def request_frame(self, request, *, timeout_sec: float | None = None):
+        self.requests.append((request, timeout_sec))
+        if not self._responses:
+            raise AssertionError("no queued blender worker response remains")
+        return self._responses.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_scenario_registry_contains_expected_specs() -> None:
     assert tuple(SCENARIO_SPECS) == _SCENARIO_IDS
     assert SCENARIO_SPECS["studio_open_v1"].difficulty_level == 1
@@ -216,9 +236,85 @@ def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp
     assert packet.scenario_state.render_time_ms == pytest.approx(16.4)
     assert worker.started is True
     assert len(worker.requests) == 1
-    assert worker.requests[0][1] == pytest.approx(0.75)
+    assert worker.requests[0][1] == pytest.approx(15.0)
     source.close()
     assert worker.closed is True
+
+
+def test_blender_realtime_frame_source_uses_longer_startup_timeout_floor(tmp_path: Path) -> None:
+    rgb_path = tmp_path / "startup-rgb.npy"
+    depth_path = tmp_path / "startup-depth.npy"
+    np.save(rgb_path, np.full((4, 6, 3), 100, dtype=np.uint8))
+    np.save(depth_path, np.full((4, 6), 2.0, dtype=np.float32))
+    worker = _FakeBlenderWorker(
+        BlenderFrameResponse(
+            rgb_path=str(rgb_path),
+            depth_path=str(depth_path),
+            semantic_mask_path=None,
+            instance_mask_path=None,
+            pose_world_gt=np.eye(4, dtype=np.float32),
+            intrinsics_gt={"fx": 12.0, "fy": 12.0, "cx": 3.0, "cy": 2.0},
+            render_time_ms=3200.0,
+            worker_state="ready",
+        )
+    )
+    config = _config(render_profile="photoreal", blender_exec="/Applications/Blender.app/Contents/MacOS/Blender")
+    source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=SCENARIO_SPECS["studio_open_v1"],
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=build_scenario_asset_manifest(
+            SCENARIO_SPECS["studio_open_v1"],
+            seed=7,
+            cache_dir=tmp_path / "assets",
+            quality="low",
+        ),
+        worker_client=worker,
+    )
+
+    packet = source.next_frame(timeout_sec=1.0)
+
+    assert packet is not None
+    assert worker.requests[0][1] == pytest.approx(15.0)
+
+
+def test_blender_realtime_frame_source_uses_runtime_timeout_floor_after_startup(tmp_path: Path) -> None:
+    rgb_path = tmp_path / "runtime-rgb.npy"
+    depth_path = tmp_path / "runtime-depth.npy"
+    np.save(rgb_path, np.full((4, 6, 3), 110, dtype=np.uint8))
+    np.save(depth_path, np.full((4, 6), 2.1, dtype=np.float32))
+    response = BlenderFrameResponse(
+        rgb_path=str(rgb_path),
+        depth_path=str(depth_path),
+        semantic_mask_path=None,
+        instance_mask_path=None,
+        pose_world_gt=np.eye(4, dtype=np.float32),
+        intrinsics_gt={"fx": 12.0, "fy": 12.0, "cx": 3.0, "cy": 2.0},
+        render_time_ms=800.0,
+        worker_state="ready",
+    )
+    worker = _QueuedFakeBlenderWorker([response, response])
+    config = _config(render_profile="photoreal", blender_exec="/Applications/Blender.app/Contents/MacOS/Blender")
+    source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=SCENARIO_SPECS["studio_open_v1"],
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=build_scenario_asset_manifest(
+            SCENARIO_SPECS["studio_open_v1"],
+            seed=7,
+            cache_dir=tmp_path / "assets",
+            quality="low",
+        ),
+        worker_client=worker,
+    )
+
+    first_packet = source.next_frame(timeout_sec=1.0)
+    second_packet = source.next_frame(timeout_sec=1.0)
+
+    assert first_packet is not None
+    assert second_packet is not None
+    assert worker.requests[0][1] == pytest.approx(15.0)
+    assert worker.requests[1][1] == pytest.approx(5.0)
 
 
 @pytest.mark.parametrize("scenario_name", _NON_STUDIO_SCENARIO_IDS)
@@ -288,7 +384,7 @@ def test_blender_realtime_frame_source_supports_remaining_photoreal_scenarios_an
     assert packet.detections[0].label == asset_manifest.semantic_target_class
     assert len(worker.requests) == 1
     request, timeout_sec = worker.requests[0]
-    assert timeout_sec == pytest.approx(0.25)
+    assert timeout_sec == pytest.approx(15.0)
     assert request.scenario_id == scenario_name
     assert set(request.dynamic_actor_transforms) == {
         str(actor.actor_id) for actor in scenario.dynamic_actors
@@ -1020,7 +1116,7 @@ def test_blender_realtime_frame_source_emits_frame_packet_for_studio_scenario(tm
     assert len(fake_worker.requests) == 1
     request, timeout_sec = fake_worker.requests[0]
     assert request.scenario_id == "studio_open_v1"
-    assert timeout_sec == pytest.approx(0.25)
+    assert timeout_sec == pytest.approx(15.0)
     assert fake_worker.closed is False
 
     source.close()

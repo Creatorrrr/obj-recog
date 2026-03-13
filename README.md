@@ -120,14 +120,21 @@ PYTHONPATH=src python -m obj_recog.main \
   --scenario office_clutter_v1 \
   --render-profile photoreal \
   --blender-exec /Applications/Blender.app/Contents/MacOS/Blender \
-  --sim-perception-mode assisted
+  --sim-perception-mode assisted \
+  --width 640 \
+  --height 360 \
+  --device cpu \
+  --segmentation-mode panoptic \
+  --explanation-mode off
 ```
 
 Current status:
 
 - `render_profile=photoreal` is routed through the Blender realtime frame-source code path.
+- The Blender worker at `scripts/blender/realtime_worker.py` now processes realtime requests and writes RGB, depth, semantic mask, instance mask, and detection metadata bundles.
 - Multi-scenario photoreal routing and validation are covered by tests.
-- The Blender worker bootstrap script at `scripts/blender/realtime_worker.py` is still a bootstrap stub, so a full manual photoreal session is not complete yet.
+- If the asset-library `.blend` files are missing from the asset cache, the worker falls back to procedurally generated Blender mesh objects built from the scene manifest. This still uses real 3D meshes, but not high-fidelity scanned/library assets yet.
+- The first photoreal frame is currently expensive on this machine. Expect a cold-start render to take several seconds before performance work lands.
 - If you already have an external render bundle manifest, you can use `--sim-external-manifest /absolute/path/to/manifest.json`.
 
 ## Outputs
