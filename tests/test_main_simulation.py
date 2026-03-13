@@ -43,6 +43,19 @@ class _FakeViewer:
         self.closed = True
 
 
+class _FakeEnvironmentViewer:
+    def __init__(self) -> None:
+        self.closed = False
+        self.states: list[object] = []
+
+    def update(self, scenario_state, *_args, **_kwargs) -> bool:
+        self.states.append(scenario_state)
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _StrictDetector:
     def __init__(self, **_kwargs) -> None:
         pass
@@ -313,11 +326,7 @@ def test_run_shows_environment_model_window_for_sim_scenario_state() -> None:
     packet.scenario_state = scenario_state
     source = _FakeFrameSource([packet])
     fake_cv2 = _FakeCV2()
-    rendered_states: list[object] = []
-
-    def environment_model_renderer(current_state, **_kwargs) -> np.ndarray:
-        rendered_states.append(current_state)
-        return np.zeros((32, 32, 3), dtype=np.uint8)
+    environment_viewer = _FakeEnvironmentViewer()
 
     run(
         config,
@@ -327,14 +336,15 @@ def test_run_shows_environment_model_window_for_sim_scenario_state() -> None:
         tracker_factory=lambda **_kwargs: _CountingTracker(),
         map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
         viewer_factory=lambda: _FakeViewer(),
+        environment_viewer_factory=lambda: environment_viewer,
         open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
         frame_source_factory=lambda *_args, **_kwargs: source,
         overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
-        environment_model_renderer=environment_model_renderer,
     )
 
-    assert rendered_states == [scenario_state]
-    assert "Environment Model" in fake_cv2.imshow_calls
+    assert environment_viewer.states == [scenario_state]
+    assert environment_viewer.closed is True
+    assert "Environment Model" not in fake_cv2.imshow_calls
 
 
 def test_run_uses_frame_source_for_sim_input_without_opening_camera() -> None:

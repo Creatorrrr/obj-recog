@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
+from PIL import Image
 
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
-from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment
+from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
 from obj_recog.visualization import (
+    Open3DEnvironmentViewer,
     Open3DMeshViewer,
     _display_points_for_view,
     draw_detections,
@@ -12,6 +16,7 @@ from obj_recog.visualization import (
     highlight_detected_points,
     render_multiline_unicode_text,
     render_explanation_panel,
+    runtime_window_position,
 )
 
 
@@ -91,8 +96,17 @@ class _FakeVisualizer:
         self.reset_calls: list[bool] = []
         self.poll_count = 0
         self.renderer_updates = 0
+        self.window_calls: list[dict[str, int | str]] = []
 
-    def create_window(self, window_name: str, width: int, height: int) -> bool:
+    def create_window(self, window_name: str, width: int, height: int, **kwargs) -> bool:
+        call = {
+            "window_name": window_name,
+            "width": int(width),
+            "height": int(height),
+        }
+        for key, value in kwargs.items():
+            call[str(key)] = int(value)
+        self.window_calls.append(call)
         return True
 
     def add_geometry(self, geometry) -> None:
@@ -118,7 +132,23 @@ class _FakeVisualizer:
         return None
 
 
+class _FakeIO:
+    def __init__(self) -> None:
+        self.read_calls: list[str] = []
+
+    def read_triangle_mesh(self, path: str):
+        self.read_calls.append(str(path))
+        mesh = _FakeTriangleMesh()
+        mesh.vertices = _FakeVector3dVector(np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]]))
+        mesh.triangles = _FakeVector3dVector(np.array([[0, 1, 2]], dtype=np.int32))
+        mesh.vertex_colors = _FakeVector3dVector(np.array([[0.2, 0.2, 0.2]] * 3))
+        return mesh
+
+
 class _FakeO3D:
+    def __init__(self) -> None:
+        self.io = _FakeIO()
+
     class visualization:
         Visualizer = _FakeVisualizer
 
@@ -1008,6 +1038,148 @@ def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:
 
     assert viewer._vis.reset_calls == [True]
     assert len(viewer._vis.geometry) == 4
+
+
+def test_runtime_window_position_uses_primary_frame_size_grid() -> None:
+    assert runtime_window_position("Object Recognition", primary_width=640, primary_height=360) == (32, 48)
+    assert runtime_window_position("Environment Model", primary_width=640, primary_height=360) == (704, 48)
+    assert runtime_window_position("Situation Explanation", primary_width=640, primary_height=360) == (32, 440)
+    assert runtime_window_position("3D Reconstruction", primary_width=640, primary_height=360) == (704, 440)
+
+
+def test_open3d_viewer_uses_runtime_window_layout_for_initial_position() -> None:
+    viewer = Open3DMeshViewer(
+        o3d_module=_FakeO3D(),
+        layout_primary_width=640,
+        layout_primary_height=360,
+    )
+
+    assert viewer._vis.window_calls == [
+        {
+            "window_name": "3D Reconstruction",
+            "width": 960,
+            "height": 720,
+            "left": 704,
+            "top": 440,
+        }
+    ]
+
+
+def test_environment_viewer_uses_environment_window_layout_for_initial_position() -> None:
+    viewer = Open3DEnvironmentViewer(
+        o3d_module=_FakeO3D(),
+        layout_primary_width=640,
+        layout_primary_height=360,
+    )
+
+    assert viewer._vis.window_calls == [
+        {
+            "window_name": "Environment Model",
+            "width": 960,
+            "height": 720,
+            "left": 704,
+            "top": 48,
+        }
+    ]
+
+
+def test_environment_viewer_renders_room_object_meshes_and_camera_marker() -> None:
+    fake_o3d = _FakeO3D()
+    viewer = Open3DEnvironmentViewer(o3d_module=fake_o3d)
+    scenario_state = SimpleNamespace(
+        room_width_m=6.0,
+        room_depth_m=8.0,
+        room_height_m=3.0,
+        environment_objects=(
+            {
+                "label": "chair",
+                "asset_id": "chair_modern",
+                "center_world": (-1.1, 0.55, 4.4),
+                "size_xyz": (0.7, 1.1, 0.7),
+                "yaw_deg": 15.0,
+                "color_bgr": (60, 180, 120),
+                "preview_mesh_path": "/tmp/chair_modern.ply",
+                "target_role": False,
+                "visible": True,
+            },
+            {
+                "label": "backpack",
+                "asset_id": "backpack_canvas",
+                "center_world": (1.5, 0.45, 5.4),
+                "size_xyz": (0.8, 0.9, 0.8),
+                "yaw_deg": 0.0,
+                "color_bgr": (40, 80, 225),
+                "preview_mesh_path": "/tmp/backpack_canvas.ply",
+                "target_role": True,
+                "visible": True,
+            },
+        ),
+        rig_x=0.0,
+        rig_y=1.6,
+        rig_z=0.0,
+        yaw_deg=-25.0,
+    )
+
+    is_active = viewer.update(scenario_state)
+
+    assert is_active is True
+    assert len(viewer._vis.geometry) == 3
+    assert viewer._room_mesh.vertices.data.shape[0] > 0
+    assert viewer._room_mesh.triangles.data.shape[0] > 0
+    assert viewer._object_mesh.vertices.data.shape[0] > 0
+    assert viewer._object_mesh.triangles.data.shape[0] > 0
+    assert viewer._camera_lines.points.data.shape[0] > 0
+    assert viewer._camera_lines.lines.data.shape[0] > 0
+    assert viewer._vis.reset_calls == [True]
+    assert fake_o3d.io.read_calls == ["/tmp/chair_modern.ply", "/tmp/backpack_canvas.ply"]
+
+
+def test_draw_detections_renders_perception_diagnostics_status_lines() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        draw_detections(
+            np.zeros((16, 16, 3), dtype=np.uint8),
+            [],
+            10.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=1,
+            perception_diagnostics=PerceptionDiagnostics(
+                perception_mode="assisted",
+                detection_source="runtime+fallback",
+                depth_source="ground_truth",
+                pose_source="ground_truth",
+                gt_target_visible=True,
+                benchmark_valid=False,
+            ),
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert "Perception assisted" in fake_cv2.text_calls
+    assert "Detect runtime+fallback" in fake_cv2.text_calls
+    assert "Depth/Pose ground_truth/ground_truth" in fake_cv2.text_calls
+    assert "Benchmark invalid GT-visible yes" in fake_cv2.text_calls
 
 
 def test_display_points_for_view_flips_y_and_z_axes() -> None:

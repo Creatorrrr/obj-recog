@@ -94,6 +94,23 @@ class _EmptyDetector:
         return []
 
 
+class _RecordingDetector:
+    def __init__(self) -> None:
+        self.frames: list[np.ndarray] = []
+
+    def detect(self, frame_bgr: np.ndarray):
+        self.frames.append(np.asarray(frame_bgr, dtype=np.uint8).copy())
+        return [
+            Detection(
+                xyxy=(0, 0, frame_bgr.shape[1] - 1, frame_bgr.shape[0] - 1),
+                class_id=3,
+                label="chair",
+                confidence=0.88,
+                color=(0, 255, 255),
+            )
+        ]
+
+
 class _CountingDepthEstimator:
     def __init__(self) -> None:
         self.calls = 0
@@ -285,6 +302,7 @@ def test_process_frame_assisted_mode_falls_back_to_packet_detections_and_depth()
                 color=(0, 255, 0),
             )
         ],
+        scenario_state=type("ScenarioState", (), {"semantic_target_class": "gt-target"})(),
     )
     detector = _EmptyDetector()
     tracker = _CountingTracker()
@@ -309,3 +327,85 @@ def test_process_frame_assisted_mode_falls_back_to_packet_detections_and_depth()
     assert np.allclose(artifacts.depth_map, packet.depth_map)
     assert cached[0].label == "gt-target"
     assert artifacts.detections[0].label == "gt-target"
+    assert artifacts.perception_diagnostics is not None
+    assert artifacts.perception_diagnostics.detection_source == "runtime+fallback"
+    assert artifacts.perception_diagnostics.depth_source == "ground_truth"
+    assert artifacts.perception_diagnostics.pose_source == "ground_truth"
+    assert artifacts.perception_diagnostics.gt_target_visible is True
+    assert artifacts.perception_diagnostics.benchmark_valid is False
+
+
+def test_process_frame_runtime_sim_mode_marks_benchmark_valid_runtime_sources() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        sim_perception_mode="runtime",
+    )
+    frame = np.full((8, 8, 3), 90, dtype=np.uint8)
+    detector = _CountingDetector()
+    depth_estimator = _CountingDepthEstimator()
+    tracker = _CountingTracker()
+
+    artifacts, cached = process_frame(
+        frame_bgr=frame,
+        detector=detector,
+        depth_estimator=depth_estimator,
+        map_builder=_FakeMapBuilder(),
+        config=config,
+        frame_index=0,
+        timestamp_sec=1.0,
+        cached_detections=[],
+        tracker=tracker,
+    )
+
+    assert cached[0].label == "runtime-target"
+    assert artifacts.perception_diagnostics is not None
+    assert artifacts.perception_diagnostics.perception_mode == "runtime"
+    assert artifacts.perception_diagnostics.detection_source == "runtime"
+    assert artifacts.perception_diagnostics.depth_source == "runtime"
+    assert artifacts.perception_diagnostics.pose_source == "runtime"
+    assert artifacts.perception_diagnostics.gt_target_visible is False
+    assert artifacts.perception_diagnostics.benchmark_valid is True
+
+
+def test_process_frame_passes_resized_raw_camera_frame_to_detector() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=12,
+        height=8,
+        inference_width=6,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+    )
+    frame = np.arange(8 * 12 * 3, dtype=np.uint8).reshape(8, 12, 3)
+    detector = _RecordingDetector()
+    depth_estimator = _CountingDepthEstimator()
+    tracker = _CountingTracker()
+
+    artifacts, cached = process_frame(
+        frame_bgr=frame,
+        detector=detector,
+        depth_estimator=depth_estimator,
+        map_builder=_FakeMapBuilder(),
+        config=config,
+        frame_index=0,
+        timestamp_sec=1.0,
+        cached_detections=[],
+        tracker=tracker,
+    )
+
+    assert len(detector.frames) == 1
+    expected_height = int(round(frame.shape[0] * (config.inference_width / float(frame.shape[1]))))
+    assert detector.frames[0].shape == (expected_height, int(config.inference_width), 3)
+    assert not np.shares_memory(detector.frames[0], artifacts.frame_bgr)
+    assert cached[0].label == "chair"
+    assert depth_estimator.calls == 1
+    assert tracker.calls == 1

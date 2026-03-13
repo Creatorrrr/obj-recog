@@ -50,6 +50,16 @@ class DepthDiagnostics:
     hint: str
 
 
+@dataclass(frozen=True, slots=True)
+class PerceptionDiagnostics:
+    perception_mode: str
+    detection_source: str
+    depth_source: str
+    pose_source: str
+    gt_target_visible: bool
+    benchmark_valid: bool
+
+
 @dataclass(slots=True)
 class FrameArtifacts:
     frame_bgr: np.ndarray
@@ -75,6 +85,7 @@ class FrameArtifacts:
     segmentation_overlay_bgr: np.ndarray
     segments: list[PanopticSegment]
     depth_diagnostics: DepthDiagnostics | None = None
+    perception_diagnostics: PerceptionDiagnostics | None = None
     scene_graph_snapshot: SceneGraphSnapshot | None = None
     visible_graph_nodes: list[GraphNode] = field(default_factory=list)
     visible_graph_edges: list[GraphEdge] = field(default_factory=list)

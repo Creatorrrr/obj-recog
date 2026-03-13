@@ -1,0 +1,22 @@
+{
+  "asset_manifest_id": "61791ef984a2",
+  "difficulty_level": 6,
+  "dynamic_actor_count": 4,
+  "failure_reason": null,
+  "fallback_count": 0,
+  "llm_goal_accept_rate": 0.0,
+  "mission_success": true,
+  "pose_error_vs_gt": 0.0,
+  "render_backend": "analytic",
+  "render_profile": "photoreal",
+  "scenario": "warehouse_moving_target_v1",
+  "scenario_family": "warehouse",
+  "seed": 7,
+  "selfcal_converged": true,
+  "sim_perception_mode": "assisted",
+  "sim_profile": "lightweight",
+  "steps": 147,
+  "target_class": "suitcase",
+  "time_to_first_valid_view": 14.4,
+  "tracking_uptime": 1.0
+}

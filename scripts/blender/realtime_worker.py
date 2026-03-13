@@ -11,6 +11,13 @@ from typing import Any, TextIO
 
 import numpy as np
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = _REPO_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from obj_recog.procedural_assets import procedural_asset_blueprint
+
 try:
     from PIL import Image, ImageDraw
 except Exception:  # pragma: no cover - Pillow is available in tests, optional in Blender runtime
@@ -45,6 +52,9 @@ class ScenePlacement:
     size_xyz: tuple[float, float, float]
     yaw_deg: float
     preview_sprite_path: str
+    preview_mesh_path: str
+    asset_metadata_path: str
+    asset_provenance: str
     blender_library_path: str
     blender_object_name: str
     recommended_scale: float
@@ -60,6 +70,7 @@ class SceneManifest:
     difficulty_level: int
     semantic_target_class: str
     asset_manifest_id: str
+    require_external_assets: bool
     environment: dict[str, float]
     camera_rig: dict[str, float]
     placements: tuple[ScenePlacement, ...]
@@ -119,6 +130,9 @@ def load_scene_manifest(path: str | Path) -> SceneManifest:
             size_xyz=_triple(item["size_xyz"]),
             yaw_deg=float(item["yaw_deg"]),
             preview_sprite_path=str(item["preview_sprite_path"]),
+            preview_mesh_path=str(item.get("preview_mesh_path", "")),
+            asset_metadata_path=str(item.get("asset_metadata_path", "")),
+            asset_provenance=str(item.get("asset_provenance", "")),
             blender_library_path=str(item["blender_library_path"]),
             blender_object_name=str(item["blender_object_name"]),
             recommended_scale=float(item["recommended_scale"]),
@@ -134,6 +148,7 @@ def load_scene_manifest(path: str | Path) -> SceneManifest:
         difficulty_level=int(payload["difficulty_level"]),
         semantic_target_class=str(payload["semantic_target_class"]),
         asset_manifest_id=str(payload["asset_manifest_id"]),
+        require_external_assets=bool(payload.get("require_external_assets", False)),
         environment={str(key): float(value) for key, value in dict(payload["environment"]).items()},
         camera_rig={str(key): float(value) for key, value in dict(payload["camera_rig"]).items()},
         placements=placements,
@@ -146,6 +161,8 @@ def create_worker_runtime(
     *,
     force_python_fallback: bool = False,
 ) -> WorkerRuntime:
+    if scene_manifest.require_external_assets and (force_python_fallback or bpy is None or mathutils is None):
+        raise RuntimeError("strict external-asset photoreal runtime requires Blender; Python fallback is disabled")
     if not force_python_fallback and bpy is not None and mathutils is not None:
         return BlenderRealtimeWorkerRuntime(config=config, scene_manifest=scene_manifest)
     return PythonFallbackWorkerRuntime(config=config, scene_manifest=scene_manifest)
@@ -379,22 +396,49 @@ class BlenderRealtimeWorkerRuntime(WorkerRuntime):  # pragma: no cover - exercis
         output_path.parent.mkdir(parents=True, exist_ok=True)
         bpy.ops.render.render(write_still=True)
 
-    def _new_primitive(self, name: str, primitive_type: str):
+    def _new_primitive(
+        self,
+        name: str,
+        primitive_type: str,
+        *,
+        location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        rotation_euler: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ):
         assert bpy is not None
         if primitive_type == "PLANE":
-            bpy.ops.mesh.primitive_plane_add(size=1.0)
+            bpy.ops.mesh.primitive_plane_add(size=1.0, location=location, rotation=rotation_euler)
         elif primitive_type == "CYLINDER":
-            bpy.ops.mesh.primitive_cylinder_add(vertices=18, radius=0.5, depth=1.0)
+            bpy.ops.mesh.primitive_cylinder_add(
+                vertices=18,
+                radius=0.5,
+                depth=1.0,
+                location=location,
+                rotation=rotation_euler,
+            )
         elif primitive_type == "UV_SPHERE":
-            bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, segments=24, ring_count=12)
+            bpy.ops.mesh.primitive_uv_sphere_add(
+                radius=0.5,
+                segments=24,
+                ring_count=12,
+                location=location,
+                rotation=rotation_euler,
+            )
         else:
-            bpy.ops.mesh.primitive_cube_add(size=1.0)
+            bpy.ops.mesh.primitive_cube_add(size=1.0, location=location, rotation=rotation_euler)
         obj = bpy.context.active_object
         obj.name = name
         return obj
 
     def _create_object_for_placement(self, placement: ScenePlacement):
         obj = self._try_link_asset_object(placement)
+        generated_library = False
+        if obj is None and self._scene_manifest.require_external_assets:
+            raise RuntimeError(
+                f"missing external mesh for {placement.asset_id} at {placement.blender_library_path}"
+            )
+        if obj is None:
+            obj = self._build_procedural_asset_object(placement)
+            generated_library = obj is not None
         if obj is None:
             primitive = _primitive_type_for_placement(placement)
             obj = self._new_primitive(f"worker-{placement.source_key}", primitive)
@@ -404,6 +448,9 @@ class BlenderRealtimeWorkerRuntime(WorkerRuntime):  # pragma: no cover - exercis
             roughness=_roughness_for_asset_family(placement.asset_family),
             metallic=0.0 if placement.asset_family != "electronics" else 0.2,
         )
+        if generated_library:
+            self._cache_asset_library(placement, obj)
+            obj.name = f"worker-{placement.source_key}"
         return obj
 
     def _try_link_asset_object(self, placement: ScenePlacement):
@@ -423,6 +470,78 @@ class BlenderRealtimeWorkerRuntime(WorkerRuntime):  # pragma: no cover - exercis
             return obj
         except Exception:
             return None
+
+    def _build_procedural_asset_object(self, placement: ScenePlacement):
+        assert bpy is not None
+        blueprint = procedural_asset_blueprint(placement.asset_id, semantic_class=placement.semantic_class)
+        if not blueprint.parts:
+            return None
+        parts = []
+        for index, part in enumerate(blueprint.parts):
+            obj = self._new_primitive(
+                f"{placement.blender_object_name}-{part.kind}-{index}",
+                part.primitive_type,
+                location=part.location_xyz,
+                rotation_euler=tuple(math.radians(float(value)) for value in part.rotation_xyz_deg),
+            )
+            obj.dimensions = tuple(float(value) for value in part.dimensions_xyz)
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+            obj.select_set(False)
+            parts.append(obj)
+        if not parts:
+            return None
+        if len(parts) == 1:
+            obj = parts[0]
+            obj.name = placement.blender_object_name
+        else:
+            obj = self._join_objects(parts, placement.blender_object_name)
+        self._recenter_object_geometry(obj)
+        return obj
+
+    def _join_objects(self, objects, name: str):
+        assert bpy is not None
+        for selected in tuple(bpy.context.selected_objects):
+            selected.select_set(False)
+        for obj in objects:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = objects[0]
+        bpy.ops.object.join()
+        joined = bpy.context.active_object
+        joined.name = name
+        joined.select_set(False)
+        return joined
+
+    def _recenter_object_geometry(self, obj) -> None:
+        mesh = getattr(obj, "data", None)
+        vertices = None if mesh is None else getattr(mesh, "vertices", None)
+        if vertices is None or len(vertices) == 0:
+            return
+        points = np.asarray([tuple(vertex.co) for vertex in vertices], dtype=np.float32)
+        center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        for vertex in vertices:
+            vertex.co.x -= float(center[0])
+            vertex.co.y -= float(center[1])
+            vertex.co.z -= float(center[2])
+        obj.location = (0.0, 0.0, 0.0)
+        obj.rotation_euler = (0.0, 0.0, 0.0)
+        mesh.update()
+
+    def _cache_asset_library(self, placement: ScenePlacement, obj) -> None:
+        assert bpy is not None
+        library_path = Path(placement.blender_library_path)
+        library_path.parent.mkdir(parents=True, exist_ok=True)
+        original_name = str(obj.name)
+        obj.name = placement.blender_object_name
+        try:
+            if library_path.exists():
+                library_path.unlink()
+            bpy.data.libraries.write(str(library_path), {obj})
+        except Exception:
+            pass
+        finally:
+            obj.name = original_name
 
     def _apply_placement_transform(self, obj, placement: ScenePlacement) -> None:
         obj.location = placement.center_world
@@ -600,6 +719,9 @@ def _active_placements(
                 size_xyz=placement.size_xyz,
                 yaw_deg=yaw_deg,
                 preview_sprite_path=placement.preview_sprite_path,
+                preview_mesh_path=placement.preview_mesh_path,
+                asset_metadata_path=placement.asset_metadata_path,
+                asset_provenance=placement.asset_provenance,
                 blender_library_path=placement.blender_library_path,
                 blender_object_name=placement.blender_object_name,
                 recommended_scale=placement.recommended_scale,

@@ -20,7 +20,11 @@ from obj_recog.config import AppConfig, SIM_SCENARIO_CHOICES
 from obj_recog.frame_source import FramePacket
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.reconstruct import CameraIntrinsics
-from obj_recog.sim_assets import build_scenario_asset_manifest, write_blender_scene_manifest
+from obj_recog.sim_assets import (
+    build_scenario_asset_manifest,
+    photoreal_asset_preflight_issues,
+    write_blender_scene_manifest,
+)
 from obj_recog.slam_bridge import KeyframeObservation, TRACKING_OK_STATES
 from obj_recog.types import Detection, FrameArtifacts
 
@@ -209,8 +213,12 @@ class SimulationScenarioState:
     elapsed_sec: float
     selfcal_converged: bool
     rig_x: float
+    rig_y: float
     rig_z: float
     yaw_deg: float
+    room_width_m: float
+    room_depth_m: float
+    room_height_m: float
     visible_labels: tuple[str, ...]
     active_goal: NavigationGoal | None
     target_motion_state: str
@@ -231,8 +239,12 @@ class _SceneObject:
     center_world: tuple[float, float, float]
     size_xyz: tuple[float, float, float]
     color_bgr: tuple[int, int, int]
+    yaw_deg: float = 0.0
     asset_id: str | None = None
     preview_sprite_path: str | None = None
+    preview_mesh_path: str | None = None
+    asset_metadata_path: str | None = None
+    asset_provenance: str | None = None
     target_role: bool = False
 
 
@@ -247,6 +259,7 @@ class _VisibleObject:
     asset_id: str | None = None
     target_role: bool = False
     preview_sprite_path: str | None = None
+    preview_mesh_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -636,6 +649,7 @@ def _visible_object(
         asset_id=item.asset_id,
         target_role=item.target_role,
         preview_sprite_path=item.preview_sprite_path,
+        preview_mesh_path=item.preview_mesh_path,
     )
 
 
@@ -721,8 +735,12 @@ def _scene_object_from_specs(
     center_world: tuple[float, float, float],
     size_xyz: tuple[float, float, float],
     color_bgr: tuple[int, int, int],
+    yaw_deg: float = 0.0,
     asset_id: str | None = None,
     preview_sprite_path: str | None = None,
+    preview_mesh_path: str | None = None,
+    asset_metadata_path: str | None = None,
+    asset_provenance: str | None = None,
     target_role: bool = False,
 ) -> _SceneObject:
     return _SceneObject(
@@ -730,8 +748,12 @@ def _scene_object_from_specs(
         center_world=center_world,
         size_xyz=size_xyz,
         color_bgr=color_bgr,
+        yaw_deg=float(yaw_deg),
         asset_id=asset_id,
         preview_sprite_path=preview_sprite_path,
+        preview_mesh_path=preview_mesh_path,
+        asset_metadata_path=asset_metadata_path,
+        asset_provenance=asset_provenance,
         target_role=target_role,
     )
 
@@ -755,9 +777,16 @@ def _environment_object_snapshots(
         snapshots.append(
             {
                 "label": label,
+                "asset_id": getattr(item, "asset_id", None),
                 "center_world": tuple(float(value) for value in getattr(item, "center_world")),
                 "size_xyz": tuple(float(value) for value in getattr(item, "size_xyz")),
+                "yaw_deg": float(getattr(item, "yaw_deg", 0.0)),
                 "color_bgr": tuple(int(value) for value in getattr(item, "color_bgr")),
+                "preview_sprite_path": getattr(item, "preview_sprite_path", None),
+                "preview_mesh_path": getattr(item, "preview_mesh_path", None),
+                "asset_metadata_path": getattr(item, "asset_metadata_path", None),
+                "asset_provenance": getattr(item, "asset_provenance", None),
+                "render_representation": getattr(item, "render_representation", "mesh"),
                 "target_role": target_role,
                 "visible": (label, target_role) in visible_keys,
             }
@@ -1297,6 +1326,9 @@ class BlenderRealtimeFrameSource:
         )
         self._intrinsics = _intrinsics_from_rig(camera_rig)
 
+    def set_pose_world(self, pose_world: np.ndarray) -> None:
+        self._pose_world = np.asarray(pose_world, dtype=np.float32).reshape(4, 4).copy()
+
     def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
         if not self._started:
             start = getattr(self._worker_client, "start", None)
@@ -1367,8 +1399,12 @@ class BlenderRealtimeFrameSource:
             elapsed_sec=self._elapsed_sec,
             selfcal_converged=False,
             rig_x=float(self._pose_world[0, 3]),
+            rig_y=float(self._pose_world[1, 3]),
             rig_z=float(self._pose_world[2, 3]),
             yaw_deg=float(self._scenario.environment.start_yaw_deg),
+            room_width_m=float(self._scenario.environment.room_width_m),
+            room_depth_m=float(self._scenario.environment.room_depth_m),
+            room_height_m=float(self._scenario.environment.room_height_m),
             visible_labels=tuple(item.label for item in (detections or ())),
             active_goal=None,
             target_motion_state=(
@@ -1509,6 +1545,14 @@ class SimulationFrameSource:
         self._runtime_tracking_ok_frames = 0
         self._runtime_pose_error_sum = 0.0
         self._runtime_pose_error_count = 0
+        self._benchmark_valid = bool(
+            str(getattr(config, "input_source", "live")) == "sim"
+            and str(getattr(config, "sim_perception_mode", "runtime")) == "runtime"
+        )
+        self._target_visible_frames_gt = 0
+        self._target_detected_frames_runtime = 0
+        self._target_first_detect_sec_runtime: float | None = None
+        self._detection_fallback_frames = 0
         self._render_backend = ""
         self._render_profile = str(getattr(config, "render_profile", "fast"))
         self._static_asset_placements = tuple(
@@ -1585,6 +1629,22 @@ class SimulationFrameSource:
         target_visible = next((item for item in visible_objects if item.label == self._mission.target_label), None)
         if self._first_valid_view_sec is None and target_visible is not None and self._is_valid_view(target_visible):
             self._first_valid_view_sec = frame_packet.timestamp_sec
+        perception_diagnostics = getattr(artifacts, "perception_diagnostics", None)
+        detection_source = None if perception_diagnostics is None else str(getattr(perception_diagnostics, "detection_source", ""))
+        if perception_diagnostics is not None:
+            self._benchmark_valid = bool(getattr(perception_diagnostics, "benchmark_valid", self._benchmark_valid))
+            if bool(getattr(perception_diagnostics, "gt_target_visible", False)):
+                self._target_visible_frames_gt += 1
+            if detection_source == "runtime+fallback":
+                self._detection_fallback_frames += 1
+        runtime_target_detection = any(
+            str(getattr(item, "label", "")) == str(self._mission.target_label)
+            for item in list(getattr(artifacts, "detections", []) or [])
+        )
+        if ((perception_diagnostics is None and self._benchmark_valid) or detection_source == "runtime") and runtime_target_detection:
+            self._target_detected_frames_runtime += 1
+            if self._target_first_detect_sec_runtime is None:
+                self._target_first_detect_sec_runtime = float(frame_packet.timestamp_sec)
         self._last_runtime_observation = _RuntimeObservation(
             timestamp_sec=frame_packet.timestamp_sec,
             visible_objects=visible_objects,
@@ -1599,8 +1659,12 @@ class SimulationFrameSource:
                 center_world=item.center_world,
                 size_xyz=item.size_xyz,
                 color_bgr=item.color_bgr,
+                yaw_deg=item.yaw_deg,
                 asset_id=item.asset_id,
                 preview_sprite_path=item.preview_sprite_path,
+                preview_mesh_path=item.preview_mesh_path,
+                asset_metadata_path=item.asset_metadata_path,
+                asset_provenance=item.asset_provenance,
                 target_role=item.target_role,
             )
             for item in self._static_asset_placements
@@ -1644,10 +1708,15 @@ class SimulationFrameSource:
     def _pose_world(self) -> np.ndarray:
         return _pose_world_matrix(self._x, self._z, self._yaw_rad)
 
+    def _external_source_accepts_runtime_pose(self) -> bool:
+        if self._external_frame_source is None:
+            return False
+        return callable(getattr(self._external_frame_source, "set_pose_world", None))
+
     def _render_packet(self) -> FramePacket | None:
+        self._update_dynamic_actors()
         if self._external_frame_source is not None:
             return self._render_external_packet()
-        self._update_dynamic_actors()
         pose_world = self._pose_world()
         self._current_timestamp_sec = None
         render_output = self._renderer.render(
@@ -1685,8 +1754,12 @@ class SimulationFrameSource:
             elapsed_sec=self._elapsed_sec,
             selfcal_converged=self._selfcal_converged,
             rig_x=float(self._x),
+            rig_y=float(_CAMERA_HEIGHT_METERS),
             rig_z=float(self._z),
             yaw_deg=math.degrees(self._yaw_rad),
+            room_width_m=float(self._scenario.environment.room_width_m),
+            room_depth_m=float(self._scenario.environment.room_depth_m),
+            room_height_m=float(self._scenario.environment.room_height_m),
             visible_labels=tuple(item.label for item in render_output.visible_objects),
             active_goal=self._active_goal,
             target_motion_state=self._target_motion_state,
@@ -1722,6 +1795,9 @@ class SimulationFrameSource:
 
     def _render_external_packet(self) -> FramePacket | None:
         assert self._external_frame_source is not None
+        set_pose_world = getattr(self._external_frame_source, "set_pose_world", None)
+        if callable(set_pose_world):
+            set_pose_world(self._pose_world())
         source_packet = self._external_frame_source.next_frame(timeout_sec=1.0)
         if source_packet is None:
             return None
@@ -1747,8 +1823,12 @@ class SimulationFrameSource:
             elapsed_sec=self._elapsed_sec,
             selfcal_converged=self._selfcal_converged,
             rig_x=float(self._x),
+            rig_y=float(_CAMERA_HEIGHT_METERS),
             rig_z=float(self._z),
             yaw_deg=math.degrees(self._yaw_rad),
+            room_width_m=float(self._scenario.environment.room_width_m),
+            room_depth_m=float(self._scenario.environment.room_depth_m),
+            room_height_m=float(self._scenario.environment.room_height_m),
             visible_labels=tuple(item.label for item in visible_objects),
             active_goal=self._active_goal,
             target_motion_state=self._target_motion_state,
@@ -1868,8 +1948,12 @@ class SimulationFrameSource:
                     center_world=center_world,
                     size_xyz=actor.size_xyz,
                     color_bgr=actor.color_bgr,
+                    yaw_deg=0.0 if placement is None else placement.yaw_deg,
                     asset_id=None if placement is None else placement.asset_id,
                     preview_sprite_path=None if placement is None else placement.preview_sprite_path,
+                    preview_mesh_path=None if placement is None else placement.preview_mesh_path,
+                    asset_metadata_path=None if placement is None else placement.asset_metadata_path,
+                    asset_provenance=None if placement is None else placement.asset_provenance,
                     target_role=bool(placement.target_role) if placement is not None else False,
                 )
             )
@@ -1948,7 +2032,7 @@ class SimulationFrameSource:
             self._drive_toward_goal(target_visible)
 
     def _record_warmup_observations(self, pose_world: np.ndarray) -> None:
-        if self._external_frame_source is not None:
+        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
             return
         if self._elapsed_sec - self._last_keyframe_capture_sec < 0.75:
             return
@@ -2013,7 +2097,7 @@ class SimulationFrameSource:
         )
 
     def _apply_warmup_motion(self) -> None:
-        if self._external_frame_source is not None:
+        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
             return
         t = self._elapsed_sec
         if t < 2.0:
@@ -2073,7 +2157,7 @@ class SimulationFrameSource:
         return 0.0 < float(near_m) < float(far_m)
 
     def _drive_explore(self) -> None:
-        if self._external_frame_source is not None:
+        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
             return
         target = next(
             item for item in self._active_scene_objects if item.target_role or item.label == self._mission.target_label
@@ -2093,7 +2177,7 @@ class SimulationFrameSource:
                 self._z += math.cos(self._yaw_rad) * forward / max(float(self._camera_rig.fps), 1.0)
 
     def _drive_toward_goal(self, target_visible: _VisibleObject) -> None:
-        if self._external_frame_source is not None:
+        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
             return
         goal = self._active_goal
         if goal is None:
@@ -2181,13 +2265,31 @@ class SimulationFrameSource:
             "seed": int(self._config.sim_seed),
             "sim_profile": self._config.sim_profile,
             "sim_perception_mode": self._config.sim_perception_mode,
+            "benchmark_valid": bool(self._benchmark_valid),
             "render_backend": self._render_backend or getattr(self._renderer, "backend_name", "unknown"),
             "render_profile": self._render_profile,
             "asset_manifest_id": self._asset_manifest.manifest_id,
+            "photoreal_asset_provenance": {
+                str(asset_id): str(provenance)
+                for asset_id, provenance in sorted(
+                    {
+                        placement.asset_id: placement.asset_provenance
+                        for placement in self._asset_manifest.placements
+                        if str(placement.asset_id)
+                    }.items()
+                )
+            },
             "mission_success": bool(self._mission_success),
             "failure_reason": self._failure_reason,
             "time_to_first_valid_view": (
                 None if self._first_valid_view_sec is None else round(float(self._first_valid_view_sec), 3)
+            ),
+            "target_visible_frames_gt": int(self._target_visible_frames_gt),
+            "target_detected_frames_runtime": int(self._target_detected_frames_runtime),
+            "target_first_detect_sec_runtime": (
+                None
+                if self._target_first_detect_sec_runtime is None
+                else round(float(self._target_first_detect_sec_runtime), 3)
             ),
             "tracking_uptime": round(tracking_uptime, 4),
             "selfcal_converged": bool(self._selfcal_converged),
@@ -2200,6 +2302,8 @@ class SimulationFrameSource:
             "target_class": self._asset_manifest.semantic_target_class,
             "steps": int(self._frame_index),
         }
+        if str(self._config.sim_perception_mode) != "runtime":
+            report["detection_fallback_frames"] = int(self._detection_fallback_frames)
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
         self._report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
         self._report_emitted = True
@@ -2238,13 +2342,32 @@ class SimulationRuntime:
             if not self.config.sim_external_manifest:
                 if self.config.sim_profile == "external":
                     raise RuntimeError("sim_profile=external requires --sim-external-manifest")
-                if self.photoreal_frame_source_factory is not None:
-                    asset_manifest = build_scenario_asset_manifest(
-                        scenario,
-                        seed=int(self.config.sim_seed),
+                asset_manifest = build_scenario_asset_manifest(
+                    scenario,
+                    seed=int(self.config.sim_seed),
+                    cache_dir=self.config.asset_cache_dir,
+                    quality=self.config.asset_quality,
+                )
+                requires_external_assets = bool(self.config.render_profile == "photoreal" and self.config.sim_perception_mode == "runtime")
+                if requires_external_assets:
+                    issues = photoreal_asset_preflight_issues(
+                        asset_manifest,
                         cache_dir=self.config.asset_cache_dir,
-                        quality=self.config.asset_quality,
                     )
+                    if issues:
+                        bootstrap_command = (
+                            "PYTHONPATH=src python -m obj_recog.asset_bootstrap "
+                            f"--scenario {scenario.scene_id} "
+                            f"--asset-cache-dir {self.config.asset_cache_dir} "
+                            f"--asset-quality {self.config.asset_quality} "
+                            f"--blender-exec {self.config.blender_exec or '<path-to-blender>'}"
+                        )
+                        raise RuntimeError(
+                            "photoreal runtime assets are missing or invalid: "
+                            + "; ".join(issues)
+                            + f". Bootstrap them with: {bootstrap_command}"
+                        )
+                if self.photoreal_frame_source_factory is not None:
                     external_frame_source = self.photoreal_frame_source_factory(
                         config=self.config,
                         scenario=scenario,
@@ -2256,25 +2379,15 @@ class SimulationRuntime:
                     if not self.config.blender_exec:
                         scene_manifest_path = write_blender_scene_manifest(
                             scenario=scenario,
-                            asset_manifest=build_scenario_asset_manifest(
-                                scenario,
-                                seed=int(self.config.sim_seed),
-                                cache_dir=self.config.asset_cache_dir,
-                                quality=self.config.asset_quality,
-                            ),
+                            asset_manifest=asset_manifest,
                             rig=camera_rig,
                             output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
+                            require_external_assets=requires_external_assets,
                         )
                         raise RuntimeError(
                             "render_profile=photoreal requires --blender-exec or --sim-external-manifest; "
                             f"scene manifest prepared at {scene_manifest_path}"
                         )
-                    asset_manifest = build_scenario_asset_manifest(
-                        scenario,
-                        seed=int(self.config.sim_seed),
-                        cache_dir=self.config.asset_cache_dir,
-                        quality=self.config.asset_quality,
-                    )
                     worker_client = (
                         self.blender_worker_client_factory(
                             config=self.config,
@@ -2370,6 +2483,8 @@ def _load_array_or_image(
     frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if frame is None:
         raise RuntimeError(f"failed to load external sim asset: {path}")
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        frame = frame[:, :, :3]
     return np.asarray(frame)
 
 
@@ -2387,6 +2502,7 @@ def _build_default_blender_worker_client(
         asset_manifest=asset_manifest,
         rig=camera_rig,
         output_dir=Path(config.asset_cache_dir) / "scene_manifests",
+        require_external_assets=bool(config.render_profile == "photoreal" and config.sim_perception_mode == "runtime"),
     )
     render_root = Path(report_path).parent / "blender_renders" / str(asset_manifest.manifest_id)
     blend_file = repo_root / "scripts" / "blender" / "scene_template" / "base_scene.blend"

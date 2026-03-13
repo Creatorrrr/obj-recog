@@ -11,6 +11,37 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFilter
 
 
+ASSET_CATALOG_VERSION = 1
+_DEFAULT_BOOTSTRAP_ARCHIVE_TYPE = "zip"
+_DEFAULT_BOOTSTRAP_IMPORT_FORMAT = "blend"
+
+
+@dataclass(frozen=True, slots=True)
+class AssetBootstrapSpec:
+    archive_url: str
+    archive_sha256: str
+    archive_type: str
+    extract_member_glob: str
+    import_format: str
+    source_object_name: str | None
+    export_object_name: str
+    up_axis: str = "Z"
+    forward_axis: str = "-Y"
+    uniform_scale: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class AssetCacheMetadata:
+    asset_id: str
+    catalog_version: int
+    provenance: str
+    archive_url: str
+    archive_sha256: str
+    blender_library_path: str
+    preview_mesh_path: str
+    export_object_name: str
+
+
 @dataclass(frozen=True, slots=True)
 class AssetCatalogEntry:
     asset_id: str
@@ -23,10 +54,19 @@ class AssetCatalogEntry:
     preview_sprite_name: str
     preview_style: str
     base_palette: tuple[tuple[int, int, int], ...]
+    catalog_version: int = ASSET_CATALOG_VERSION
 
     @property
     def blender_library_relpath(self) -> str:
         return f"libraries/{self.asset_family}/{self.asset_id}.blend"
+
+    @property
+    def preview_mesh_relpath(self) -> str:
+        return f"preview_meshes/{self.asset_family}/{self.asset_id}.ply"
+
+    @property
+    def metadata_relpath(self) -> str:
+        return f"metadata/{self.asset_family}/{self.asset_id}.json"
 
     @property
     def blender_object_name(self) -> str:
@@ -44,6 +84,10 @@ class AssetCatalogEntry:
     def material_variant(self) -> str:
         return f"{self.asset_family}-{self.preview_style}"
 
+    @property
+    def bootstrap(self) -> AssetBootstrapSpec:
+        return _BOOTSTRAP_SPECS[self.asset_id]
+
 
 @dataclass(frozen=True, slots=True)
 class ScenarioAssetPlacement:
@@ -58,6 +102,9 @@ class ScenarioAssetPlacement:
     yaw_deg: float
     color_bgr: tuple[int, int, int]
     preview_sprite_path: str
+    preview_mesh_path: str
+    asset_metadata_path: str
+    asset_provenance: str
     blender_library_path: str
     blender_object_name: str
     recommended_scale: float
@@ -72,6 +119,19 @@ class ScenarioAssetManifest:
     scenario_id: str
     semantic_target_class: str
     placements: tuple[ScenarioAssetPlacement, ...]
+
+
+def _bootstrap_spec_for_entry(entry: AssetCatalogEntry) -> AssetBootstrapSpec:
+    archive_sha256 = hashlib.sha256(f"obj-recog:{entry.asset_id}".encode("utf-8")).hexdigest()
+    return AssetBootstrapSpec(
+        archive_url=entry.download_url,
+        archive_sha256=archive_sha256,
+        archive_type=_DEFAULT_BOOTSTRAP_ARCHIVE_TYPE,
+        extract_member_glob="**/*",
+        import_format=_DEFAULT_BOOTSTRAP_IMPORT_FORMAT,
+        source_object_name=entry.blender_object_name,
+        export_object_name=entry.blender_object_name,
+    )
 
 
 _TARGET_CLASS_BY_SCENARIO = {
@@ -333,9 +393,111 @@ _CATALOG_DATA: tuple[AssetCatalogEntry, ...] = (
     ),
 )
 
+_BOOTSTRAP_SPECS: dict[str, AssetBootstrapSpec] = {
+    entry.asset_id: _bootstrap_spec_for_entry(entry)
+    for entry in _CATALOG_DATA
+}
+
 
 def load_asset_catalog() -> dict[str, AssetCatalogEntry]:
     return {entry.asset_id: entry for entry in _CATALOG_DATA}
+
+
+def preview_mesh_path(entry: AssetCatalogEntry, cache_dir: str | Path) -> Path:
+    return Path(cache_dir) / entry.preview_mesh_relpath
+
+
+def asset_metadata_path(entry: AssetCatalogEntry, cache_dir: str | Path) -> Path:
+    return Path(cache_dir) / entry.metadata_relpath
+
+
+def load_asset_cache_metadata(path: str | Path) -> AssetCacheMetadata | None:
+    metadata_path = Path(path)
+    if not metadata_path.is_file():
+        return None
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return AssetCacheMetadata(
+        asset_id=str(payload["asset_id"]),
+        catalog_version=int(payload["catalog_version"]),
+        provenance=str(payload["provenance"]),
+        archive_url=str(payload["archive_url"]),
+        archive_sha256=str(payload["archive_sha256"]),
+        blender_library_path=str(payload["blender_library_path"]),
+        preview_mesh_path=str(payload["preview_mesh_path"]),
+        export_object_name=str(payload["export_object_name"]),
+    )
+
+
+def write_asset_cache_metadata(metadata: AssetCacheMetadata, path: str | Path) -> Path:
+    metadata_path = Path(path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "asset_id": metadata.asset_id,
+                "catalog_version": int(metadata.catalog_version),
+                "provenance": metadata.provenance,
+                "archive_url": metadata.archive_url,
+                "archive_sha256": metadata.archive_sha256,
+                "blender_library_path": metadata.blender_library_path,
+                "preview_mesh_path": metadata.preview_mesh_path,
+                "export_object_name": metadata.export_object_name,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return metadata_path
+
+
+def resolve_asset_cache_metadata(entry: AssetCatalogEntry, *, cache_dir: str | Path) -> AssetCacheMetadata | None:
+    return load_asset_cache_metadata(asset_metadata_path(entry, cache_dir))
+
+
+def asset_cache_metadata_is_current(
+    metadata: AssetCacheMetadata | None,
+    *,
+    entry: AssetCatalogEntry,
+) -> bool:
+    if metadata is None:
+        return False
+    return (
+        metadata.asset_id == entry.asset_id
+        and int(metadata.catalog_version) == int(entry.catalog_version)
+        and str(metadata.archive_sha256) == str(entry.bootstrap.archive_sha256)
+        and str(metadata.export_object_name) == str(entry.bootstrap.export_object_name)
+    )
+
+
+def photoreal_asset_preflight_issues(
+    asset_manifest: ScenarioAssetManifest,
+    *,
+    cache_dir: str | Path,
+) -> list[str]:
+    catalog = load_asset_catalog()
+    issues: list[str] = []
+    checked_asset_ids: set[str] = set()
+    for placement in asset_manifest.placements:
+        asset_id = str(placement.asset_id)
+        if asset_id in checked_asset_ids:
+            continue
+        checked_asset_ids.add(asset_id)
+        entry = catalog[asset_id]
+        metadata = resolve_asset_cache_metadata(entry, cache_dir=cache_dir)
+        if not asset_cache_metadata_is_current(metadata, entry=entry):
+            issues.append(f"{asset_id}: metadata missing or stale")
+            continue
+        if str(metadata.provenance) != "external":
+            issues.append(f"{asset_id}: provenance={metadata.provenance}")
+            continue
+        if not Path(metadata.blender_library_path).is_file():
+            issues.append(f"{asset_id}: missing blend {metadata.blender_library_path}")
+            continue
+        if not Path(metadata.preview_mesh_path).is_file():
+            issues.append(f"{asset_id}: missing preview mesh {metadata.preview_mesh_path}")
+            continue
+    return issues
 
 
 def ensure_preview_sprite(
@@ -437,6 +599,7 @@ def write_blender_scene_manifest(
     asset_manifest: ScenarioAssetManifest,
     rig: Any,
     output_dir: str | Path,
+    require_external_assets: bool = False,
 ) -> Path:
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -447,6 +610,7 @@ def write_blender_scene_manifest(
         "difficulty_level": int(getattr(scenario, "difficulty_level")),
         "semantic_target_class": asset_manifest.semantic_target_class,
         "asset_manifest_id": asset_manifest.manifest_id,
+        "require_external_assets": bool(require_external_assets),
         "environment": {
             "room_width_m": float(getattr(getattr(scenario, "environment"), "room_width_m")),
             "room_depth_m": float(getattr(getattr(scenario, "environment"), "room_depth_m")),
@@ -472,6 +636,9 @@ def write_blender_scene_manifest(
                 "size_xyz": list(placement.size_xyz),
                 "yaw_deg": placement.yaw_deg,
                 "preview_sprite_path": placement.preview_sprite_path,
+                "preview_mesh_path": placement.preview_mesh_path,
+                "asset_metadata_path": placement.asset_metadata_path,
+                "asset_provenance": placement.asset_provenance,
                 "blender_library_path": placement.blender_library_path,
                 "blender_object_name": placement.blender_object_name,
                 "recommended_scale": placement.recommended_scale,
@@ -516,6 +683,10 @@ def _placement_from_spec(
         target_role = False
     entry = catalog[asset_id]
     sprite_path = ensure_preview_sprite(entry, cache_dir=cache_dir, quality=quality)
+    mesh_path = preview_mesh_path(entry, cache_dir)
+    metadata_path = asset_metadata_path(entry, cache_dir)
+    metadata = load_asset_cache_metadata(metadata_path)
+    asset_provenance = "missing" if metadata is None else str(metadata.provenance)
     center_world = getattr(item, "center_world", None)
     if center_world is None:
         center_world = getattr(item, "base_center_world")
@@ -531,6 +702,9 @@ def _placement_from_spec(
         yaw_deg=float((abs(hash((source_key, seed))) % 36000) / 100.0),
         color_bgr=tuple(int(v) for v in getattr(item, "color_bgr")),
         preview_sprite_path=str(sprite_path),
+        preview_mesh_path=str(mesh_path),
+        asset_metadata_path=str(metadata_path),
+        asset_provenance=asset_provenance,
         blender_library_path=str(Path(cache_dir) / entry.blender_library_relpath),
         blender_object_name=entry.blender_object_name,
         recommended_scale=float(entry.recommended_scale),

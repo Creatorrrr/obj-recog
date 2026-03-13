@@ -1,0 +1,256 @@
+{
+  "asset_manifest_id": "61791ef984a2",
+  "camera_rig": {
+    "far_plane_m": 8.0,
+    "fps": 10.0,
+    "horizontal_fov_deg": 72.0,
+    "image_height": 360,
+    "image_width": 640,
+    "near_plane_m": 0.2
+  },
+  "difficulty_level": 6,
+  "environment": {
+    "room_depth_m": 10.0,
+    "room_height_m": 3.5,
+    "room_width_m": 8.0
+  },
+  "placements": [
+    {
+      "asset_family": "warehouse",
+      "asset_id": "shelf_warehouse",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/warehouse/shelf_warehouse.blend",
+      "blender_object_name": "ShelfWarehouse",
+      "center_world": [
+        -2.0,
+        1.0,
+        5.0
+      ],
+      "lod_hint": "high",
+      "material_variant": "warehouse-shelf",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/shelf_warehouse.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "shelf",
+      "size_xyz": [
+        0.8,
+        2.0,
+        2.8
+      ],
+      "source_key": "static-0",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 221.11
+    },
+    {
+      "asset_family": "warehouse",
+      "asset_id": "shelf_warehouse",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/warehouse/shelf_warehouse.blend",
+      "blender_object_name": "ShelfWarehouse",
+      "center_world": [
+        2.3,
+        1.0,
+        5.6
+      ],
+      "lod_hint": "high",
+      "material_variant": "warehouse-shelf",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/shelf_warehouse.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "shelf",
+      "size_xyz": [
+        0.8,
+        2.0,
+        2.8
+      ],
+      "source_key": "static-1",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 239.03
+    },
+    {
+      "asset_family": "architecture",
+      "asset_id": "pillar_concrete",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/architecture/pillar_concrete.blend",
+      "blender_object_name": "PillarConcrete",
+      "center_world": [
+        -0.2,
+        1.0,
+        6.0
+      ],
+      "lod_hint": "high",
+      "material_variant": "architecture-pillar",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/pillar_concrete.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "pillar",
+      "size_xyz": [
+        0.45,
+        2.0,
+        0.45
+      ],
+      "source_key": "static-2",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 54.83
+    },
+    {
+      "asset_family": "storage",
+      "asset_id": "box_cardboard",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/storage/box_cardboard.blend",
+      "blender_object_name": "BoxCardboard",
+      "center_world": [
+        1.0,
+        0.4,
+        4.6
+      ],
+      "lod_hint": "low",
+      "material_variant": "storage-box",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/box_cardboard.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "box",
+      "size_xyz": [
+        0.8,
+        0.8,
+        0.8
+      ],
+      "source_key": "static-3",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 199.37
+    },
+    {
+      "asset_family": "warehouse",
+      "asset_id": "crate_wood",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/warehouse/crate_wood.blend",
+      "blender_object_name": "CrateWood",
+      "center_world": [
+        -1.1,
+        0.45,
+        6.9
+      ],
+      "lod_hint": "high",
+      "material_variant": "warehouse-crate",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/crate_wood.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "box",
+      "size_xyz": [
+        0.9,
+        0.9,
+        0.9
+      ],
+      "source_key": "static-4",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 0.61
+    },
+    {
+      "asset_family": "prop",
+      "asset_id": "suitcase_hardshell",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/prop/suitcase_hardshell.blend",
+      "blender_object_name": "SuitcaseHardshell",
+      "center_world": [
+        1.8,
+        0.45,
+        5.8
+      ],
+      "lod_hint": "low",
+      "material_variant": "prop-suitcase",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/suitcase_hardshell.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "suitcase",
+      "size_xyz": [
+        0.8,
+        0.9,
+        0.8
+      ],
+      "source_key": "warehouse-target",
+      "source_kind": "dynamic",
+      "target_role": true,
+      "yaw_deg": 273.61
+    },
+    {
+      "asset_family": "character",
+      "asset_id": "person_walker",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/character/person_walker.blend",
+      "blender_object_name": "PersonWalker",
+      "center_world": [
+        0.2,
+        0.8,
+        5.1
+      ],
+      "lod_hint": "medium",
+      "material_variant": "character-person",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/person_walker.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "person",
+      "size_xyz": [
+        0.95,
+        1.6,
+        0.85
+      ],
+      "source_key": "warehouse-occluder",
+      "source_kind": "dynamic",
+      "target_role": false,
+      "yaw_deg": 131.25
+    },
+    {
+      "asset_family": "character",
+      "asset_id": "person_walker",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/character/person_walker.blend",
+      "blender_object_name": "PersonWalker",
+      "center_world": [
+        -1.6,
+        0.55,
+        4.8
+      ],
+      "lod_hint": "medium",
+      "material_variant": "character-person",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/person_walker.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "person",
+      "size_xyz": [
+        0.75,
+        1.1,
+        0.75
+      ],
+      "source_key": "warehouse-distractor-a",
+      "source_kind": "dynamic",
+      "target_role": false,
+      "yaw_deg": 235.88
+    },
+    {
+      "asset_family": "character",
+      "asset_id": "person_walker",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/character/person_walker.blend",
+      "blender_object_name": "PersonWalker",
+      "center_world": [
+        1.9,
+        0.55,
+        6.6
+      ],
+      "lod_hint": "medium",
+      "material_variant": "character-person",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/person_walker.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "person",
+      "size_xyz": [
+        0.75,
+        1.1,
+        0.75
+      ],
+      "source_key": "warehouse-distractor-b",
+      "source_kind": "dynamic",
+      "target_role": false,
+      "yaw_deg": 284.28
+    }
+  ],
+  "scenario_family": "warehouse",
+  "scene_id": "warehouse_moving_target_v1",
+  "semantic_target_class": "suitcase"
+}

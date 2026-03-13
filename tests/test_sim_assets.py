@@ -5,10 +5,15 @@ from pathlib import Path
 from PIL import Image
 
 from obj_recog.sim_assets import (
+    AssetCacheMetadata,
+    asset_metadata_path,
     build_scenario_asset_manifest,
     ensure_asset_payload,
     ensure_preview_sprite,
     load_asset_catalog,
+    load_asset_cache_metadata,
+    preview_mesh_path,
+    write_asset_cache_metadata,
     write_blender_scene_manifest,
 )
 from obj_recog.simulation import CameraRigSpec
@@ -25,7 +30,14 @@ def test_load_asset_catalog_exposes_semantic_assets_with_download_metadata() -> 
         assert entry.license_name == "CC0"
         assert entry.download_url.startswith("https://")
         assert entry.asset_family
+        assert entry.bootstrap.archive_url.startswith("https://")
+        assert len(entry.bootstrap.archive_sha256) == 64
+        assert entry.bootstrap.archive_type in {"zip", "tar.gz", "blend"}
+        assert entry.bootstrap.import_format in {"blend", "glb", "obj", "fbx"}
+        assert entry.bootstrap.export_object_name
         assert entry.blender_library_relpath.endswith(".blend")
+        assert entry.preview_mesh_relpath.endswith(".ply")
+        assert entry.metadata_relpath.endswith(".json")
         assert entry.blender_object_name
         assert entry.recommended_scale > 0.0
         assert entry.lod_hint in {"low", "medium", "high"}
@@ -107,6 +119,50 @@ def test_ensure_asset_payload_caches_downloaded_bytes(tmp_path: Path) -> None:
     assert asset_path.is_file()
     assert asset_path.read_bytes() == b"fake-asset-binary"
     assert calls == [catalog["chair_modern"].download_url]
+
+
+def test_asset_cache_metadata_round_trips_with_external_provenance(tmp_path: Path) -> None:
+    catalog = load_asset_catalog()
+    entry = catalog["chair_modern"]
+    blend_path = tmp_path / entry.blender_library_relpath
+    preview_path = tmp_path / entry.preview_mesh_relpath
+    blend_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    blend_path.write_bytes(b"blend")
+    preview_path.write_text("ply", encoding="utf-8")
+
+    metadata = AssetCacheMetadata(
+        asset_id=entry.asset_id,
+        catalog_version=entry.catalog_version,
+        provenance="external",
+        archive_url=entry.bootstrap.archive_url,
+        archive_sha256=entry.bootstrap.archive_sha256,
+        blender_library_path=str(blend_path),
+        preview_mesh_path=str(preview_path),
+        export_object_name=entry.bootstrap.export_object_name,
+    )
+
+    metadata_path = asset_metadata_path(entry, tmp_path)
+    write_asset_cache_metadata(metadata, metadata_path)
+    loaded = load_asset_cache_metadata(metadata_path)
+
+    assert loaded == metadata
+
+
+def test_build_scenario_asset_manifest_exposes_preview_mesh_and_provenance_metadata(tmp_path: Path) -> None:
+    scenario = SCENARIO_SPECS["studio_open_v1"]
+    manifest = build_scenario_asset_manifest(
+        scenario,
+        seed=7,
+        cache_dir=tmp_path,
+        quality="low",
+    )
+
+    assert manifest.placements
+    for placement in manifest.placements:
+        assert placement.preview_mesh_path.endswith(".ply")
+        assert placement.asset_metadata_path.endswith(".json")
+        assert placement.asset_provenance == "missing"
 
 
 def test_write_blender_scene_manifest_serializes_scene_and_camera_bundle(tmp_path: Path) -> None:

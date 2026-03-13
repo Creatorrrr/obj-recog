@@ -12,7 +12,7 @@ from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.sim_assets import build_scenario_asset_manifest
 from obj_recog.simulation import SCENARIO_SPECS, SimulationScenarioState
 from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
-from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, PanopticSegment
+from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, PanopticSegment, PerceptionDiagnostics
 from obj_recog.validation import RuntimeValidationProbe, run_validation_suite
 
 
@@ -165,6 +165,14 @@ def _artifacts(
             intrinsics_summary=(intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy),
             hint="ok",
         ),
+        perception_diagnostics=PerceptionDiagnostics(
+            perception_mode="runtime",
+            detection_source="runtime",
+            depth_source="runtime",
+            pose_source="runtime",
+            gt_target_visible=bool(detections),
+            benchmark_valid=True,
+        ),
         scene_graph_snapshot=scene_graph_snapshot,
         visible_graph_nodes=[] if scene_graph_snapshot is None else list(scene_graph_snapshot.visible_nodes),
         visible_graph_edges=[] if scene_graph_snapshot is None else list(scene_graph_snapshot.visible_edges),
@@ -193,8 +201,12 @@ def _scenario_state(
         elapsed_sec=9.5,
         selfcal_converged=selfcal_converged,
         rig_x=0.0,
+        rig_y=1.6,
         rig_z=0.0,
         yaw_deg=0.0,
+        room_width_m=6.0,
+        room_depth_m=8.0,
+        room_height_m=3.0,
         visible_labels=("backpack",),
         active_goal=None,
         target_motion_state="static",
@@ -211,7 +223,7 @@ def _scenario_state(
 
 
 def test_runtime_validation_probe_marks_passes_for_complete_pipeline() -> None:
-    probe = RuntimeValidationProbe(_base_config())
+    probe = RuntimeValidationProbe(_base_config(sim_perception_mode="runtime"))
     probe.on_start(explanation_api_available=True)
     mesh_vertices_xyz = np.array(
         [[0.0, 0.0, 3.2], [0.2, 0.0, 3.4], [0.0, 0.2, 3.6], [0.1, 0.1, 3.5]],
@@ -283,7 +295,7 @@ def test_runtime_validation_probe_marks_passes_for_complete_pipeline() -> None:
 
 
 def test_runtime_validation_probe_marks_failures_and_skips() -> None:
-    probe = RuntimeValidationProbe(_base_config())
+    probe = RuntimeValidationProbe(_base_config(sim_perception_mode="runtime"))
     probe.on_start(explanation_api_available=False)
     probe.record_frame(
         frame_index=0,
@@ -326,7 +338,7 @@ def test_runtime_validation_probe_marks_failures_and_skips() -> None:
     assert report.subsystems["pass_output_presence"].status == "skipped"
     assert report.subsystems["reconstruction"].status == "fail"
     assert report.subsystems["calibration"].status == "fail"
-    assert report.subsystems["object_detection"].status == "fail"
+    assert report.subsystems["object_detection"].status == "skipped"
     assert report.subsystems["segmentation"].status == "fail"
     assert report.subsystems["scene_graph"].status == "fail"
     assert report.subsystems["llm_explanation"].status == "skipped"
@@ -350,8 +362,12 @@ def test_run_validation_suite_writes_per_scenario_reports_summary_and_preview_sh
                         elapsed_sec=10.0,
                         selfcal_converged=True,
                         rig_x=0.0,
+                        rig_y=1.6,
                         rig_z=0.0,
                         yaw_deg=0.0,
+                        room_width_m=6.0,
+                        room_depth_m=8.0,
+                        room_height_m=3.0,
                         visible_labels=("backpack",),
                         active_goal=None,
                         target_motion_state="static",
@@ -407,18 +423,18 @@ def test_run_validation_suite_writes_per_scenario_reports_summary_and_preview_sh
         _base_config(sim_max_steps=60, scenario_preview_shots=True),
         output_dir=tmp_path,
         scenarios=("studio_open_v1", "office_clutter_v1"),
-        perception_modes=("assisted",),
+        perception_modes=("runtime",),
         run_fn=fake_run_fn,
     )
 
     assert summary.total_runs == 2
-    assert (tmp_path / "studio_open_v1-assisted.json").is_file()
-    assert (tmp_path / "office_clutter_v1-assisted.json").is_file()
+    assert (tmp_path / "studio_open_v1-runtime.json").is_file()
+    assert (tmp_path / "office_clutter_v1-runtime.json").is_file()
     summary_path = tmp_path / "summary.json"
     assert summary_path.is_file()
     assert sorted(path.name for path in tmp_path.glob("*preview*.png")) == [
-        "office_clutter_v1-assisted-preview-f0.png",
-        "studio_open_v1-assisted-preview-f0.png",
+        "office_clutter_v1-runtime-preview-f0.png",
+        "studio_open_v1-runtime-preview-f0.png",
     ]
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     assert payload["total_runs"] == 2
@@ -507,9 +523,152 @@ def test_runtime_validation_probe_marks_photoreal_worker_health_and_pass_outputs
     report = probe.build_report()
 
     assert report.subsystems["mesh_backed_environment"].status == "pass"
+
+
+def test_runtime_validation_probe_marks_nonbenchmark_assisted_detection_as_skipped() -> None:
+    probe = RuntimeValidationProbe(_base_config(render_profile="photoreal", sim_perception_mode="assisted"))
+    probe.on_start(explanation_api_available=False)
+
+    frame_packet = type(
+        "Packet",
+        (),
+        {
+            "scenario_state": _scenario_state(
+                selfcal_converged=True,
+                render_backend="blender-realtime",
+                render_profile="photoreal",
+                environment_objects=(),
+                semantic_mask_path="/tmp/semantic.npy",
+                instance_mask_path="/tmp/instance.npy",
+                worker_state="ready",
+                render_time_ms=16.0,
+            ),
+            "calibration_source": "blender-ground-truth",
+            "semantic_mask": np.ones((24, 32), dtype=np.uint8),
+            "instance_mask": np.ones((24, 32), dtype=np.uint8),
+            "depth_map": np.full((24, 32), 3.0, dtype=np.float32),
+        },
+    )()
+    artifacts = _artifacts(
+        mesh_vertices_xyz=np.array([[0.0, 0.0, 3.0], [0.2, 0.0, 3.1], [0.0, 0.2, 3.2]], dtype=np.float32),
+        mesh_triangles=np.array([[0, 1, 2]], dtype=np.int32),
+        mesh_vertex_colors=np.full((3, 3), 0.5, dtype=np.float32),
+        detections=[
+            Detection(
+                xyxy=(8, 5, 26, 22),
+                class_id=1,
+                label="backpack",
+                confidence=0.99,
+                color=(40, 80, 225),
+            )
+        ],
+        segments=[],
+        scene_graph_snapshot=None,
+        segmentation_overlay_bgr=np.zeros((24, 32, 3), dtype=np.uint8),
+        calibration_source="blender-ground-truth",
+    )
+    artifacts.perception_diagnostics = PerceptionDiagnostics(
+        perception_mode="assisted",
+        detection_source="runtime+fallback",
+        depth_source="ground_truth",
+        pose_source="ground_truth",
+        gt_target_visible=True,
+        benchmark_valid=False,
+    )
+
+    probe.record_frame(
+        frame_index=0,
+        frame_packet=frame_packet,
+        artifacts=artifacts,
+        explanation_status=ExplanationStatus.DISABLED,
+        explanation_result=ExplanationResult(
+            text="",
+            status=ExplanationStatus.DISABLED,
+            latency_ms=None,
+            model="gpt-5-mini",
+            error_message=None,
+        ),
+        viewer_active=True,
+    )
+
+    report = probe.build_report()
+
+    assert report.benchmark_valid is False
+    assert report.target_visible_frames_gt == 1
+    assert report.target_detected_frames_runtime == 0
+    assert report.detection_fallback_frames == 1
+    assert report.subsystems["object_detection"].status == "skipped"
+
+
+def test_runtime_validation_probe_fails_runtime_detection_when_gt_target_visible_but_runtime_target_missing() -> None:
+    probe = RuntimeValidationProbe(_base_config(render_profile="photoreal", sim_perception_mode="runtime"))
+    probe.on_start(explanation_api_available=False)
+
+    frame_packet = type(
+        "Packet",
+        (),
+        {
+            "scenario_state": _scenario_state(
+                selfcal_converged=True,
+                render_backend="blender-realtime",
+                render_profile="photoreal",
+                environment_objects=(),
+                semantic_mask_path="/tmp/semantic.npy",
+                instance_mask_path="/tmp/instance.npy",
+                worker_state="ready",
+                render_time_ms=16.0,
+            ),
+            "calibration_source": "blender-ground-truth",
+            "semantic_mask": np.ones((24, 32), dtype=np.uint8),
+            "instance_mask": np.ones((24, 32), dtype=np.uint8),
+            "depth_map": np.full((24, 32), 3.0, dtype=np.float32),
+        },
+    )()
+    artifacts = _artifacts(
+        mesh_vertices_xyz=np.array([[0.0, 0.0, 3.0], [0.2, 0.0, 3.1], [0.0, 0.2, 3.2]], dtype=np.float32),
+        mesh_triangles=np.array([[0, 1, 2]], dtype=np.int32),
+        mesh_vertex_colors=np.full((3, 3), 0.5, dtype=np.float32),
+        detections=[],
+        segments=[],
+        scene_graph_snapshot=None,
+        segmentation_overlay_bgr=np.zeros((24, 32, 3), dtype=np.uint8),
+        calibration_source="blender-ground-truth",
+    )
+    artifacts.perception_diagnostics = PerceptionDiagnostics(
+        perception_mode="runtime",
+        detection_source="runtime",
+        depth_source="runtime",
+        pose_source="runtime",
+        gt_target_visible=True,
+        benchmark_valid=True,
+    )
+
+    probe.record_frame(
+        frame_index=0,
+        frame_packet=frame_packet,
+        artifacts=artifacts,
+        explanation_status=ExplanationStatus.DISABLED,
+        explanation_result=ExplanationResult(
+            text="",
+            status=ExplanationStatus.DISABLED,
+            latency_ms=None,
+            model="gpt-5-mini",
+            error_message=None,
+        ),
+        viewer_active=True,
+    )
+
+    report = probe.build_report()
+
+    assert report.benchmark_valid is True
+    assert report.target_visible_frames_gt == 1
+    assert report.target_detected_frames_runtime == 0
+    assert report.target_first_detect_sec_runtime is None
+    assert report.detection_fallback_frames is None
+    assert report.subsystems["object_detection"].status == "fail"
     assert report.subsystems["worker_health"].status == "pass"
     assert report.subsystems["frame_latency"].status == "pass"
-    assert report.subsystems["frame_latency"].key_metrics["max_total_frame_time_ms"] >= 28.0
+    assert report.subsystems["frame_latency"].key_metrics["max_total_frame_time_ms"] == 16.0
     assert report.subsystems["pass_output_presence"].status == "pass"
     assert report.subsystems["pass_output_presence"].key_metrics["rgb_pass_frames"] == 1
 

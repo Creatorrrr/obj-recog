@@ -39,9 +39,15 @@ class ScenarioValidationReport:
     scenario_family: str
     difficulty_level: int
     perception_mode: str
+    benchmark_valid: bool
     render_backend: str
     overall_status: str
     frame_count: int
+    target_visible_frames_gt: int
+    target_detected_frames_runtime: int
+    target_first_detect_sec_runtime: float | None
+    photoreal_asset_provenance: dict[str, str]
+    detection_fallback_frames: int | None
     subsystems: dict[str, SubsystemVerdict]
     error_message: str | None = None
 
@@ -51,9 +57,15 @@ class ScenarioValidationReport:
             "scenario_family": self.scenario_family,
             "difficulty_level": self.difficulty_level,
             "perception_mode": self.perception_mode,
+            "benchmark_valid": self.benchmark_valid,
             "render_backend": self.render_backend,
             "overall_status": self.overall_status,
             "frame_count": self.frame_count,
+            "target_visible_frames_gt": self.target_visible_frames_gt,
+            "target_detected_frames_runtime": self.target_detected_frames_runtime,
+            "target_first_detect_sec_runtime": self.target_first_detect_sec_runtime,
+            "photoreal_asset_provenance": dict(self.photoreal_asset_provenance),
+            "detection_fallback_frames": self.detection_fallback_frames,
             "error_message": self.error_message,
             "subsystems": {name: verdict.to_dict() for name, verdict in self.subsystems.items()},
         }
@@ -96,6 +108,10 @@ class RuntimeValidationProbe:
         self._asset_manifest_id = ""
         self._explanation_api_available = False
         self._error_message: str | None = None
+        self._benchmark_valid = bool(
+            str(getattr(config, "input_source", "live")) == "sim"
+            and str(getattr(config, "sim_perception_mode", "runtime")) == "runtime"
+        )
 
         self._mesh_nonempty_frames = 0
         self._dense_nonempty_frames = 0
@@ -116,8 +132,14 @@ class RuntimeValidationProbe:
         self._target_detection_frames = 0
         self._max_detection_count = 0
         self._target_confidences: list[float] = []
+        self._target_confidences_runtime: list[float] = []
         self._max_target_crop_unique_colors = 0
         self._preview_shot_path: str | None = None
+        self._target_visible_frames_gt = 0
+        self._target_detected_frames_runtime = 0
+        self._target_first_detect_sec_runtime: float | None = None
+        self._detection_fallback_frames = 0
+        self._photoreal_asset_provenance: dict[str, str] = {}
 
         self._environment_frames = 0
         self._mesh_environment_frames = 0
@@ -201,6 +223,11 @@ class RuntimeValidationProbe:
             if environment_objects:
                 self._environment_frames += 1
                 self._max_environment_objects = max(self._max_environment_objects, len(environment_objects))
+                for item in environment_objects:
+                    asset_id = self._scenario_item_value(item, "asset_id", None)
+                    asset_provenance = self._scenario_item_value(item, "asset_provenance", None)
+                    if asset_id not in (None, "") and asset_provenance not in (None, ""):
+                        self._photoreal_asset_provenance.setdefault(str(asset_id), str(asset_provenance))
                 mesh_environment_count = sum(
                     1
                     for item in environment_objects
@@ -314,6 +341,22 @@ class RuntimeValidationProbe:
         target_detections = [
             item for item in detections if str(getattr(item, "label", "")) == self._semantic_target_class
         ]
+        perception_diagnostics = getattr(artifacts, "perception_diagnostics", None)
+        detection_source = None if perception_diagnostics is None else str(getattr(perception_diagnostics, "detection_source", ""))
+        if perception_diagnostics is not None:
+            self._benchmark_valid = bool(getattr(perception_diagnostics, "benchmark_valid", self._benchmark_valid))
+            if bool(getattr(perception_diagnostics, "gt_target_visible", False)):
+                self._target_visible_frames_gt += 1
+            if detection_source == "runtime+fallback":
+                self._detection_fallback_frames += 1
+        if (perception_diagnostics is None and self._benchmark_valid) or detection_source == "runtime":
+            if target_detections:
+                self._target_detected_frames_runtime += 1
+                self._target_confidences_runtime.append(
+                    max(float(getattr(item, "confidence", 0.0)) for item in target_detections)
+                )
+                if self._target_first_detect_sec_runtime is None:
+                    self._target_first_detect_sec_runtime = float(getattr(frame_packet, "timestamp_sec", frame_index))
         if target_detections:
             self._target_detection_frames += 1
             self._target_confidences.append(
@@ -392,9 +435,23 @@ class RuntimeValidationProbe:
             scenario_family=self._scenario_family,
             difficulty_level=self._difficulty_level,
             perception_mode=str(self._config.sim_perception_mode),
+            benchmark_valid=bool(self._benchmark_valid),
             render_backend=self._render_backend,
             overall_status=overall_status,
             frame_count=self._frame_count,
+            target_visible_frames_gt=int(self._target_visible_frames_gt),
+            target_detected_frames_runtime=int(self._target_detected_frames_runtime),
+            target_first_detect_sec_runtime=(
+                None
+                if self._target_first_detect_sec_runtime is None
+                else round(float(self._target_first_detect_sec_runtime), 3)
+            ),
+            photoreal_asset_provenance=dict(sorted(self._photoreal_asset_provenance.items())),
+            detection_fallback_frames=(
+                int(self._detection_fallback_frames)
+                if str(getattr(self._config, "sim_perception_mode", "runtime")) != "runtime"
+                else None
+            ),
             subsystems=subsystems,
             error_message=self._error_message,
         )
@@ -675,33 +732,59 @@ class RuntimeValidationProbe:
     def _object_detection_verdict(self) -> SubsystemVerdict:
         avg_target_confidence = (
             0.0
-            if not self._target_confidences
-            else float(sum(self._target_confidences) / len(self._target_confidences))
+            if not self._target_confidences_runtime
+            else float(sum(self._target_confidences_runtime) / len(self._target_confidences_runtime))
         )
         metrics = {
             "detection_frames": int(self._detection_frames),
             "target_detection_frames": int(self._target_detection_frames),
+            "target_visible_frames_gt": int(self._target_visible_frames_gt),
+            "target_detected_frames_runtime": int(self._target_detected_frames_runtime),
+            "target_first_detect_sec_runtime": (
+                None
+                if self._target_first_detect_sec_runtime is None
+                else round(float(self._target_first_detect_sec_runtime), 3)
+            ),
             "avg_target_confidence": round(avg_target_confidence, 4),
             "max_detection_count": int(self._max_detection_count),
             "semantic_target_class": self._semantic_target_class,
+            "benchmark_valid": bool(self._benchmark_valid),
         }
-        if self._target_detection_frames >= 1 and avg_target_confidence >= float(self._config.conf_threshold):
+        if str(getattr(self._config, "sim_perception_mode", "runtime")) != "runtime":
+            metrics["detection_fallback_frames"] = int(self._detection_fallback_frames)
             return SubsystemVerdict(
-                status="pass",
-                reason="target was detected with usable confidence",
+                status="skipped",
+                reason="object-detection benchmark only applies to sim_perception_mode=runtime",
                 key_metrics=metrics,
                 sample_count=self._frame_count,
             )
-        if self._target_detection_frames >= 1:
+        if self._target_visible_frames_gt == 0:
+            return SubsystemVerdict(
+                status="skipped",
+                reason="target was never visible in ground truth, so runtime detection was not scoreable",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        if (
+            self._target_detected_frames_runtime >= 1
+            and avg_target_confidence >= float(self._config.conf_threshold)
+        ):
+            return SubsystemVerdict(
+                status="pass",
+                reason="runtime detector found the target with usable confidence while it was visible in ground truth",
+                key_metrics=metrics,
+                sample_count=self._frame_count,
+            )
+        if self._target_detected_frames_runtime >= 1:
             return SubsystemVerdict(
                 status="warn",
-                reason="target appeared but confidence stayed below the configured threshold",
+                reason="runtime detector found the target, but confidence stayed below the configured threshold",
                 key_metrics=metrics,
                 sample_count=self._frame_count,
             )
         return SubsystemVerdict(
             status="fail",
-            reason="target was never detected",
+            reason="target was visible in ground truth but never detected by the runtime detector",
             key_metrics=metrics,
             first_failure_frame=self._first_frame_index,
             sample_count=self._frame_count,

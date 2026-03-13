@@ -5,12 +5,20 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from obj_recog.blender_worker import BlenderFrameResponse
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
-from obj_recog.sim_assets import build_scenario_asset_manifest
+from obj_recog.sim_assets import (
+    AssetCacheMetadata,
+    asset_metadata_path,
+    build_scenario_asset_manifest,
+    load_asset_catalog,
+    preview_mesh_path,
+    write_asset_cache_metadata,
+)
 from obj_recog.simulation import (
     BlenderRealtimeFrameSource,
     CameraRigSpec,
@@ -23,7 +31,7 @@ from obj_recog.simulation import (
     SimulationRuntime,
     _VisibleObject,
 )
-from obj_recog.types import Detection, FrameArtifacts
+from obj_recog.types import Detection, FrameArtifacts, PerceptionDiagnostics
 
 
 _SCENARIO_IDS = (
@@ -94,6 +102,24 @@ class _FakePhotorealRealtimeSource:
         self.closed = True
 
 
+class _SinglePacketFrameSource:
+    backend_name = "blender-realtime"
+
+    def __init__(self, packet: FramePacket) -> None:
+        self._packet = packet
+        self._emitted = False
+
+    def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
+        _ = timeout_sec
+        if self._emitted:
+            return None
+        self._emitted = True
+        return self._packet
+
+    def close(self) -> None:
+        return None
+
+
 class _FakeBlenderWorker:
     def __init__(self, response: BlenderFrameResponse) -> None:
         self.response = response
@@ -124,6 +150,40 @@ class _FakeBlenderWorker:
     def request_frame(self, request, *, timeout_sec: float | None = None):
         self.requests.append((request, timeout_sec))
         return self._response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _EchoPoseBlenderWorker:
+    def __init__(self, *, tmp_path: Path, frame_shape: tuple[int, int] = (5, 7)) -> None:
+        self._tmp_path = tmp_path
+        self._frame_shape = frame_shape
+        self.started = False
+        self.closed = False
+        self.requests = []
+
+    def start(self) -> None:
+        self.started = True
+
+    def request_frame(self, request, *, timeout_sec: float | None = None) -> BlenderFrameResponse:
+        self.requests.append((request, timeout_sec))
+        height, width = self._frame_shape
+        rgb_path = self._tmp_path / f"echo-{len(self.requests):03d}.npy"
+        depth_path = self._tmp_path / f"echo-{len(self.requests):03d}-depth.npy"
+        np.save(rgb_path, np.full((height, width, 3), 101, dtype=np.uint8))
+        np.save(depth_path, np.full((height, width), 2.4, dtype=np.float32))
+        return BlenderFrameResponse(
+            rgb_path=str(rgb_path),
+            depth_path=str(depth_path),
+            semantic_mask_path=None,
+            instance_mask_path=None,
+            pose_world_gt=np.asarray(request.camera_pose_world, dtype=np.float32),
+            intrinsics_gt=dict(request.intrinsics),
+            render_time_ms=10.0,
+            worker_state="ready",
+            detections=(),
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -237,6 +297,52 @@ def test_blender_realtime_frame_source_emits_valid_packet_for_studio_open_v1(tmp
     assert worker.started is True
     assert len(worker.requests) == 1
     assert worker.requests[0][1] == pytest.approx(15.0)
+    source.close()
+
+
+def test_blender_realtime_frame_source_converts_rgba_png_to_bgr(tmp_path: Path) -> None:
+    rgba = np.zeros((5, 7, 4), dtype=np.uint8)
+    rgba[:, :, 0] = 12
+    rgba[:, :, 1] = 34
+    rgba[:, :, 2] = 56
+    rgba[:, :, 3] = 180
+    rgb_path = tmp_path / "frame-rgba.png"
+    Image.fromarray(rgba, mode="RGBA").save(rgb_path)
+    depth_path = tmp_path / "depth.npy"
+    np.save(depth_path, np.full((5, 7), 2.75, dtype=np.float32))
+    worker = _FakeBlenderWorker(
+        response={
+            "rgb_path": str(rgb_path),
+            "depth_path": str(depth_path),
+            "semantic_mask_path": None,
+            "instance_mask_path": None,
+            "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
+            "intrinsics_gt": {"fx": 12.0, "fy": 13.0, "cx": 3.5, "cy": 2.5},
+            "render_time_ms": 16.4,
+            "worker_state": "ready",
+            "detections": [],
+        }
+    )
+    config = _config(render_profile="photoreal", blender_exec="/Applications/Blender.app/Contents/MacOS/Blender")
+    source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=SCENARIO_SPECS["studio_open_v1"],
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=build_scenario_asset_manifest(
+            SCENARIO_SPECS["studio_open_v1"],
+            seed=7,
+            cache_dir=tmp_path,
+            quality="low",
+        ),
+        report_path=tmp_path / "photoreal-report.json",
+        worker_client=worker,
+    )
+
+    packet = source.next_frame(timeout_sec=0.75)
+
+    assert packet is not None
+    assert packet.frame_bgr.shape == (5, 7, 3)
+    np.testing.assert_array_equal(packet.frame_bgr[0, 0], np.array([56, 34, 12], dtype=np.uint8))
     source.close()
     assert worker.closed is True
 
@@ -461,6 +567,49 @@ def test_simulation_runtime_routes_photoreal_to_blender_realtime_frame_source(tm
     assert packet.instance_mask is not None
 
 
+def test_simulation_frame_source_advances_runtime_pose_for_blender_photoreal_source(tmp_path: Path) -> None:
+    config = _config(
+        render_profile="photoreal",
+        blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+        sim_camera_fps=1.0,
+        sim_max_steps=12,
+    )
+    scenario = SCENARIO_SPECS["studio_open_v1"]
+    worker = _EchoPoseBlenderWorker(tmp_path=tmp_path)
+    photoreal_source = BlenderRealtimeFrameSource(
+        config=config,
+        scenario=scenario,
+        camera_rig=CameraRigSpec.from_config(config),
+        asset_manifest=build_scenario_asset_manifest(
+            scenario,
+            seed=int(config.sim_seed),
+            cache_dir=tmp_path / "assets",
+            quality="low",
+        ),
+        report_path=tmp_path / "photoreal-report.json",
+        worker_client=worker,
+    )
+    source = SimulationFrameSource(
+        config=config,
+        report_path=tmp_path / "runtime-report.json",
+        goal_selector=HeuristicGoalSelector(),
+        external_frame_source=photoreal_source,
+    )
+
+    packets = [source.next_frame() for _ in range(5)]
+
+    assert all(packet is not None for packet in packets)
+    assert len(worker.requests) == 5
+    requested_poses = [
+        np.asarray(request.camera_pose_world, dtype=np.float32).copy()
+        for request, _timeout_sec in worker.requests
+    ]
+    assert any(not np.allclose(requested_poses[0], pose) for pose in requested_poses[1:])
+
+    source.close()
+    assert worker.closed is True
+
+
 @pytest.mark.parametrize("scenario_name", _SCENARIO_IDS)
 def test_simulation_frame_source_is_deterministic_for_same_seed(
     tmp_path: Path,
@@ -529,6 +678,26 @@ def test_simulation_frame_source_emits_render_profile_and_asset_manifest_metadat
     assert report["render_profile"] == "fast"
     assert report["asset_manifest_id"]
     assert report["target_class"] == "backpack"
+
+
+def test_simulation_frame_source_environment_objects_include_preview_sprite_paths(tmp_path: Path) -> None:
+    source = SimulationFrameSource(
+        config=_config(scenario="studio_open_v1", sim_seed=29),
+        report_path=tmp_path / "environment-objects-report.json",
+        goal_selector=HeuristicGoalSelector(),
+    )
+
+    packet = source.next_frame()
+
+    assert packet is not None
+    assert packet.scenario_state.room_width_m == pytest.approx(6.0)
+    assert packet.scenario_state.room_depth_m == pytest.approx(8.0)
+    assert packet.scenario_state.room_height_m == pytest.approx(3.0)
+    environment_objects = tuple(packet.scenario_state.environment_objects)
+    assert environment_objects
+    assert all(item.get("preview_sprite_path") for item in environment_objects)
+    assert all(item.get("asset_id") for item in environment_objects)
+    assert all("yaw_deg" in item for item in environment_objects)
 
 
 def test_build_scenario_asset_manifest_matches_runtime_target_class() -> None:
@@ -724,6 +893,7 @@ class _FakeResponsesClient:
 def _runtime_artifacts(packet, *, pose_world: np.ndarray, tracking_state: str = "TRACKING") -> FrameArtifacts:
     frame_bgr = np.asarray(packet.frame_bgr, dtype=np.uint8)
     depth_map = np.full(frame_bgr.shape[:2], 2.5, dtype=np.float32)
+    target_label = str(getattr(getattr(packet, "scenario_state", None), "semantic_target_class", "target"))
     return FrameArtifacts(
         frame_bgr=frame_bgr,
         intrinsics=packet.intrinsics_gt or CameraIntrinsics(fx=40.0, fy=40.0, cx=frame_bgr.shape[1] / 2.0, cy=frame_bgr.shape[0] / 2.0),
@@ -731,7 +901,7 @@ def _runtime_artifacts(packet, *, pose_world: np.ndarray, tracking_state: str = 
             Detection(
                 xyxy=(10, 10, max(12, frame_bgr.shape[1] - 10), max(12, frame_bgr.shape[0] - 10)),
                 class_id=1,
-                label="target",
+                label=target_label,
                 confidence=0.95,
                 color=(0, 255, 0),
             )
@@ -755,6 +925,14 @@ def _runtime_artifacts(packet, *, pose_world: np.ndarray, tracking_state: str = 
         loop_closure_applied=False,
         segmentation_overlay_bgr=frame_bgr.copy(),
         segments=[],
+        perception_diagnostics=PerceptionDiagnostics(
+            perception_mode="runtime",
+            detection_source="runtime",
+            depth_source="runtime",
+            pose_source="runtime",
+            gt_target_visible=True,
+            benchmark_valid=True,
+        ),
     )
 
 
@@ -1033,6 +1211,132 @@ def test_simulation_runtime_photoreal_profile_uses_realtime_factory_without_mani
     assert packet is not None
     assert factory_calls == [("photoreal", "/Applications/Blender.app/Contents/MacOS/Blender")]
     assert packet.scenario_state.render_profile == "photoreal"
+
+
+def test_simulation_runtime_photoreal_runtime_mode_requires_external_assets(tmp_path: Path) -> None:
+    runtime = SimulationRuntime(
+        config=_config(
+            render_profile="photoreal",
+            sim_perception_mode="runtime",
+            blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+            asset_cache_dir=str(tmp_path / "assets"),
+        ),
+        report_path=tmp_path / "runtime-report.json",
+    )
+
+    with pytest.raises(RuntimeError, match="photoreal runtime assets are missing or invalid"):
+        runtime.create_frame_source()
+
+
+def test_simulation_runtime_photoreal_runtime_mode_accepts_external_asset_cache(tmp_path: Path) -> None:
+    config = _config(
+        render_profile="photoreal",
+        sim_perception_mode="runtime",
+        blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+        asset_cache_dir=str(tmp_path / "assets"),
+    )
+    scenario = SCENARIO_SPECS[config.scenario]
+    catalog = load_asset_catalog()
+    manifest = build_scenario_asset_manifest(
+        scenario,
+        seed=int(config.sim_seed),
+        cache_dir=config.asset_cache_dir,
+        quality=config.asset_quality,
+    )
+    unique_asset_ids = {placement.asset_id for placement in manifest.placements}
+    semantic_path = tmp_path / "semantic.npy"
+    instance_path = tmp_path / "instance.npy"
+    np.save(semantic_path, np.ones((24, 32), dtype=np.uint8))
+    np.save(instance_path, np.full((24, 32), 7, dtype=np.uint8))
+    for asset_id in unique_asset_ids:
+        entry = catalog[asset_id]
+        blend_path = tmp_path / "assets" / entry.blender_library_relpath
+        mesh_path = tmp_path / "assets" / entry.preview_mesh_relpath
+        blend_path.parent.mkdir(parents=True, exist_ok=True)
+        mesh_path.parent.mkdir(parents=True, exist_ok=True)
+        blend_path.write_bytes(b"blend")
+        mesh_path.write_text("ply", encoding="utf-8")
+        write_asset_cache_metadata(
+            AssetCacheMetadata(
+                asset_id=entry.asset_id,
+                catalog_version=entry.catalog_version,
+                provenance="external",
+                archive_url=entry.bootstrap.archive_url,
+                archive_sha256=entry.bootstrap.archive_sha256,
+                blender_library_path=str(blend_path),
+                preview_mesh_path=str(mesh_path),
+                export_object_name=entry.bootstrap.export_object_name,
+            ),
+            asset_metadata_path(entry, config.asset_cache_dir),
+        )
+
+    captured_calls: list[str] = []
+
+    def _factory(*, config: AppConfig, scenario, camera_rig, asset_manifest, report_path):
+        _ = (scenario, camera_rig, asset_manifest, report_path)
+        captured_calls.append(config.sim_perception_mode)
+        return _SinglePacketFrameSource(
+            FramePacket(
+                frame_bgr=np.zeros((24, 32, 3), dtype=np.uint8),
+                timestamp_sec=0.0,
+                depth_map=np.ones((24, 32), dtype=np.float32),
+                pose_world_gt=np.eye(4, dtype=np.float32),
+                intrinsics_gt=CameraIntrinsics(fx=16.0, fy=16.0, cx=16.0, cy=12.0),
+                semantic_mask=np.load(semantic_path),
+                instance_mask=np.load(instance_path),
+                detections=[
+                    Detection(
+                        xyxy=(8, 6, 24, 20),
+                        class_id=1,
+                        label="backpack",
+                        confidence=0.95,
+                        color=(0, 255, 0),
+                    )
+                ],
+                scenario_state=type(
+                    "ScenarioState",
+                    (),
+                    {
+                        "render_profile": "photoreal",
+                        "render_backend": "blender-realtime",
+                        "semantic_target_class": "backpack",
+                        "asset_manifest_id": "manifest-1",
+                        "environment_objects": (),
+                        "phase": "PHOTOREAL_PREVIEW",
+                        "scene_id": "studio_open_v1",
+                        "difficulty_level": 1,
+                        "step_index": 0,
+                        "elapsed_sec": 0.0,
+                        "selfcal_converged": False,
+                        "rig_x": 0.0,
+                        "rig_y": 1.6,
+                        "rig_z": 0.0,
+                        "yaw_deg": 0.0,
+                        "room_width_m": 6.0,
+                        "room_depth_m": 8.0,
+                        "room_height_m": 3.0,
+                        "visible_labels": (),
+                        "active_goal": None,
+                        "target_motion_state": "static",
+                        "semantic_mask_path": str(semantic_path),
+                        "instance_mask_path": str(instance_path),
+                    },
+                )(),
+                calibration_source="blender-ground-truth",
+            )
+        )
+
+    runtime = SimulationRuntime(
+        config=config,
+        report_path=tmp_path / "runtime-report.json",
+        photoreal_frame_source_factory=_factory,
+    )
+
+    frame_source = runtime.create_frame_source()
+    packet = frame_source.next_frame()
+
+    assert captured_calls == ["runtime"]
+    assert packet is not None
     assert packet.scenario_state.render_backend == "blender-realtime"
     assert packet.scenario_state.semantic_mask_path == str(semantic_path)
     assert packet.scenario_state.instance_mask_path == str(instance_path)
@@ -1163,7 +1467,11 @@ def test_simulation_frame_source_records_runtime_pose_error_into_report(tmp_path
     source.close()
     report = json.loads(report_path.read_text(encoding="utf-8"))
 
+    assert report["benchmark_valid"] is True
     assert report["pose_error_vs_gt"] == pytest.approx(0.5)
+    assert report["target_visible_frames_gt"] == 1
+    assert report["target_detected_frames_runtime"] == 1
+    assert report["target_first_detect_sec_runtime"] == pytest.approx(packet.timestamp_sec)
 
 
 def test_simulation_frame_source_uses_injected_renderer_backend(tmp_path: Path) -> None:

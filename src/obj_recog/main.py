@@ -32,14 +32,15 @@ from obj_recog.situation_explainer import (
     build_explanation_snapshot,
 )
 from obj_recog.tracking import PoseTracker
-from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, SegmentationResult
+from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, PerceptionDiagnostics, SegmentationResult
 from obj_recog.visualization import (
+    Open3DEnvironmentViewer,
     Open3DMeshViewer,
     draw_detections,
     explanation_button_rect,
     point_in_rect,
-    render_environment_model_panel,
     render_explanation_panel,
+    runtime_window_position,
 )
 
 
@@ -233,6 +234,7 @@ def process_frame(
     inference_frame, scale_x, scale_y = resize_for_inference(frame_bgr, config.inference_width)
 
     packet_detections = None if frame_packet is None else frame_packet.detections
+    used_detection_fallback = False
     if prefer_frame_packet_ground_truth and packet_detections is not None:
         detections = list(packet_detections)
     elif frame_index % config.detection_interval == 0 or not cached_detections:
@@ -242,6 +244,7 @@ def process_frame(
         detections = cached_detections
     if assist_frame_packet_ground_truth and not detections and packet_detections is not None:
         detections = list(packet_detections)
+        used_detection_fallback = True
 
     packet_depth_map = None if frame_packet is None else frame_packet.depth_map
     depth_map = (
@@ -300,6 +303,44 @@ def process_frame(
 
     if assist_frame_packet_ground_truth and packet_pose_available:
         slam_result = _slam_result_from_frame_packet(frame_packet)
+
+    target_label = None
+    if frame_packet is not None and getattr(frame_packet, "scenario_state", None) is not None:
+        target_label = getattr(frame_packet.scenario_state, "semantic_target_class", None)
+    gt_target_visible = bool(
+        target_label
+        and packet_detections
+        and any(str(item.label) == str(target_label) for item in packet_detections)
+    )
+    perception_mode = (
+        str(getattr(config, "sim_perception_mode", "runtime"))
+        if str(getattr(config, "input_source", "live")) == "sim"
+        else "live"
+    )
+    if prefer_frame_packet_ground_truth and packet_detections is not None:
+        detection_source = "ground_truth"
+    elif used_detection_fallback:
+        detection_source = "runtime+fallback"
+    else:
+        detection_source = "runtime"
+    depth_source = (
+        "ground_truth"
+        if (prefer_frame_packet_ground_truth or assist_frame_packet_ground_truth) and packet_depth_map is not None
+        else "runtime"
+    )
+    pose_source = (
+        "ground_truth"
+        if ((prefer_frame_packet_ground_truth or assist_frame_packet_ground_truth) and packet_pose_available)
+        else "runtime"
+    )
+    perception_diagnostics = PerceptionDiagnostics(
+        perception_mode=perception_mode,
+        detection_source=detection_source,
+        depth_source=depth_source,
+        pose_source=pose_source,
+        gt_target_visible=gt_target_visible,
+        benchmark_valid=bool(str(getattr(config, "input_source", "live")) == "sim" and perception_mode == "runtime"),
+    )
 
     camera_pose_world = np.asarray(slam_result.pose_world, dtype=np.float32)
     map_update = _update_map_builder(
@@ -437,6 +478,7 @@ def process_frame(
         segmentation_overlay_bgr=np.zeros_like(frame_bgr),
         segments=[],
         depth_diagnostics=depth_diagnostics,
+        perception_diagnostics=perception_diagnostics,
     )
     return artifacts, list(detections)
 
@@ -447,7 +489,58 @@ def window_is_visible(cv2_module, window_name: str) -> bool:
         return False
 
 
-def _show_runtime_loading_preview(cv2_module, width: int, height: int, message: str) -> None:
+def _position_runtime_window(
+    cv2_module,
+    window_name: str,
+    *,
+    primary_width: int,
+    primary_height: int,
+    positioned_windows: set[str],
+) -> None:
+    if window_name in positioned_windows:
+        return
+    positioned_windows.add(window_name)
+    move_window = getattr(cv2_module, "moveWindow", None)
+    if not callable(move_window):
+        return
+    x, y = runtime_window_position(
+        window_name,
+        primary_width=primary_width,
+        primary_height=primary_height,
+    )
+    try:
+        move_window(window_name, int(x), int(y))
+    except Exception:
+        return
+
+
+def _imshow_runtime_window(
+    cv2_module,
+    window_name: str,
+    frame: np.ndarray,
+    *,
+    primary_width: int,
+    primary_height: int,
+    positioned_windows: set[str],
+) -> None:
+    cv2_module.imshow(window_name, frame)
+    _position_runtime_window(
+        cv2_module,
+        window_name,
+        primary_width=primary_width,
+        primary_height=primary_height,
+        positioned_windows=positioned_windows,
+    )
+
+
+def _show_runtime_loading_preview(
+    cv2_module,
+    width: int,
+    height: int,
+    message: str,
+    *,
+    positioned_windows: set[str],
+) -> None:
     frame = np.zeros((max(height, 240), max(width, 320), 3), dtype=np.uint8)
     cv2_module.putText(
         frame,
@@ -459,8 +552,40 @@ def _show_runtime_loading_preview(cv2_module, width: int, height: int, message: 
         2,
         cv2_module.LINE_AA,
     )
-    cv2_module.imshow("Object Recognition", frame)
+    _imshow_runtime_window(
+        cv2_module,
+        "Object Recognition",
+        frame,
+        primary_width=width,
+        primary_height=height,
+        positioned_windows=positioned_windows,
+    )
     cv2_module.waitKey(1)
+
+
+def _build_viewer(
+    viewer_factory,
+    *,
+    layout_primary_width: int,
+    layout_primary_height: int,
+):
+    try:
+        signature = inspect.signature(viewer_factory)
+    except (TypeError, ValueError):
+        return viewer_factory()
+
+    parameters = signature.parameters
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    kwargs: dict[str, int] = {}
+    if accepts_kwargs or "layout_primary_width" in parameters:
+        kwargs["layout_primary_width"] = int(layout_primary_width)
+    if accepts_kwargs or "layout_primary_height" in parameters:
+        kwargs["layout_primary_height"] = int(layout_primary_height)
+    if kwargs:
+        return viewer_factory(**kwargs)
+    return viewer_factory()
 
 
 def _camera_space_z_span(points_xyz: np.ndarray, camera_pose_world: np.ndarray) -> float:
@@ -546,13 +671,13 @@ def run(
     situation_explainer_factory=None,
     explanation_worker_factory=SituationExplanationWorker,
     viewer_factory=Open3DMeshViewer,
+    environment_viewer_factory=None,
     open_camera_fn=open_camera,
     camera_lister=list_available_cameras,
     runtime_calibration_resolver=ensure_runtime_calibration,
     overlay_renderer=draw_detections,
     explanation_snapshot_builder=build_explanation_snapshot,
     explanation_panel_renderer=render_explanation_panel,
-    environment_model_renderer=render_environment_model_panel,
     scene_graph_memory_factory=SceneGraphMemory,
     frame_source_factory=None,
     time_source=time.perf_counter,
@@ -565,6 +690,7 @@ def run(
     depth_profile = resolve_depth_profile(config.depth_profile)
     camera_session: CameraSession | None = None
     viewer = None
+    environment_viewer = None
     slam_bridge = None
     segmentation_worker = None
     explanation_worker = None
@@ -587,6 +713,7 @@ def run(
     explanation_refresh_status = "idle"
     explanation_auto_refresh_enabled = False
     last_explanation_request_time: float | None = None
+    positioned_runtime_windows: set[str] = set()
     explanation_button_state = {
         "pending_toggle": False,
         "rect": None,
@@ -803,6 +930,7 @@ def run(
                         int(config.width),
                         int(config.height),
                         "Calibration complete. Loading models...",
+                        positioned_windows=positioned_runtime_windows,
                     )
             frame_source = _build_live_frame_source(camera_session)
         if use_frame_packet_ground_truth:
@@ -931,8 +1059,19 @@ def run(
                 graph_relation_smoothing_frames=config.graph_relation_smoothing_frames,
                 occlusion_ttl_frames=config.graph_occlusion_ttl_frames,
             )
-        viewer = viewer_factory()
+        viewer = _build_viewer(
+            viewer_factory,
+            layout_primary_width=int(config.width),
+            layout_primary_height=int(config.height),
+        )
         debug_log("viewer init done")
+        if config.input_source == "sim" and environment_viewer_factory is not None:
+            environment_viewer = _build_viewer(
+                environment_viewer_factory,
+                layout_primary_width=int(config.width),
+                layout_primary_height=int(config.height),
+            )
+            debug_log("environment viewer init done")
         last_frame_time = time_source()
         if use_slam_bridge:
             slam_time_origin = time_source()
@@ -1174,15 +1313,20 @@ def run(
                 explanation_auto_refresh_enabled=explanation_auto_refresh_enabled,
                 depth_diagnostics=artifacts.depth_diagnostics,
                 depth_debug_level=depth_debug_level,
+                perception_diagnostics=artifacts.perception_diagnostics,
                 cv2_module=cv2,
             )
-            cv2.imshow("Object Recognition", overlay)
-            if frame_packet.scenario_state is not None:
-                environment_panel = environment_model_renderer(
-                    frame_packet.scenario_state,
-                    cv2_module=cv2,
-                )
-                cv2.imshow("Environment Model", environment_panel)
+            _imshow_runtime_window(
+                cv2,
+                "Object Recognition",
+                overlay,
+                primary_width=int(config.width),
+                primary_height=int(config.height),
+                positioned_windows=positioned_runtime_windows,
+            )
+            environment_viewer_active = True
+            if environment_viewer is not None and frame_packet.scenario_state is not None:
+                environment_viewer_active = bool(environment_viewer.update(frame_packet.scenario_state))
             explanation_button_state["rect"] = (
                 explanation_button_rect(
                     frame_width=overlay.shape[1],
@@ -1238,14 +1382,22 @@ def run(
                     panel = panel_render_result
                     explanation_panel_state["up_rect"] = None
                     explanation_panel_state["down_rect"] = None
-                cv2.imshow("Situation Explanation", panel)
+                _imshow_runtime_window(
+                    cv2,
+                    "Situation Explanation",
+                    panel,
+                    primary_width=int(config.width),
+                    primary_height=int(config.height),
+                    positioned_windows=positioned_runtime_windows,
+                )
                 if (
                     not explanation_panel_mouse_callback_registered
                     and callable(getattr(cv2, "setMouseCallback", None))
                 ):
                     cv2.setMouseCallback("Situation Explanation", _handle_explanation_window_mouse)
                     explanation_panel_mouse_callback_registered = True
-            viewer_active = _update_viewer(viewer, artifacts)
+            reconstruction_viewer_active = _update_viewer(viewer, artifacts)
+            viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
             if validation_probe is not None and hasattr(validation_probe, "record_frame"):
                 validation_probe.record_frame(
                     frame_index=frame_index,
@@ -1343,6 +1495,8 @@ def run(
             segmentation_worker.close()
         if explanation_worker is not None:
             explanation_worker.close()
+        if environment_viewer is not None:
+            environment_viewer.close()
         if viewer is not None:
             viewer.close()
         cv2.destroyAllWindows()
@@ -1375,6 +1529,7 @@ def main() -> None:
         map_builder_factory=TsdfMeshMapBuilder,
         situation_explainer_factory=OpenAISituationExplainer,
         explanation_worker_factory=SituationExplanationWorker,
+        environment_viewer_factory=Open3DEnvironmentViewer,
     )
 
 

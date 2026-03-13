@@ -8,7 +8,11 @@ import numpy as np
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.scene_graph import SceneGraphSnapshot
 from obj_recog.situation_explainer import ExplanationStatus, wrap_explanation_text
-from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment
+from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
+
+_RUNTIME_WINDOW_MARGIN_X = 32
+_RUNTIME_WINDOW_MARGIN_Y = 48
+_RUNTIME_WINDOW_GAP = 32
 
 
 def _display_points_for_view(points_xyz: np.ndarray) -> np.ndarray:
@@ -94,6 +98,27 @@ def render_multiline_unicode_text(
         draw.text((int(x), int(y + index * line_height)), str(line), fill=rgb_color, font=font)
     rendered = np.asarray(image, dtype=np.uint8)
     return rendered[:, :, ::-1].copy()
+
+
+def runtime_window_position(
+    window_name: str,
+    *,
+    primary_width: int = 640,
+    primary_height: int = 360,
+) -> tuple[int, int]:
+    main_width = max(320, int(primary_width))
+    main_height = max(240, int(primary_height))
+    left_x = _RUNTIME_WINDOW_MARGIN_X
+    top_y = _RUNTIME_WINDOW_MARGIN_Y
+    right_x = left_x + main_width + _RUNTIME_WINDOW_GAP
+    bottom_y = top_y + main_height + _RUNTIME_WINDOW_GAP
+    positions = {
+        "Object Recognition": (left_x, top_y),
+        "Environment Model": (right_x, top_y),
+        "Situation Explanation": (left_x, bottom_y),
+        "3D Reconstruction": (right_x, bottom_y),
+    }
+    return positions.get(str(window_name), (left_x, top_y))
 
 
 def explanation_button_rect(
@@ -331,6 +356,7 @@ def _draw_runtime_status(
     explanation_status: str | None = None,
     depth_diagnostics: DepthDiagnostics | None = None,
     depth_debug_level: str | None = None,
+    perception_diagnostics: PerceptionDiagnostics | None = None,
 ) -> None:
     if (
         slam_tracking_state is None
@@ -342,6 +368,7 @@ def _draw_runtime_status(
         and localized_node_count is None
         and explanation_status is None
         and depth_diagnostics is None
+        and perception_diagnostics is None
     ):
         return
 
@@ -360,6 +387,19 @@ def _draw_runtime_status(
         )
     if explanation_status is not None:
         lines.append(f"Explain: {explanation_status}")
+    if perception_diagnostics is not None:
+        lines.extend(
+            [
+                f"Perception {perception_diagnostics.perception_mode}",
+                f"Detect {perception_diagnostics.detection_source}",
+                f"Depth/Pose {perception_diagnostics.depth_source}/{perception_diagnostics.pose_source}",
+                (
+                    "Benchmark "
+                    f"{'valid' if perception_diagnostics.benchmark_valid else 'invalid'} "
+                    f"GT-visible {'yes' if perception_diagnostics.gt_target_visible else 'no'}"
+                ),
+            ]
+        )
     if depth_diagnostics is not None and depth_debug_level in {"basic", "detailed"}:
         p10, p50, p90 = depth_diagnostics.normalized_distance_percentiles
         lines.extend(
@@ -424,6 +464,7 @@ def draw_detections(
     explanation_auto_refresh_enabled: bool = False,
     depth_diagnostics: DepthDiagnostics | None = None,
     depth_debug_level: str | None = None,
+    perception_diagnostics: PerceptionDiagnostics | None = None,
     cv2_module=None,
 ) -> np.ndarray:
     cv2 = load_cv2(cv2_module)
@@ -489,6 +530,7 @@ def draw_detections(
         explanation_status=explanation_status,
         depth_diagnostics=depth_diagnostics,
         depth_debug_level=depth_debug_level,
+        perception_diagnostics=perception_diagnostics,
     )
 
     if segments:
@@ -658,186 +700,436 @@ def highlight_detected_points(
     return highlighted
 
 
-def render_environment_model_panel(
-    scenario_state,
-    *,
-    panel_width: int = 520,
-    panel_height: int = 420,
-    cv2_module=None,
-) -> np.ndarray:
-    cv2 = load_cv2(cv2_module)
-    canvas = np.full((panel_height, panel_width, 3), (18, 20, 24), dtype=np.uint8)
-    objects = tuple(getattr(scenario_state, "environment_objects", ()) or ())
-    _draw_rectangle(cv2, canvas, (18, 18), (panel_width - 18, panel_height - 18), (46, 54, 70), 1)
-    cv2.putText(
-        canvas,
-        "Environment Model",
-        (24, 38),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (235, 240, 250),
-        1,
-        cv2.LINE_AA,
-    )
-    if not objects:
-        cv2.putText(
-            canvas,
-            "No environment objects",
-            (24, 72),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (170, 176, 188),
-            1,
-            cv2.LINE_AA,
+def _combine_triangle_meshes(
+    meshes: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not meshes:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.int32),
+            np.empty((0, 3), dtype=np.float64),
         )
-        return canvas
-
-    scale = min(panel_width, panel_height) * 0.065
-    center_x = int(panel_width * 0.5)
-    center_y = int(panel_height * 0.64)
-    _draw_isometric_floor_grid(cv2, canvas, center_x=center_x, center_y=center_y, scale=scale)
-    for obj in sorted(objects, key=lambda item: float(item["center_world"][1]) + float(item["center_world"][2])):
-        _draw_isometric_object(cv2, canvas, obj, center_x=center_x, center_y=center_y, scale=scale)
-    _draw_isometric_camera(cv2, canvas, scenario_state, center_x=center_x, center_y=center_y, scale=scale)
-    return canvas
-
-
-def _iso_project(x: float, y: float, z: float, *, center_x: int, center_y: int, scale: float) -> tuple[int, int]:
-    iso_x = center_x + ((x - z) * scale)
-    iso_y = center_y + (((x + z) * scale * 0.5) - (y * scale * 1.35))
-    return int(round(iso_x)), int(round(iso_y))
-
-
-def _draw_isometric_floor_grid(cv2, canvas: np.ndarray, *, center_x: int, center_y: int, scale: float) -> None:
-    line = getattr(cv2, "line", None)
-    if not callable(line):
-        return
-    grid_color = (42, 50, 62)
-    for offset in range(-6, 7):
-        start = _iso_project(-6.0, 0.0, float(offset), center_x=center_x, center_y=center_y, scale=scale)
-        end = _iso_project(6.0, 0.0, float(offset), center_x=center_x, center_y=center_y, scale=scale)
-        line(canvas, start, end, grid_color, 1)
-        start = _iso_project(float(offset), 0.0, -6.0, center_x=center_x, center_y=center_y, scale=scale)
-        end = _iso_project(float(offset), 0.0, 6.0, center_x=center_x, center_y=center_y, scale=scale)
-        line(canvas, start, end, grid_color, 1)
+    vertices: list[np.ndarray] = []
+    triangles: list[np.ndarray] = []
+    colors: list[np.ndarray] = []
+    vertex_offset = 0
+    for mesh_vertices, mesh_triangles, mesh_colors in meshes:
+        current_vertices = np.asarray(mesh_vertices, dtype=np.float64).reshape(-1, 3)
+        current_triangles = np.asarray(mesh_triangles, dtype=np.int32).reshape(-1, 3)
+        current_colors = np.asarray(mesh_colors, dtype=np.float64).reshape(-1, 3)
+        vertices.append(current_vertices)
+        triangles.append(current_triangles + int(vertex_offset))
+        colors.append(current_colors)
+        vertex_offset += int(current_vertices.shape[0])
+    return (
+        np.vstack(vertices),
+        np.vstack(triangles),
+        np.vstack(colors),
+    )
 
 
-def _shade_color(color_bgr: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
-    return tuple(int(max(0, min(255, round(channel * factor)))) for channel in color_bgr)
+def _box_mesh_arrays(size_xyz: tuple[float, float, float]) -> tuple[np.ndarray, np.ndarray]:
+    sx, sy, sz = (max(float(value), 1e-3) * 0.5 for value in size_xyz)
+    vertices = np.array(
+        [
+            [-sx, -sy, -sz],
+            [sx, -sy, -sz],
+            [sx, sy, -sz],
+            [-sx, sy, -sz],
+            [-sx, -sy, sz],
+            [sx, -sy, sz],
+            [sx, sy, sz],
+            [-sx, sy, sz],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 4, 5],
+            [0, 5, 1],
+            [1, 5, 6],
+            [1, 6, 2],
+            [2, 6, 7],
+            [2, 7, 3],
+            [3, 7, 4],
+            [3, 4, 0],
+        ],
+        dtype=np.int32,
+    )
+    return vertices, triangles
 
 
-def _draw_isometric_object(
-    cv2,
-    canvas: np.ndarray,
+def _sphere_mesh_arrays(
+    size_xyz: tuple[float, float, float],
+    *,
+    segments: int = 14,
+    rings: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    rx, ry, rz = (max(float(value), 1e-3) * 0.5 for value in size_xyz)
+    vertices: list[list[float]] = [[0.0, ry, 0.0]]
+    triangles: list[list[int]] = []
+    for ring_index in range(1, rings):
+        phi = math.pi * (ring_index / float(rings))
+        sin_phi = math.sin(phi)
+        cos_phi = math.cos(phi)
+        for segment_index in range(segments):
+            theta = (2.0 * math.pi * segment_index) / float(segments)
+            vertices.append(
+                [
+                    rx * sin_phi * math.cos(theta),
+                    ry * cos_phi,
+                    rz * sin_phi * math.sin(theta),
+                ]
+            )
+    south_index = len(vertices)
+    vertices.append([0.0, -ry, 0.0])
+    if rings > 1:
+        for segment_index in range(segments):
+            next_index = (segment_index + 1) % segments
+            triangles.append([0, 1 + next_index, 1 + segment_index])
+        for ring_index in range(rings - 2):
+            ring_start = 1 + (ring_index * segments)
+            next_ring_start = ring_start + segments
+            for segment_index in range(segments):
+                next_index = (segment_index + 1) % segments
+                a = ring_start + segment_index
+                b = ring_start + next_index
+                c = next_ring_start + segment_index
+                d = next_ring_start + next_index
+                triangles.append([a, c, b])
+                triangles.append([b, c, d])
+        last_ring_start = 1 + ((rings - 2) * segments)
+        for segment_index in range(segments):
+            next_index = (segment_index + 1) % segments
+            triangles.append([south_index, last_ring_start + segment_index, last_ring_start + next_index])
+    return np.asarray(vertices, dtype=np.float64), np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+
+
+def _rotation_matrix_xyz(rotation_xyz_deg: tuple[float, float, float]) -> np.ndarray:
+    rx, ry, rz = (math.radians(float(value)) for value in rotation_xyz_deg)
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+    rot_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+    rot_z = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rot_z @ rot_y @ rot_x
+
+
+def _rotation_matrix_y(yaw_deg: float) -> np.ndarray:
+    yaw_rad = math.radians(float(yaw_deg))
+    c = math.cos(yaw_rad)
+    s = math.sin(yaw_rad)
+    return np.array(
+        [
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _primitive_mesh_arrays(
+    primitive_type: str,
+    dimensions_xyz: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    if str(primitive_type) == "UV_SPHERE":
+        return _sphere_mesh_arrays(dimensions_xyz)
+    return _box_mesh_arrays(dimensions_xyz)
+
+
+def _colored_mesh(
+    vertices_xyz: np.ndarray,
+    triangles: np.ndarray,
+    *,
+    color_rgb: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vertex_count = int(np.asarray(vertices_xyz).reshape(-1, 3).shape[0])
+    colors = np.tile(np.asarray(color_rgb, dtype=np.float64).reshape(1, 3), (vertex_count, 1))
+    return (
+        np.asarray(vertices_xyz, dtype=np.float64).reshape(-1, 3),
+        np.asarray(triangles, dtype=np.int32).reshape(-1, 3),
+        colors,
+    )
+
+
+def _object_mesh_arrays(
     obj: dict[str, object],
     *,
-    center_x: int,
-    center_y: int,
-    scale: float,
-) -> None:
-    fill_poly = getattr(cv2, "fillConvexPoly", None)
-    polylines = getattr(cv2, "polylines", None)
-    line = getattr(cv2, "line", None)
-    center_world = tuple(float(value) for value in obj["center_world"])
-    size_xyz = tuple(float(value) for value in obj["size_xyz"])
-    half_x = size_xyz[0] * 0.5
-    half_y = size_xyz[1] * 0.5
-    half_z = size_xyz[2] * 0.5
+    o3d_module=None,
+    preview_mesh_cache: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    preview_mesh_path = obj.get("preview_mesh_path")
+    vertices_xyz = np.empty((0, 3), dtype=np.float64)
+    triangles = np.empty((0, 3), dtype=np.int32)
+    if preview_mesh_path and o3d_module is not None and hasattr(o3d_module, "io"):
+        cache_key = str(preview_mesh_path)
+        cached = None if preview_mesh_cache is None else preview_mesh_cache.get(cache_key)
+        if cached is None:
+            try:
+                mesh = o3d_module.io.read_triangle_mesh(str(preview_mesh_path))
+                raw_vertices = np.asarray(getattr(getattr(mesh, "vertices", None), "data", getattr(mesh, "vertices", np.empty((0, 3)))), dtype=np.float64).reshape(-1, 3)
+                raw_triangles = np.asarray(getattr(getattr(mesh, "triangles", None), "data", getattr(mesh, "triangles", np.empty((0, 3)))), dtype=np.int32).reshape(-1, 3)
+            except Exception:
+                raw_vertices = np.empty((0, 3), dtype=np.float64)
+                raw_triangles = np.empty((0, 3), dtype=np.int32)
+            cached = (raw_vertices, raw_triangles)
+            if preview_mesh_cache is not None:
+                preview_mesh_cache[cache_key] = cached
+        vertices_xyz, triangles = cached
+    if vertices_xyz.size == 0:
+        fallback_vertices, fallback_triangles = _box_mesh_arrays(tuple(float(value) for value in obj["size_xyz"]))
+        color_bgr = tuple(int(value) for value in obj["color_bgr"])
+        return _colored_mesh(
+            fallback_vertices + np.asarray(obj["center_world"], dtype=np.float64),
+            fallback_triangles,
+            color_rgb=(color_bgr[2] / 255.0, color_bgr[1] / 255.0, color_bgr[0] / 255.0),
+        )
+
+    bounds_min = vertices_xyz.min(axis=0)
+    bounds_max = vertices_xyz.max(axis=0)
+    extents = np.maximum(bounds_max - bounds_min, 1e-3)
+    centered_vertices = vertices_xyz - ((bounds_min + bounds_max) * 0.5)
+    target_size = np.asarray(obj["size_xyz"], dtype=np.float64).reshape(3)
+    scaled_vertices = centered_vertices * (target_size / extents)
+    world_rotation = _rotation_matrix_y(float(obj.get("yaw_deg", 0.0)))
+    world_vertices = (scaled_vertices @ world_rotation.T) + np.asarray(obj["center_world"], dtype=np.float64)
     color_bgr = tuple(int(value) for value in obj["color_bgr"])
     if bool(obj.get("target_role")):
-        color_bgr = (40, 210, 245)
+        color_rgb = (245.0 / 255.0, 210.0 / 255.0, 40.0 / 255.0)
     elif bool(obj.get("visible")):
-        color_bgr = _shade_color(color_bgr, 1.15)
+        color_rgb = (
+            min(1.0, (color_bgr[2] / 255.0) * 1.15),
+            min(1.0, (color_bgr[1] / 255.0) * 1.15),
+            min(1.0, (color_bgr[0] / 255.0) * 1.15),
+        )
+    else:
+        color_rgb = (color_bgr[2] / 255.0, color_bgr[1] / 255.0, color_bgr[0] / 255.0)
+    return _colored_mesh(world_vertices, triangles, color_rgb=color_rgb)
 
-    x, y, z = center_world
-    top = np.array(
+
+def _room_mesh_arrays(
+    *,
+    room_width_m: float,
+    room_depth_m: float,
+    room_height_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    wall_thickness = 0.05
+    beam_thickness = 0.06
+    room_meshes = [
+        _colored_mesh(
+            _box_mesh_arrays((room_width_m, wall_thickness, room_depth_m))[0]
+            + np.asarray((0.0, -wall_thickness * 0.5, room_depth_m * 0.5), dtype=np.float64),
+            _box_mesh_arrays((room_width_m, wall_thickness, room_depth_m))[1],
+            color_rgb=(0.38, 0.37, 0.35),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((room_width_m, room_height_m, wall_thickness))[0]
+            + np.asarray((0.0, room_height_m * 0.5, room_depth_m), dtype=np.float64),
+            _box_mesh_arrays((room_width_m, room_height_m, wall_thickness))[1],
+            color_rgb=(0.56, 0.55, 0.58),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((wall_thickness, room_height_m, room_depth_m))[0]
+            + np.asarray((-room_width_m * 0.5, room_height_m * 0.5, room_depth_m * 0.5), dtype=np.float64),
+            _box_mesh_arrays((wall_thickness, room_height_m, room_depth_m))[1],
+            color_rgb=(0.50, 0.49, 0.47),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((wall_thickness, room_height_m, room_depth_m))[0]
+            + np.asarray((room_width_m * 0.5, room_height_m * 0.5, room_depth_m * 0.5), dtype=np.float64),
+            _box_mesh_arrays((wall_thickness, room_height_m, room_depth_m))[1],
+            color_rgb=(0.50, 0.49, 0.47),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((room_width_m, beam_thickness, beam_thickness))[0]
+            + np.asarray((0.0, room_height_m, 0.0), dtype=np.float64),
+            _box_mesh_arrays((room_width_m, beam_thickness, beam_thickness))[1],
+            color_rgb=(0.62, 0.63, 0.66),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((room_width_m, beam_thickness, beam_thickness))[0]
+            + np.asarray((0.0, room_height_m, room_depth_m), dtype=np.float64),
+            _box_mesh_arrays((room_width_m, beam_thickness, beam_thickness))[1],
+            color_rgb=(0.62, 0.63, 0.66),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((beam_thickness, beam_thickness, room_depth_m))[0]
+            + np.asarray((-room_width_m * 0.5, room_height_m, room_depth_m * 0.5), dtype=np.float64),
+            _box_mesh_arrays((beam_thickness, beam_thickness, room_depth_m))[1],
+            color_rgb=(0.62, 0.63, 0.66),
+        ),
+        _colored_mesh(
+            _box_mesh_arrays((beam_thickness, beam_thickness, room_depth_m))[0]
+            + np.asarray((room_width_m * 0.5, room_height_m, room_depth_m * 0.5), dtype=np.float64),
+            _box_mesh_arrays((beam_thickness, beam_thickness, room_depth_m))[1],
+            color_rgb=(0.62, 0.63, 0.66),
+        ),
+    ]
+    return _combine_triangle_meshes(room_meshes)
+
+
+def _camera_marker_lines(
+    *,
+    rig_x: float,
+    rig_y: float,
+    rig_z: float,
+    yaw_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    local_points = np.array(
         [
-            _iso_project(x - half_x, y + half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y + half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x - half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.45],
+            [-0.18, 0.10, 0.25],
+            [0.18, 0.10, 0.25],
+            [-0.18, -0.10, 0.25],
+            [0.18, -0.10, 0.25],
+        ],
+        dtype=np.float64,
+    )
+    rotation = _rotation_matrix_y(float(yaw_deg))
+    world_points = (local_points @ rotation.T) + np.asarray((rig_x, rig_y, rig_z), dtype=np.float64)
+    lines = np.array(
+        [
+            [0, 1],
+            [0, 2],
+            [0, 3],
+            [0, 4],
+            [0, 5],
+            [2, 3],
+            [3, 5],
+            [5, 4],
+            [4, 2],
         ],
         dtype=np.int32,
     )
-    right = np.array(
-        [
-            _iso_project(x + half_x, y + half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y - half_y, z - half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y - half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-        ],
-        dtype=np.int32,
-    )
-    left = np.array(
-        [
-            _iso_project(x - half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x - half_x, y - half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y - half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-            _iso_project(x + half_x, y + half_y, z + half_z, center_x=center_x, center_y=center_y, scale=scale),
-        ],
-        dtype=np.int32,
-    )
-    if callable(fill_poly):
-        fill_poly(canvas, top, _shade_color(color_bgr, 1.1))
-        fill_poly(canvas, left, _shade_color(color_bgr, 0.88))
-        fill_poly(canvas, right, _shade_color(color_bgr, 0.72))
-    elif callable(line):
-        x1, y1 = top.min(axis=0)
-        x2, y2 = top.max(axis=0)
-        _draw_rectangle(cv2, canvas, (int(x1), int(y1)), (int(x2), int(y2)), color_bgr, -1)
-    if callable(polylines):
-        polylines(canvas, [top, right, left], True, (16, 18, 22), 1)
-    cv2.putText(
-        canvas,
-        str(obj["label"]),
-        (int(top[0][0]) - 8, int(top[0][1]) - 6),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.38,
-        (235, 240, 250),
-        1,
-        cv2.LINE_AA,
-    )
+    colors = np.tile(np.asarray([[0.82, 0.90, 1.0]], dtype=np.float64), (lines.shape[0], 1))
+    return world_points, lines, colors
 
 
-def _draw_isometric_camera(cv2, canvas: np.ndarray, scenario_state, *, center_x: int, center_y: int, scale: float) -> None:
-    line = getattr(cv2, "line", None)
-    if not callable(line):
-        return
-    rig_x = float(getattr(scenario_state, "rig_x", 0.0))
-    rig_z = float(getattr(scenario_state, "rig_z", 0.0))
-    yaw_rad = math.radians(float(getattr(scenario_state, "yaw_deg", 0.0)))
-    camera_point = _iso_project(rig_x, 0.0, rig_z, center_x=center_x, center_y=center_y, scale=scale)
-    forward = _iso_project(
-        rig_x + (math.sin(yaw_rad) * 0.8),
-        0.0,
-        rig_z + (math.cos(yaw_rad) * 0.8),
-        center_x=center_x,
-        center_y=center_y,
-        scale=scale,
-    )
-    left = _iso_project(
-        rig_x + (math.sin(yaw_rad - 0.5) * 0.55),
-        0.0,
-        rig_z + (math.cos(yaw_rad - 0.5) * 0.55),
-        center_x=center_x,
-        center_y=center_y,
-        scale=scale,
-    )
-    right = _iso_project(
-        rig_x + (math.sin(yaw_rad + 0.5) * 0.55),
-        0.0,
-        rig_z + (math.cos(yaw_rad + 0.5) * 0.55),
-        center_x=center_x,
-        center_y=center_y,
-        scale=scale,
-    )
-    line(canvas, camera_point, forward, (255, 255, 255), 2)
-    line(canvas, camera_point, left, (180, 210, 255), 1)
-    line(canvas, camera_point, right, (180, 210, 255), 1)
+class Open3DEnvironmentViewer:
+    def __init__(
+        self,
+        window_name: str = "Environment Model",
+        o3d_module=None,
+        layout_primary_width: int = 640,
+        layout_primary_height: int = 360,
+    ) -> None:
+        if o3d_module is None:
+            try:
+                import open3d as o3d
+            except ImportError as exc:  # pragma: no cover - depends on local install.
+                raise RuntimeError("open3d is required to render the environment model") from exc
+        else:
+            o3d = o3d_module
+
+        self._o3d = o3d
+        self._vis = o3d.visualization.Visualizer()
+        window_left, window_top = runtime_window_position(
+            window_name,
+            primary_width=layout_primary_width,
+            primary_height=layout_primary_height,
+        )
+        try:
+            window_created = self._vis.create_window(
+                window_name=window_name,
+                width=960,
+                height=720,
+                left=window_left,
+                top=window_top,
+            )
+        except TypeError:
+            window_created = self._vis.create_window(window_name=window_name, width=960, height=720)
+        if not window_created:
+            raise RuntimeError("failed to create Open3D environment window")
+        self._room_mesh = o3d.geometry.TriangleMesh()
+        self._object_mesh = o3d.geometry.TriangleMesh()
+        self._camera_lines = o3d.geometry.LineSet()
+        self._preview_mesh_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._has_fitted_view = False
+        self._vis.add_geometry(self._room_mesh)
+        self._vis.add_geometry(self._object_mesh)
+        self._vis.add_geometry(self._camera_lines)
+        self._vis.poll_events()
+        self._vis.update_renderer()
+        render_option = self._vis.get_render_option()
+        if render_option is not None:
+            render_option.background_color = np.array([0.05, 0.05, 0.08], dtype=np.float64)
+            show_back_face = getattr(render_option, "mesh_show_back_face", None)
+            if show_back_face is not None:
+                render_option.mesh_show_back_face = True
+
+    def update(self, scenario_state, *_unused, **_unused_kwargs) -> bool:
+        room_width_m = float(getattr(scenario_state, "room_width_m", 0.0))
+        room_depth_m = float(getattr(scenario_state, "room_depth_m", 0.0))
+        room_height_m = float(getattr(scenario_state, "room_height_m", 0.0))
+        room_vertices, room_triangles, room_colors = _room_mesh_arrays(
+            room_width_m=max(room_width_m, 1.0),
+            room_depth_m=max(room_depth_m, 1.0),
+            room_height_m=max(room_height_m, 1.0),
+        )
+        self._room_mesh.vertices = self._o3d.utility.Vector3dVector(_display_points_for_view(room_vertices))
+        self._room_mesh.triangles = self._o3d.utility.Vector3iVector(room_triangles)
+        self._room_mesh.vertex_colors = self._o3d.utility.Vector3dVector(room_colors)
+        compute_room_normals = getattr(self._room_mesh, "compute_vertex_normals", None)
+        if callable(compute_room_normals):
+            compute_room_normals()
+        self._vis.update_geometry(self._room_mesh)
+
+        object_meshes = [
+            _object_mesh_arrays(
+                dict(obj),
+                o3d_module=self._o3d,
+                preview_mesh_cache=self._preview_mesh_cache,
+            )
+            for obj in tuple(getattr(scenario_state, "environment_objects", ()) or ())
+        ]
+        object_vertices, object_triangles, object_colors = _combine_triangle_meshes(object_meshes)
+        self._object_mesh.vertices = self._o3d.utility.Vector3dVector(_display_points_for_view(object_vertices))
+        self._object_mesh.triangles = self._o3d.utility.Vector3iVector(object_triangles)
+        self._object_mesh.vertex_colors = self._o3d.utility.Vector3dVector(object_colors)
+        compute_object_normals = getattr(self._object_mesh, "compute_vertex_normals", None)
+        if callable(compute_object_normals):
+            compute_object_normals()
+        self._vis.update_geometry(self._object_mesh)
+
+        camera_points, camera_lines, camera_colors = _camera_marker_lines(
+            rig_x=float(getattr(scenario_state, "rig_x", 0.0)),
+            rig_y=float(getattr(scenario_state, "rig_y", 1.6)),
+            rig_z=float(getattr(scenario_state, "rig_z", 0.0)),
+            yaw_deg=float(getattr(scenario_state, "yaw_deg", 0.0)),
+        )
+        self._camera_lines.points = self._o3d.utility.Vector3dVector(_display_points_for_view(camera_points))
+        self._camera_lines.lines = self._o3d.utility.Vector2iVector(camera_lines)
+        self._camera_lines.colors = self._o3d.utility.Vector3dVector(camera_colors)
+        self._vis.update_geometry(self._camera_lines)
+
+        if not self._has_fitted_view and (room_vertices.size > 0 or object_vertices.size > 0):
+            self._vis.reset_view_point(True)
+            self._has_fitted_view = True
+        is_active = self._vis.poll_events()
+        self._vis.update_renderer()
+        return bool(is_active)
+
+    def close(self) -> None:
+        destroy_window = getattr(self._vis, "destroy_window", None)
+        if callable(destroy_window):
+            destroy_window()
 
 
 class Open3DMeshViewer:
-    def __init__(self, window_name: str = "3D Reconstruction", o3d_module=None) -> None:
+    def __init__(
+        self,
+        window_name: str = "3D Reconstruction",
+        o3d_module=None,
+        layout_primary_width: int = 640,
+        layout_primary_height: int = 360,
+    ) -> None:
         if o3d_module is None:
             try:
                 import open3d as o3d
@@ -848,7 +1140,21 @@ class Open3DMeshViewer:
 
         self._o3d = o3d
         self._vis = o3d.visualization.Visualizer()
-        window_created = self._vis.create_window(window_name=window_name, width=960, height=720)
+        window_left, window_top = runtime_window_position(
+            window_name,
+            primary_width=layout_primary_width,
+            primary_height=layout_primary_height,
+        )
+        try:
+            window_created = self._vis.create_window(
+                window_name=window_name,
+                width=960,
+                height=720,
+                left=window_left,
+                top=window_top,
+            )
+        except TypeError:
+            window_created = self._vis.create_window(window_name=window_name, width=960, height=720)
         if not window_created:
             raise RuntimeError("failed to create Open3D window")
         self._mesh = o3d.geometry.TriangleMesh()

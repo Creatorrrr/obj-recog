@@ -1,0 +1,22 @@
+{
+  "asset_manifest_id": "92f6228c9108",
+  "difficulty_level": 1,
+  "dynamic_actor_count": 0,
+  "failure_reason": "aborted",
+  "fallback_count": 0,
+  "llm_goal_accept_rate": 0.0,
+  "mission_success": false,
+  "pose_error_vs_gt": 0.0,
+  "render_backend": "analytic",
+  "render_profile": "photoreal",
+  "scenario": "studio_open_v1",
+  "scenario_family": "studio",
+  "seed": 7,
+  "selfcal_converged": false,
+  "sim_perception_mode": "assisted",
+  "sim_profile": "lightweight",
+  "steps": 30,
+  "target_class": "backpack",
+  "time_to_first_valid_view": null,
+  "tracking_uptime": 1.0
+}

@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 def _load_worker_module():
@@ -58,6 +59,9 @@ def _scene_manifest_payload() -> dict[str, object]:
                 "size_xyz": [1.4, 0.8, 0.8],
                 "yaw_deg": 0.0,
                 "preview_sprite_path": "/tmp/desk.png",
+                "preview_mesh_path": "/tmp/desk.ply",
+                "asset_metadata_path": "/tmp/desk.json",
+                "asset_provenance": "external",
                 "blender_library_path": "/tmp/assets/libraries/furniture/desk_basic.blend",
                 "blender_object_name": "DeskBasic",
                 "recommended_scale": 1.0,
@@ -76,6 +80,9 @@ def _scene_manifest_payload() -> dict[str, object]:
                 "size_xyz": [0.6, 1.8, 0.6],
                 "yaw_deg": 0.0,
                 "preview_sprite_path": "/tmp/person.png",
+                "preview_mesh_path": "/tmp/person.ply",
+                "asset_metadata_path": "/tmp/person.json",
+                "asset_provenance": "external",
                 "blender_library_path": "/tmp/assets/libraries/character/person_walker.blend",
                 "blender_object_name": "PersonWalker",
                 "recommended_scale": 1.0,
@@ -94,6 +101,9 @@ def _scene_manifest_payload() -> dict[str, object]:
                 "size_xyz": [0.45, 0.55, 0.3],
                 "yaw_deg": 0.0,
                 "preview_sprite_path": "/tmp/backpack.png",
+                "preview_mesh_path": "/tmp/backpack.ply",
+                "asset_metadata_path": "/tmp/backpack.json",
+                "asset_provenance": "external",
                 "blender_library_path": "/tmp/assets/libraries/prop/backpack_canvas.blend",
                 "blender_object_name": "BackpackCanvas",
                 "recommended_scale": 1.0,
@@ -220,3 +230,21 @@ def test_realtime_worker_parse_config_uses_args_after_double_dash() -> None:
     assert str(config.render_root).endswith("/tmp/render-root")
     assert str(config.asset_cache_dir).endswith("/tmp/assets")
     assert config.quality == "high"
+
+
+def test_realtime_worker_strict_external_assets_rejects_python_fallback(tmp_path: Path) -> None:
+    module = _load_worker_module()
+    payload = _scene_manifest_payload()
+    payload["require_external_assets"] = True
+    manifest_path = tmp_path / "scene.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    config = module.WorkerConfig(
+        scene_manifest_path=manifest_path,
+        render_root=tmp_path / "render-root",
+        asset_cache_dir=tmp_path / "assets",
+        quality="low",
+    )
+    scene_manifest = module.load_scene_manifest(config.scene_manifest_path)
+
+    with pytest.raises(RuntimeError, match="Python fallback is disabled"):
+        module.create_worker_runtime(config, scene_manifest, force_python_fallback=True)

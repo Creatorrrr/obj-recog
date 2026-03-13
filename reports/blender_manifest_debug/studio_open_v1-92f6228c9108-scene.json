@@ -1,0 +1,126 @@
+{
+  "asset_manifest_id": "92f6228c9108",
+  "camera_rig": {
+    "far_plane_m": 8.0,
+    "fps": 10.0,
+    "horizontal_fov_deg": 72.0,
+    "image_height": 360,
+    "image_width": 640,
+    "near_plane_m": 0.2
+  },
+  "difficulty_level": 1,
+  "environment": {
+    "room_depth_m": 8.0,
+    "room_height_m": 3.0,
+    "room_width_m": 6.0
+  },
+  "placements": [
+    {
+      "asset_family": "furniture",
+      "asset_id": "desk_basic",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/furniture/desk_basic.blend",
+      "blender_object_name": "DeskBasic",
+      "center_world": [
+        0.0,
+        0.45,
+        3.1
+      ],
+      "lod_hint": "low",
+      "material_variant": "furniture-desk",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/desk_basic.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "desk",
+      "size_xyz": [
+        1.5,
+        0.9,
+        0.8
+      ],
+      "source_key": "static-0",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 221.11
+    },
+    {
+      "asset_family": "furniture",
+      "asset_id": "chair_modern",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/furniture/chair_modern.blend",
+      "blender_object_name": "ChairModern",
+      "center_world": [
+        -1.1,
+        0.55,
+        4.4
+      ],
+      "lod_hint": "low",
+      "material_variant": "furniture-chair",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/chair_modern.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "chair",
+      "size_xyz": [
+        0.7,
+        1.1,
+        0.7
+      ],
+      "source_key": "static-1",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 239.03
+    },
+    {
+      "asset_family": "decor",
+      "asset_id": "plant_potted",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/decor/plant_potted.blend",
+      "blender_object_name": "PlantPotted",
+      "center_world": [
+        1.8,
+        0.7,
+        4.8
+      ],
+      "lod_hint": "low",
+      "material_variant": "decor-plant",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/plant_potted.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "potted plant",
+      "size_xyz": [
+        0.6,
+        1.4,
+        0.6
+      ],
+      "source_key": "static-2",
+      "source_kind": "static",
+      "target_role": false,
+      "yaw_deg": 54.83
+    },
+    {
+      "asset_family": "prop",
+      "asset_id": "backpack_canvas",
+      "blender_library_path": "/Users/chasoik/.cache/obj-recog/assets/libraries/prop/backpack_canvas.blend",
+      "blender_object_name": "BackpackCanvas",
+      "center_world": [
+        1.5,
+        0.45,
+        5.4
+      ],
+      "lod_hint": "low",
+      "material_variant": "prop-backpack",
+      "preview_sprite_path": "/Users/chasoik/.cache/obj-recog/assets/preview_sprites/low/backpack_canvas.png",
+      "recommended_scale": 1.0,
+      "render_representation": "mesh",
+      "semantic_class": "backpack",
+      "size_xyz": [
+        0.8,
+        0.9,
+        0.8
+      ],
+      "source_key": "static-3",
+      "source_kind": "static",
+      "target_role": true,
+      "yaw_deg": 199.37
+    }
+  ],
+  "scenario_family": "studio",
+  "scene_id": "studio_open_v1",
+  "semantic_target_class": "backpack"
+}
