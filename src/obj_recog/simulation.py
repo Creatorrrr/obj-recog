@@ -8,6 +8,7 @@ from typing import Protocol
 
 import numpy as np
 
+from obj_recog.blend_scene_loader import load_blend_scene_manifest
 from obj_recog.blender_worker import (
     BlenderFrameRequest,
     BlenderSceneBuildRequest,
@@ -29,10 +30,15 @@ from obj_recog.sim_protocol import (
     RobotPose,
     SensorFrame,
 )
-from obj_recog.sim_scene import build_living_room_scene_spec, pose_distance_to_goal
+from obj_recog.sim_scene import build_interior_test_tv_scene_spec, build_living_room_scene_spec, pose_distance_to_goal
 
 
-SCENARIO_SPECS = {"living_room_navigation_v1": build_living_room_scene_spec()}
+SCENARIO_SPECS = {
+    "living_room_navigation_v1": build_living_room_scene_spec(),
+    "interior_test_tv_navigation_v1": build_interior_test_tv_scene_spec(),
+}
+
+_ROBOT_COLLISION_RADIUS_M = 0.22
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +143,7 @@ class LivingRoomEpisodeRunner:
         camera_rig: CameraRigSpec | None = None,
     ) -> None:
         self._config = config
-        self._scene_spec = scene_spec or build_living_room_scene_spec()
+        self._scene_spec = scene_spec or SCENARIO_SPECS.get(str(config.scenario), build_living_room_scene_spec())
         self._camera_rig = camera_rig or CameraRigSpec.from_config(config)
         self._planner = planner
         self._sensor_backend = sensor_backend
@@ -220,6 +226,7 @@ class LivingRoomEpisodeRunner:
                 scene_spec=self._scene_spec,
                 robot_pose=self._state.robot_pose,
                 phase=self._state.phase,
+                semantic_target_class=self._scene_spec.semantic_target_class,
             ),
             planner_context=self._latest_planner_context,
             calibration_source="self_calibration/converged"
@@ -276,6 +283,7 @@ class LivingRoomEpisodeRunner:
         context = build_planner_context(
             phase=self._state.phase,
             frame_index=self._state.frame_index,
+            goal_description=self._scene_spec.goal_description,
             detections=list(getattr(artifacts, "detections", []) or []),
             scene_graph_snapshot=getattr(artifacts, "scene_graph_snapshot", None),
             reconstruction_summary={
@@ -364,14 +372,19 @@ class LivingRoomEpisodeRunner:
         yaw_deg = float(pose.yaw_deg)
         camera_pan_deg = float(pose.camera_pan_deg)
 
-        if step.primitive == ActionPrimitive.MOVE_FORWARD:
-            z += float(step.value)
-        elif step.primitive == ActionPrimitive.MOVE_BACKWARD:
-            z -= float(step.value)
-        elif step.primitive == ActionPrimitive.STRAFE_LEFT:
-            x -= float(step.value)
-        elif step.primitive == ActionPrimitive.STRAFE_RIGHT:
-            x += float(step.value)
+        if step.primitive in {
+            ActionPrimitive.MOVE_FORWARD,
+            ActionPrimitive.MOVE_BACKWARD,
+            ActionPrimitive.STRAFE_LEFT,
+            ActionPrimitive.STRAFE_RIGHT,
+        }:
+            x, z = self._translated_ground_position(
+                x=x,
+                z=z,
+                yaw_deg=yaw_deg,
+                primitive=step.primitive,
+                distance_m=float(step.value),
+            )
         elif step.primitive == ActionPrimitive.TURN_LEFT:
             yaw_deg += float(step.value)
         elif step.primitive == ActionPrimitive.TURN_RIGHT:
@@ -381,12 +394,87 @@ class LivingRoomEpisodeRunner:
         elif step.primitive == ActionPrimitive.CAMERA_PAN_RIGHT:
             camera_pan_deg -= float(step.value)
 
-        self._state.robot_pose = RobotPose(
+        candidate_pose = RobotPose(
             x=x,
             y=y,
             z=z,
             yaw_deg=yaw_deg,
             camera_pan_deg=max(-60.0, min(60.0, camera_pan_deg)),
+        )
+        if step.primitive in {
+            ActionPrimitive.MOVE_FORWARD,
+            ActionPrimitive.MOVE_BACKWARD,
+            ActionPrimitive.STRAFE_LEFT,
+            ActionPrimitive.STRAFE_RIGHT,
+        } and self._pose_collides(candidate_pose):
+            return
+        self._state.robot_pose = candidate_pose
+
+    def _translated_ground_position(
+        self,
+        *,
+        x: float,
+        z: float,
+        yaw_deg: float,
+        primitive: ActionPrimitive,
+        distance_m: float,
+    ) -> tuple[float, float]:
+        yaw_rad = math.radians(float(yaw_deg))
+        forward_x = math.sin(yaw_rad)
+        forward_z = math.cos(yaw_rad)
+        right_x = math.cos(yaw_rad)
+        right_z = -math.sin(yaw_rad)
+        if primitive == ActionPrimitive.MOVE_FORWARD:
+            return x + (forward_x * distance_m), z + (forward_z * distance_m)
+        if primitive == ActionPrimitive.MOVE_BACKWARD:
+            return x - (forward_x * distance_m), z - (forward_z * distance_m)
+        if primitive == ActionPrimitive.STRAFE_LEFT:
+            return x - (right_x * distance_m), z - (right_z * distance_m)
+        if primitive == ActionPrimitive.STRAFE_RIGHT:
+            return x + (right_x * distance_m), z + (right_z * distance_m)
+        return x, z
+
+    def _pose_collides(self, pose: RobotPose) -> bool:
+        half_width = max((float(self._scene_spec.room_size_xyz[0]) * 0.5) - _ROBOT_COLLISION_RADIUS_M, 0.1)
+        half_depth = max((float(self._scene_spec.room_size_xyz[2]) * 0.5) - _ROBOT_COLLISION_RADIUS_M, 0.1)
+        if abs(float(pose.x)) > half_width or abs(float(pose.z)) > half_depth:
+            return True
+
+        pose_x = float(pose.x)
+        pose_z = float(pose.z)
+        for item in self._scene_spec.objects:
+            if not bool(item.collider):
+                continue
+            local_x, local_z = self._object_local_ground_position(
+                pose_x=pose_x,
+                pose_z=pose_z,
+                object_center_x=float(item.center_xyz[0]),
+                object_center_z=float(item.center_xyz[2]),
+                object_yaw_deg=float(item.yaw_deg),
+            )
+            half_x = (float(item.size_xyz[0]) * 0.5) + _ROBOT_COLLISION_RADIUS_M
+            half_z = (float(item.size_xyz[2]) * 0.5) + _ROBOT_COLLISION_RADIUS_M
+            if abs(local_x) <= half_x and abs(local_z) <= half_z:
+                return True
+        return False
+
+    @staticmethod
+    def _object_local_ground_position(
+        *,
+        pose_x: float,
+        pose_z: float,
+        object_center_x: float,
+        object_center_z: float,
+        object_yaw_deg: float,
+    ) -> tuple[float, float]:
+        rel_x = pose_x - object_center_x
+        rel_z = pose_z - object_center_z
+        yaw_rad = math.radians(float(object_yaw_deg))
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+        return (
+            (rel_x * cos_yaw) - (rel_z * sin_yaw),
+            (rel_x * sin_yaw) + (rel_z * cos_yaw),
         )
 
     def _write_selfcalibration_artifact(self) -> None:
@@ -473,6 +561,7 @@ class LivingRoomSimulationRuntime:
 
     def create_frame_source(self) -> LivingRoomEpisodeRunner:
         camera_rig = CameraRigSpec.from_config(self.config)
+        scene_spec = _resolve_scene_spec(self.config)
         planner = self.planner or OpenAILivingRoomPlanner(
             model=self.config.sim_planner_model,
             timeout_sec=self.config.sim_planner_timeout_sec,
@@ -484,6 +573,7 @@ class LivingRoomSimulationRuntime:
                 config=self.config,
                 camera_rig=camera_rig,
                 report_path=self.report_path,
+                scene_spec=scene_spec,
                 worker_client_factory=self.blender_worker_client_factory,
             )
         )
@@ -492,6 +582,7 @@ class LivingRoomSimulationRuntime:
             report_path=self.report_path,
             planner=planner,
             sensor_backend=sensor_backend,
+            scene_spec=scene_spec,
             camera_rig=camera_rig,
         )
 
@@ -504,6 +595,7 @@ def _build_blender_sensor_backend(
     config: AppConfig,
     camera_rig: CameraRigSpec,
     report_path: str | Path,
+    scene_spec,
     worker_client_factory=None,
 ) -> BlenderLivingRoomSensorBackend:
     if not config.blender_exec:
@@ -511,7 +603,7 @@ def _build_blender_sensor_backend(
     worker_client = (
         worker_client_factory(config=config, camera_rig=camera_rig)
         if worker_client_factory is not None
-        else _default_blender_worker_client(config=config, report_path=report_path)
+        else _default_blender_worker_client(config=config, report_path=report_path, scene_spec=scene_spec)
     )
     return BlenderLivingRoomSensorBackend(
         config=config,
@@ -520,14 +612,29 @@ def _build_blender_sensor_backend(
     )
 
 
-def _default_blender_worker_client(*, config: AppConfig, report_path: str | Path) -> BlenderWorkerClient:
+def _default_blender_worker_client(*, config: AppConfig, report_path: str | Path, scene_spec) -> BlenderWorkerClient:
     repo_root = Path(__file__).resolve().parents[2]
     command = build_realtime_blender_worker_command(
         blender_exec=str(config.blender_exec),
         repo_root=repo_root,
         output_root=Path(report_path).parent,
+        blend_file=scene_spec.blend_file_path,
     )
     return BlenderWorkerClient(command=command)
+
+
+def _resolve_scene_spec(config: AppConfig):
+    scenario_id = str(config.scenario)
+    base_scene = SCENARIO_SPECS.get(scenario_id, build_living_room_scene_spec())
+    if scenario_id != "interior_test_tv_navigation_v1":
+        return base_scene
+    if not base_scene.blend_file_path or not config.blender_exec:
+        return base_scene
+    manifest = load_blend_scene_manifest(
+        blend_file_path=base_scene.blend_file_path,
+        blender_exec=str(config.blender_exec),
+    )
+    return build_interior_test_tv_scene_spec(manifest)
 
 
 def _pose_matrix(pose: RobotPose) -> np.ndarray:

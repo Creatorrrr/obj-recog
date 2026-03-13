@@ -10,6 +10,7 @@ import sys
 import pytest
 import numpy as np
 
+from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.sim_scene import build_living_room_scene_spec, build_scene_mesh_components
 
 
@@ -61,7 +62,50 @@ def _scene_payload(scene) -> dict[str, object]:
             }
             for light in scene.lights
         ],
+        "blend_file_path": scene.blend_file_path,
+        "goal_description": scene.goal_description,
+        "semantic_target_class": scene.semantic_target_class,
     }
+
+
+def _interior_scene():
+    from obj_recog.sim_scene import build_interior_test_tv_scene_spec
+
+    manifest = BlendSceneManifest(
+        blend_file_path="/Users/chasoik/Downloads/InteriorTest.blend",
+        room_size_xyz=(5.0, 3.0, 8.0),
+        objects=(
+            BlendSceneObject(
+                object_id="Floor",
+                object_type="MESH",
+                semantic_label="floor",
+                center_xyz=(0.0, 0.0, 0.0),
+                size_xyz=(5.0, 0.01, 8.0),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [[-2.5, 0.0, -4.0], [2.5, 0.0, -4.0], [2.5, 0.0, 4.0], [-2.5, 0.0, 4.0]],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=True,
+            ),
+            BlendSceneObject(
+                object_id="TV",
+                object_type="MESH",
+                semantic_label="tv",
+                center_xyz=(0.0, 1.3221, 3.9260),
+                size_xyz=(1.5, 0.8, 0.05),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [[-0.75, 0.9, 3.90], [0.75, 0.9, 3.90], [0.75, 1.7, 3.95], [-0.75, 1.7, 3.95]],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=False,
+            ),
+        ),
+    )
+    return build_interior_test_tv_scene_spec(manifest)
 
 
 def test_realtime_worker_python_runtime_handles_build_then_render(tmp_path: Path) -> None:
@@ -299,6 +343,69 @@ def test_realtime_worker_camera_pan_changes_rendered_view(tmp_path: Path) -> Non
     right_rgb = np.load(right_response["rgb_path"])
 
     assert not np.array_equal(left_rgb, right_rgb)
+
+
+def test_realtime_worker_build_scene_uses_authored_objects_without_procedural_room_shell(tmp_path: Path) -> None:
+    module = _load_worker_module()
+    runtime = module.create_worker_runtime(output_root=tmp_path, force_python_fallback=True)
+    scene = _interior_scene()
+
+    runtime.process_request(
+        {
+            "kind": "build_scene",
+            "scene_spec": _scene_payload(scene),
+            "image_width": 64,
+            "image_height": 48,
+            "horizontal_fov_deg": 72.0,
+            "near_plane_m": 0.2,
+            "far_plane_m": 8.0,
+        }
+    )
+
+    primitive_ids = {primitive.primitive_id for primitive in runtime._primitives}
+
+    assert "Floor" in primitive_ids
+    assert "TV" in primitive_ids
+    assert "wall_left" not in primitive_ids
+
+
+def test_realtime_worker_renders_nonempty_authored_scene_from_box_proxies(tmp_path: Path) -> None:
+    module = _load_worker_module()
+    runtime = module.create_worker_runtime(output_root=tmp_path, force_python_fallback=True)
+    scene = _interior_scene()
+
+    runtime.process_request(
+        {
+            "kind": "build_scene",
+            "scene_spec": _scene_payload(scene),
+            "image_width": 64,
+            "image_height": 48,
+            "horizontal_fov_deg": 72.0,
+            "near_plane_m": 0.2,
+            "far_plane_m": 8.0,
+        }
+    )
+    response = runtime.process_request(
+        {
+            "kind": "render_frame",
+            "frame_index": 0,
+            "timestamp_sec": 0.0,
+            "robot_pose": {
+                "x": scene.start_pose.x,
+                "y": scene.start_pose.y,
+                "z": scene.start_pose.z,
+                "yaw_deg": scene.start_pose.yaw_deg,
+                "camera_pan_deg": scene.start_pose.camera_pan_deg,
+            },
+            "camera_pose_world": np.eye(4, dtype=np.float32).tolist(),
+        }
+    )
+
+    rgb = np.load(response["rgb_path"])
+    semantic = np.load(response["semantic_mask_path"])
+
+    assert float(rgb.std()) > 1.0
+    assert int((semantic > 0).sum()) > 0
 
 
 def test_realtime_worker_glass_tints_rgb_but_keeps_opaque_depth_and_semantics(tmp_path: Path) -> None:

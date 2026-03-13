@@ -400,6 +400,14 @@ def _coerce_scene_spec(scene_spec_obj: dict[str, object]) -> LivingRoomSceneSpec
         hidden_goal_pose_xyz=hidden_goal_pose_xyz,
         objects=objects,
         lights=lights,
+        blend_file_path=None if scene_spec_obj.get("blend_file_path") in (None, "") else str(scene_spec_obj.get("blend_file_path")),
+        goal_description=str(
+            scene_spec_obj.get(
+                "goal_description",
+                "Reach the front position of the dining table using only current visible evidence.",
+            )
+        ),
+        semantic_target_class=str(scene_spec_obj.get("semantic_target_class", "dining_table")),
     )
 
 
@@ -538,6 +546,23 @@ def _build_primitives_from_components(scene_spec: LivingRoomSceneSpec) -> tuple[
             )
         )
         next_instance_id += 1
+
+    if scene_spec.blend_file_path:
+        for item in scene_spec.objects:
+            local_to_world = _rotation_y_matrix(float(item.yaw_deg))
+            add_primitive(
+                primitive_id=str(item.object_id),
+                semantic_label=str(item.semantic_label),
+                center_xyz=tuple(float(value) for value in item.center_xyz),
+                half_size_xyz=np.clip(
+                    np.asarray(item.size_xyz, dtype=np.float32).reshape(3) * 0.5,
+                    0.01,
+                    None,
+                ),
+                material_key=str(item.material_key),
+                rotation_world_to_local=local_to_world.T,
+            )
+        return tuple(primitives)
 
     for component in build_scene_mesh_components(scene_spec):
         center_xyz, half_size_xyz, rotation_world_to_local = _extract_box_component(component)

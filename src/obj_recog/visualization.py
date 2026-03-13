@@ -868,6 +868,18 @@ def _colored_mesh(
     )
 
 
+def _translated_colored_primitive_mesh(
+    primitive_type: str,
+    dimensions_xyz: tuple[float, float, float],
+    center_xyz: tuple[float, float, float],
+    *,
+    color_rgb: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vertices_xyz, triangles = _primitive_mesh_arrays(primitive_type, dimensions_xyz)
+    translated_vertices = vertices_xyz + np.asarray(center_xyz, dtype=np.float64).reshape(1, 3)
+    return _colored_mesh(translated_vertices, triangles, color_rgb=color_rgb)
+
+
 def _object_mesh_arrays(
     obj: dict[str, object],
     *,
@@ -984,6 +996,64 @@ def _room_mesh_arrays(
     return _combine_triangle_meshes(room_meshes)
 
 
+def _outdoor_backdrop_meshes_for_scene(scene_spec) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    room_width, room_height, room_depth = (
+        float(scene_spec.room_size_xyz[0]),
+        float(scene_spec.room_size_xyz[1]),
+        float(scene_spec.room_size_xyz[2]),
+    )
+    half_depth = room_depth * 0.5
+    backdrop_z = half_depth + 0.72
+    sky_width = room_width * 1.35
+    sky_depth = 0.04
+
+    backdrop_meshes = [
+        _translated_colored_primitive_mesh(
+            "BOX",
+            (sky_width, room_height * 0.85, sky_depth),
+            (0.0, room_height * 0.98, backdrop_z),
+            color_rgb=(0.62, 0.80, 0.96),
+        ),
+        _translated_colored_primitive_mesh(
+            "BOX",
+            (sky_width, room_height * 0.45, sky_depth),
+            (0.0, room_height * 0.48, backdrop_z - 0.01),
+            color_rgb=(0.83, 0.92, 0.99),
+        ),
+        _translated_colored_primitive_mesh(
+            "BOX",
+            (sky_width, 0.95, sky_depth),
+            (0.0, 0.18, backdrop_z - 0.02),
+            color_rgb=(0.32, 0.58, 0.28),
+        ),
+    ]
+
+    tree_layout = (
+        (-2.25, 1.55, 1.25, 1.10, 0.28),
+        (-0.65, 1.72, 1.45, 1.25, 0.30),
+        (1.35, 1.62, 1.30, 1.15, 0.28),
+        (2.55, 1.48, 1.10, 1.00, 0.26),
+    )
+    for tree_x, canopy_y, canopy_w, canopy_h, canopy_d in tree_layout:
+        backdrop_meshes.append(
+            _translated_colored_primitive_mesh(
+                "UV_SPHERE",
+                (canopy_w, canopy_h, canopy_d),
+                (tree_x, canopy_y, backdrop_z - 0.08),
+                color_rgb=(0.22, 0.42, 0.18),
+            )
+        )
+        backdrop_meshes.append(
+            _translated_colored_primitive_mesh(
+                "BOX",
+                (0.14, canopy_y - 0.28, 0.10),
+                (tree_x, (canopy_y - 0.28) * 0.5, backdrop_z - 0.08),
+                color_rgb=(0.38, 0.24, 0.12),
+            )
+        )
+    return backdrop_meshes
+
+
 def _camera_marker_lines(
     *,
     rig_x: float,
@@ -1089,7 +1159,8 @@ class Open3DEnvironmentViewer:
                 for component in scene_components
                 if component.semantic_label not in {"floor", "wall", "window_frame", "ceiling", "glass"}
             ]
-            room_vertices, room_triangles, room_colors = _combine_triangle_meshes(room_component_meshes)
+            backdrop_meshes = [] if getattr(scene_spec, "blend_file_path", None) else _outdoor_backdrop_meshes_for_scene(scene_spec)
+            room_vertices, room_triangles, room_colors = _combine_triangle_meshes(room_component_meshes + backdrop_meshes)
             object_vertices, object_triangles, object_colors = _combine_triangle_meshes(object_component_meshes)
             rig_x = float(getattr(robot_pose, "x", 0.0))
             rig_y = float(getattr(robot_pose, "y", 1.25))

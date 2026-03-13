@@ -5,9 +5,10 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
+from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import EpisodePhase, OperatorSceneState
-from obj_recog.sim_scene import build_living_room_scene_spec, build_scene_mesh_components
+from obj_recog.sim_scene import build_interior_test_tv_scene_spec, build_living_room_scene_spec, build_scene_mesh_components
 from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
@@ -1160,7 +1161,7 @@ def test_environment_viewer_includes_window_frame_in_structural_room_mesh_for_sc
         )
     )
 
-    assert viewer._room_mesh.vertices.data.shape[0] == expected_room_vertices
+    assert viewer._room_mesh.vertices.data.shape[0] >= expected_room_vertices
     assert viewer._object_mesh.vertices.data.shape[0] == expected_object_vertices
 
 
@@ -1189,6 +1190,99 @@ def test_environment_viewer_excludes_glass_from_solid_mesh_for_scene_spec() -> N
 
     assert glass_vertices > 0
     assert viewer._object_mesh.vertices.data.shape[0] == solid_object_vertices
+
+
+def test_environment_viewer_adds_natural_backdrop_geometry_for_scene_spec() -> None:
+    scene = build_living_room_scene_spec()
+    components = build_scene_mesh_components(scene)
+    structural_room_vertices = sum(
+        int(component.vertices_xyz.shape[0])
+        for component in components
+        if component.semantic_label in {"floor", "wall", "ceiling", "window_frame"}
+    )
+
+    viewer = Open3DEnvironmentViewer(o3d_module=_FakeO3D())
+    viewer.update(
+        OperatorSceneState(
+            scene_spec=scene,
+            robot_pose=scene.start_pose,
+            phase=EpisodePhase.SELF_CALIBRATING,
+        )
+    )
+
+    assert viewer._room_mesh.vertices.data.shape[0] > structural_room_vertices
+
+
+def test_environment_viewer_backdrop_uses_sky_grass_and_tree_palette_for_scene_spec() -> None:
+    scene = build_living_room_scene_spec()
+    viewer = Open3DEnvironmentViewer(o3d_module=_FakeO3D())
+    viewer.update(
+        OperatorSceneState(
+            scene_spec=scene,
+            robot_pose=scene.start_pose,
+            phase=EpisodePhase.SELF_CALIBRATING,
+        )
+    )
+
+    colors = np.asarray(viewer._room_mesh.vertex_colors.data, dtype=np.float64).reshape(-1, 3)
+
+    def has_color(target_rgb: tuple[float, float, float]) -> bool:
+        target = np.asarray(target_rgb, dtype=np.float64).reshape(1, 3)
+        return bool(np.any(np.all(np.isclose(colors, target, atol=1e-3), axis=1)))
+
+    assert has_color((0.83, 0.92, 0.99))
+    assert has_color((0.32, 0.58, 0.28))
+    assert has_color((0.22, 0.42, 0.18))
+
+
+def test_environment_viewer_skips_synthetic_backdrop_for_authored_scene_spec() -> None:
+    fake_o3d = _FakeO3D()
+    viewer = Open3DEnvironmentViewer(o3d_module=fake_o3d)
+    manifest = BlendSceneManifest(
+        blend_file_path="/Users/chasoik/Downloads/InteriorTest.blend",
+        room_size_xyz=(5.0, 3.0, 8.0),
+        objects=(
+            BlendSceneObject(
+                object_id="Floor",
+                object_type="MESH",
+                semantic_label="floor",
+                center_xyz=(0.0, 0.0, 0.0),
+                size_xyz=(5.0, 0.01, 8.0),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [[-2.5, 0.0, -4.0], [2.5, 0.0, -4.0], [2.5, 0.0, 4.0], [-2.5, 0.0, 4.0]],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=False,
+            ),
+            BlendSceneObject(
+                object_id="Wall.001",
+                object_type="MESH",
+                semantic_label="wall",
+                center_xyz=(0.0, 1.25, 3.95),
+                size_xyz=(5.0, 2.5, 0.1),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [[-2.5, 0.0, 3.9], [2.5, 0.0, 3.9], [2.5, 2.5, 4.0], [-2.5, 2.5, 4.0]],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=True,
+            ),
+        ),
+    )
+    scene = build_interior_test_tv_scene_spec(manifest)
+
+    viewer.update(
+        OperatorSceneState(
+            scene_spec=scene,
+            robot_pose=scene.start_pose,
+            phase=EpisodePhase.SELF_CALIBRATING,
+        )
+    )
+
+    assert viewer._room_mesh.vertices.data.shape[0] == 8
 
 
 def test_environment_viewer_keeps_floor_below_ceiling_in_display_coordinates() -> None:

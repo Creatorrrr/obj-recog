@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 
 import numpy as np
 
+from obj_recog.blend_scene_loader import DEFAULT_INTERIOR_TEST_BLEND_FILE, BlendSceneManifest, tv_front_goal_from_manifest
 from obj_recog.sim_materials import material_color_rgb
 from obj_recog.sim_protocol import LivingRoomLightSpec, LivingRoomObjectSpec, LivingRoomSceneSpec, RobotPose
 
@@ -138,10 +140,58 @@ def build_living_room_scene_spec() -> LivingRoomSceneSpec:
         hidden_goal_pose_xyz=(dining_table_center[0], 1.25, near_edge_z - 0.75),
         objects=objects,
         lights=lights,
+        goal_description="Reach the front position of the dining table using only current visible evidence.",
+        semantic_target_class="dining_table",
+    )
+
+
+def build_interior_test_tv_scene_spec(manifest: BlendSceneManifest | None = None) -> LivingRoomSceneSpec:
+    resolved_manifest = manifest
+    if resolved_manifest is None:
+        resolved_manifest = BlendSceneManifest(
+            blend_file_path=DEFAULT_INTERIOR_TEST_BLEND_FILE,
+            room_size_xyz=(5.0, 3.0, 8.0),
+            objects=(),
+        )
+    hidden_goal_pose_xyz = (
+        tv_front_goal_from_manifest(resolved_manifest, tv_object_id="TV", offset_m=0.8)
+        if any(item.object_id == "TV" for item in resolved_manifest.objects)
+        else (0.0, 1.25, 3.1260)
+    )
+    room_width, room_height, room_depth = (float(value) for value in resolved_manifest.room_size_xyz)
+    return LivingRoomSceneSpec(
+        scene_id="interior_test_tv_navigation_v1",
+        room_size_xyz=(room_width, room_height, room_depth),
+        wall_thickness_m=0.05,
+        window_wall="authored",
+        start_pose=RobotPose(x=0.0, y=1.25, z=-2.8, yaw_deg=0.0, camera_pan_deg=0.0),
+        hidden_goal_pose_xyz=hidden_goal_pose_xyz,
+        objects=tuple(_manifest_object_to_scene_object(item) for item in resolved_manifest.objects),
+        lights=(),
+        blend_file_path=str(Path(resolved_manifest.blend_file_path)),
+        goal_description="Reach the front position of the TV using only current visible evidence.",
+        semantic_target_class="tv",
+        scene_metadata={"blend_manifest": resolved_manifest},
     )
 
 
 def build_scene_mesh_components(scene: LivingRoomSceneSpec) -> tuple[SceneMeshComponent, ...]:
+    blend_manifest = scene.scene_metadata.get("blend_manifest")
+    if isinstance(blend_manifest, BlendSceneManifest) and blend_manifest.objects:
+        return _build_authored_scene_mesh_components(blend_manifest)
+    if scene.blend_file_path:
+        return tuple(
+            _make_box_component(
+                item.object_id,
+                item.semantic_label,
+                center_xyz=item.center_xyz,
+                size_xyz=item.size_xyz,
+                material_key=item.material_key,
+                yaw_deg=item.yaw_deg,
+            )
+            for item in scene.objects
+        )
+
     room_width, room_height, room_depth = scene.room_size_xyz
     wall_thickness = scene.wall_thickness_m
     half_w = room_width * 0.5
@@ -243,10 +293,69 @@ def build_scene_mesh_components(scene: LivingRoomSceneSpec) -> tuple[SceneMeshCo
     return tuple(components)
 
 
+def _build_authored_scene_mesh_components(manifest: BlendSceneManifest) -> tuple[SceneMeshComponent, ...]:
+    components: list[SceneMeshComponent] = []
+    for item in manifest.objects:
+        if item.vertices_xyz.size == 0 or item.triangles.size == 0:
+            components.append(
+                _make_box_component(
+                    item.object_id,
+                    item.semantic_label,
+                    center_xyz=item.center_xyz,
+                    size_xyz=item.size_xyz,
+                    material_key=_material_key_for_semantic_label(item.semantic_label),
+                    yaw_deg=item.yaw_deg,
+                )
+            )
+            continue
+        color_rgb = np.asarray(material_color_rgb(_material_key_for_semantic_label(item.semantic_label)), dtype=np.float32)
+        vertex_colors = np.tile(color_rgb.reshape(1, 3), (item.vertices_xyz.shape[0], 1))
+        components.append(
+            SceneMeshComponent(
+                component_id=item.object_id,
+                semantic_label=item.semantic_label,
+                material_key=_material_key_for_semantic_label(item.semantic_label),
+                vertices_xyz=np.asarray(item.vertices_xyz, dtype=np.float32).reshape((-1, 3)),
+                triangles=np.asarray(item.triangles, dtype=np.int32).reshape((-1, 3)),
+                vertex_colors=vertex_colors,
+            )
+        )
+    return tuple(components)
+
+
 def pose_distance_to_goal(scene: LivingRoomSceneSpec, pose: RobotPose) -> float:
     goal = np.asarray(scene.hidden_goal_pose_xyz, dtype=np.float32)
     robot = np.asarray((pose.x, pose.y, pose.z), dtype=np.float32)
     return float(np.linalg.norm(goal - robot))
+
+
+def _manifest_object_to_scene_object(item) -> LivingRoomObjectSpec:
+    return LivingRoomObjectSpec(
+        object_id=str(item.object_id),
+        semantic_label=str(item.semantic_label),
+        center_xyz=tuple(float(value) for value in item.center_xyz),
+        size_xyz=tuple(max(float(value), 1e-3) for value in item.size_xyz),
+        yaw_deg=float(item.yaw_deg),
+        material_key=_material_key_for_semantic_label(str(item.semantic_label)),
+        collider=bool(item.collider),
+    )
+
+
+def _material_key_for_semantic_label(semantic_label: str) -> str:
+    normalized = str(semantic_label).lower()
+    if normalized == "floor":
+        return "wood_floor"
+    if normalized in {"wall", "window_frame"}:
+        return "painted_wall"
+    if normalized in {"ceiling", "plafon"}:
+        return "matte_ceiling"
+    if normalized in {"tv", "tv_panel"}:
+        return "tv_panel"
+    if normalized in {"table", "meja", "coffee_table", "dining_table"}:
+        return "wood_table"
+    if normalized in {"chair", "bangku", "dining_chair"}:
+        return "chair_wood"
+    return "painted_wall"
 
 
 def _build_sofa_components(item: LivingRoomObjectSpec) -> tuple[SceneMeshComponent, ...]:

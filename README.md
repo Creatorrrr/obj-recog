@@ -48,12 +48,16 @@ Useful runtime controls:
 - `Situation Explanation` appears in a separate OpenCV window.
 - `Environment Model` is a separate Open3D third-person scene view when simulation data is available.
 
-## Living Room Simulation Run
+## Simulation Runs
 
-The simulation path now supports a single scenario only: `living_room_navigation_v1`.
-It uses:
+The simulation path currently supports two scenarios:
 
-- a hidden procedural living-room world
+- `living_room_navigation_v1`: procedural 20-pyeong-class apartment living room with dining-table-front goal
+- `interior_test_tv_navigation_v1`: `/Users/chasoik/Downloads/InteriorTest.blend`-backed interior with a TV-front goal
+
+Both scenarios use:
+
+- a hidden scene world that is not exposed directly to the planner
 - Blender for robot camera RGB/depth/semantic/instance rendering
 - Open3D for the operator 3D room view
 - a closed loop of self-calibration, perception, LLM planning, action execution, and hidden goal evaluation
@@ -92,6 +96,26 @@ Visible sim windows:
 
 The old simulation asset bootstrap flow, external manifests, multi-scenario validation suite, and assisted/ground-truth sim perception modes are retired.
 
+To run the authored TV scenario:
+
+```bash
+PYTHONPATH=src python -m obj_recog.main \
+  --input-source sim \
+  --scenario interior_test_tv_navigation_v1 \
+  --blender-exec /Applications/Blender.app/Contents/MacOS/Blender \
+  --width 640 \
+  --height 360 \
+  --device auto \
+  --depth-profile fast \
+  --segmentation-mode panoptic \
+  --sim-planner-model gpt-5-mini \
+  --sim-planner-timeout-sec 8 \
+  --sim-replan-interval-sec 4 \
+  --sim-selfcal-max-sec 6 \
+  --sim-action-batch-size 6 \
+  --explanation-mode off
+```
+
 ## Outputs
 
 Each sim run writes episode artifacts under:
@@ -99,6 +123,9 @@ Each sim run writes episode artifacts under:
 - `reports/sim/living_room_navigation_v1/.../episode_report.json`
 - `reports/sim/living_room_navigation_v1/.../planner_turns.jsonl`
 - `reports/sim/living_room_navigation_v1/.../self_calibration.json`
+- `reports/sim/interior_test_tv_navigation_v1/.../episode_report.json`
+- `reports/sim/interior_test_tv_navigation_v1/.../planner_turns.jsonl`
+- `reports/sim/interior_test_tv_navigation_v1/.../self_calibration.json`
 
 ## Development Checks
 

@@ -68,6 +68,10 @@ class LivingRoomSceneSpec:
     hidden_goal_pose_xyz: tuple[float, float, float]
     objects: tuple[LivingRoomObjectSpec, ...]
     lights: tuple[LivingRoomLightSpec, ...]
+    blend_file_path: str | None = None
+    goal_description: str = "Reach the front position of the dining table using only current visible evidence."
+    semantic_target_class: str = "dining_table"
+    scene_metadata: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(slots=True)

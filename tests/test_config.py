@@ -69,6 +69,22 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
     assert config.camera_calibration == "/tmp/camera.yaml"
 
 
+def test_parse_config_accepts_interior_test_tv_scenario(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
+
+    config = parse_config(
+        [
+            "--input-source",
+            "sim",
+            "--scenario",
+            "interior_test_tv_navigation_v1",
+        ]
+    )
+
+    assert config.input_source == "sim"
+    assert config.scenario == "interior_test_tv_navigation_v1"
+
+
 def test_parse_config_allows_disabling_open3d_view() -> None:
     config = parse_config(["--sim-open3d-view", "off"])
 

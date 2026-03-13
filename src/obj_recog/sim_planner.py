@@ -32,6 +32,7 @@ def build_planner_context(
     *,
     phase: EpisodePhase,
     frame_index: int,
+    goal_description: str = "Reach the front position of the dining table using only current visible evidence.",
     detections: Iterable[Detection],
     scene_graph_snapshot: SceneGraphSnapshot | None,
     reconstruction_summary: dict[str, float | int],
@@ -57,7 +58,7 @@ def build_planner_context(
     return PlannerContext(
         phase=phase,
         frame_index=int(frame_index),
-        goal_description="Reach the front position of the dining table using only current visible evidence.",
+        goal_description=str(goal_description),
         perception=PerceptionSnapshot(
             visible_detections=visible_detections,
             visible_segments=visible_segments,

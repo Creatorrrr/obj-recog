@@ -96,3 +96,20 @@ def test_planner_context_includes_visible_graph_nodes_once_they_are_seen() -> No
 
     assert "chair" in prompt
     assert "front-right-of" in prompt
+
+
+def test_planner_context_uses_scene_specific_goal_description() -> None:
+    context = build_planner_context(
+        phase=EpisodePhase.PERCEIVE_AND_PLAN,
+        frame_index=13,
+        goal_description="Reach the front position of the TV using only current visible evidence.",
+        detections=[],
+        scene_graph_snapshot=_graph_snapshot(visible_node_ids=("ego",)),
+        reconstruction_summary={"mesh_vertices": 640, "tracked_points": 220},
+        depth_summary={"min_depth_m": 0.9, "median_depth_m": 2.6},
+        recent_actions=("turn_right:12",),
+        calibration_status="converged",
+        tracking_status="TRACKING",
+    )
+
+    assert context.goal_description == "Reach the front position of the TV using only current visible evidence."

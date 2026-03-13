@@ -3,8 +3,19 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
-from obj_recog.sim_scene import build_living_room_scene_spec, build_scene_mesh_components
+from obj_recog.blend_scene_loader import (
+    BlendSceneManifest,
+    BlendSceneObject,
+    normalize_blender_xyz_to_sim_xyz,
+    tv_front_goal_from_manifest,
+)
+from obj_recog.sim_scene import (
+    build_interior_test_tv_scene_spec,
+    build_living_room_scene_spec,
+    build_scene_mesh_components,
+)
 
 
 def test_living_room_scene_has_expected_room_dimensions() -> None:
@@ -214,3 +225,100 @@ def test_living_room_scene_builds_expected_mesh_component_groups() -> None:
 
     assert all(component.vertices_xyz.shape[1] == 3 for component in components)
     assert all(component.triangles.shape[1] == 3 for component in components)
+
+
+def test_interior_test_tv_scene_has_expected_spec_metadata() -> None:
+    scene = build_interior_test_tv_scene_spec()
+
+    assert scene.scene_id == "interior_test_tv_navigation_v1"
+    assert scene.blend_file_path == "/Users/chasoik/Downloads/InteriorTest.blend"
+    assert scene.semantic_target_class == "tv"
+    assert "TV" in scene.goal_description
+    assert scene.start_pose == scene.start_pose.__class__(x=0.0, y=1.25, z=-2.8, yaw_deg=0.0, camera_pan_deg=0.0)
+
+
+def test_blend_coordinate_normalization_maps_blender_z_to_sim_height() -> None:
+    sim_xyz = normalize_blender_xyz_to_sim_xyz((1.5, 3.25, 0.8))
+
+    assert sim_xyz == pytest.approx((1.5, 0.8, 3.25))
+
+
+def test_interior_test_tv_goal_is_derived_from_tv_anchor() -> None:
+    manifest = BlendSceneManifest(
+        blend_file_path="/Users/chasoik/Downloads/InteriorTest.blend",
+        room_size_xyz=(5.0, 3.0, 8.0),
+        objects=(
+            BlendSceneObject(
+                object_id="TV",
+                object_type="MESH",
+                semantic_label="tv",
+                center_xyz=(0.0, 1.3221, 3.9260),
+                size_xyz=(1.5, 0.8, 0.05),
+                yaw_deg=0.0,
+                vertices_xyz=np.empty((0, 3), dtype=np.float32),
+                triangles=np.empty((0, 3), dtype=np.int32),
+                collider=False,
+            ),
+        ),
+    )
+
+    goal = tv_front_goal_from_manifest(manifest, tv_object_id="TV", offset_m=0.8)
+
+    assert goal == pytest.approx((0.0, 1.25, 3.1260), abs=1e-4)
+
+
+def test_build_scene_mesh_components_uses_authored_manifest_geometry_for_interior_scene() -> None:
+    manifest = BlendSceneManifest(
+        blend_file_path="/Users/chasoik/Downloads/InteriorTest.blend",
+        room_size_xyz=(5.0, 3.0, 8.0),
+        objects=(
+            BlendSceneObject(
+                object_id="Floor",
+                object_type="MESH",
+                semantic_label="floor",
+                center_xyz=(0.0, 0.0, 0.0),
+                size_xyz=(5.0, 0.01, 8.0),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [
+                        [-2.5, 0.0, -4.0],
+                        [2.5, 0.0, -4.0],
+                        [2.5, 0.0, 4.0],
+                        [-2.5, 0.0, 4.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=True,
+            ),
+            BlendSceneObject(
+                object_id="TV",
+                object_type="MESH",
+                semantic_label="tv",
+                center_xyz=(0.0, 1.3221, 3.9260),
+                size_xyz=(1.5, 0.8, 0.05),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [
+                        [-0.75, 0.9, 3.90],
+                        [0.75, 0.9, 3.90],
+                        [0.75, 1.7, 3.95],
+                        [-0.75, 1.7, 3.95],
+                    ],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=False,
+            ),
+        ),
+    )
+
+    scene = build_interior_test_tv_scene_spec(manifest)
+    components = build_scene_mesh_components(scene)
+    floor_component = next(component for component in components if component.component_id == "Floor")
+    tv_component = next(component for component in components if component.component_id == "TV")
+
+    assert floor_component.vertices_xyz.shape == (4, 3)
+    assert floor_component.triangles.shape == (2, 3)
+    assert tv_component.vertices_xyz.shape == (4, 3)
+    assert tv_component.triangles.shape == (2, 3)

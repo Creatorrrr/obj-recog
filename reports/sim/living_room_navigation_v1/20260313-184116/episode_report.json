@@ -1,0 +1,10 @@
+{
+  "scenario_id": "living_room_navigation_v1",
+  "success": false,
+  "final_phase": "SELF_CALIBRATING",
+  "total_frames": 2,
+  "planner_turns": 0,
+  "self_calibration_completed": false,
+  "final_distance_to_goal_m": 4.744733810424805,
+  "report_dir": "/Users/chasoik/Projects/obj-recog/reports/sim/living_room_navigation_v1/20260313-184116"
+}

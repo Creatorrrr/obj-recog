@@ -282,6 +282,9 @@ def _json_ready(value: Any) -> Any:
             "window_wall": value.window_wall,
             "start_pose": _json_ready(value.start_pose),
             "hidden_goal_pose_xyz": list(value.hidden_goal_pose_xyz),
+            "blend_file_path": value.blend_file_path,
+            "goal_description": value.goal_description,
+            "semantic_target_class": value.semantic_target_class,
             "objects": [
                 {
                     "object_id": item.object_id,

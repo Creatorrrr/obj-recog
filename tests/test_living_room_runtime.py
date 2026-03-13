@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
-from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, EpisodePhase, SensorFrame
-from obj_recog.sim_scene import build_living_room_scene_spec
-from obj_recog.simulation import LivingRoomEpisodeRunner
+from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, EpisodePhase, RobotPose, SensorFrame
+from obj_recog.sim_scene import build_interior_test_tv_scene_spec, build_living_room_scene_spec
+from obj_recog.simulation import LivingRoomEpisodeRunner, LivingRoomSimulationRuntime
 
 
 class _FakePlanner:
@@ -92,6 +95,43 @@ def _artifacts(packet: FramePacket):
     )()
 
 
+def _interior_manifest() -> BlendSceneManifest:
+    return BlendSceneManifest(
+        blend_file_path="/Users/chasoik/Downloads/InteriorTest.blend",
+        room_size_xyz=(5.0, 3.0, 8.0),
+        objects=(
+            BlendSceneObject(
+                object_id="Floor",
+                object_type="MESH",
+                semantic_label="floor",
+                center_xyz=(0.0, 0.0, 0.0),
+                size_xyz=(5.0, 0.01, 8.0),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [[-2.5, 0.0, -4.0], [2.5, 0.0, -4.0], [2.5, 0.0, 4.0], [-2.5, 0.0, 4.0]],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=True,
+            ),
+            BlendSceneObject(
+                object_id="TV",
+                object_type="MESH",
+                semantic_label="tv",
+                center_xyz=(0.0, 1.3221, 3.9260),
+                size_xyz=(1.5, 0.8, 0.05),
+                yaw_deg=0.0,
+                vertices_xyz=np.asarray(
+                    [[-0.75, 0.9, 3.90], [0.75, 0.9, 3.90], [0.75, 1.7, 3.95], [-0.75, 1.7, 3.95]],
+                    dtype=np.float32,
+                ),
+                triangles=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+                collider=False,
+            ),
+        ),
+    )
+
+
 def test_living_room_runtime_self_calibrates_before_first_planner_turn(tmp_path: Path) -> None:
     planner = _FakePlanner(
         [
@@ -140,7 +180,8 @@ def test_living_room_runtime_recovers_from_empty_schedule_with_pause_fallback(tm
 
 
 def test_living_room_runtime_marks_success_when_robot_reaches_hidden_goal(tmp_path: Path) -> None:
-    scene = build_living_room_scene_spec()
+    base_scene = build_living_room_scene_spec()
+    scene = replace(base_scene, objects=())
     goal_x, goal_y, goal_z = scene.hidden_goal_pose_xyz
     planner = _FakePlanner(
         [
@@ -244,3 +285,118 @@ def test_living_room_runtime_chunks_large_schedule_steps_into_tracking_safe_subs
     assert runner.current_schedule.steps[0].primitive == ActionPrimitive.CAMERA_PAN_LEFT
     assert float(runner.current_schedule.steps[0].value) == 24.0
     assert runner.current_phase == EpisodePhase.EXECUTING_SCHEDULE
+
+
+def test_living_room_runtime_moves_forward_relative_to_robot_yaw(tmp_path: Path) -> None:
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.robot_pose = RobotPose(x=0.0, y=1.25, z=-2.0, yaw_deg=90.0, camera_pan_deg=0.0)
+
+    runner._apply_step(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.5))
+
+    assert runner._state.robot_pose.x == pytest.approx(0.5, abs=1e-4)
+    assert runner._state.robot_pose.z == pytest.approx(-2.0, abs=1e-4)
+
+
+def test_living_room_runtime_blocks_motion_into_hidden_collider(tmp_path: Path) -> None:
+    manifest = BlendSceneManifest(
+        blend_file_path="/Users/chasoik/Downloads/InteriorTest.blend",
+        room_size_xyz=(5.0, 3.0, 8.0),
+        objects=(
+            BlendSceneObject(
+                object_id="Floor",
+                object_type="MESH",
+                semantic_label="floor",
+                center_xyz=(0.0, 0.0, 0.0),
+                size_xyz=(5.0, 0.01, 8.0),
+                yaw_deg=0.0,
+                vertices_xyz=np.empty((0, 3), dtype=np.float32),
+                triangles=np.empty((0, 3), dtype=np.int32),
+                collider=False,
+            ),
+            BlendSceneObject(
+                object_id="BlockerTable",
+                object_type="MESH",
+                semantic_label="table",
+                center_xyz=(0.0, 0.45, -2.35),
+                size_xyz=(0.80, 0.90, 0.80),
+                yaw_deg=0.0,
+                vertices_xyz=np.empty((0, 3), dtype=np.float32),
+                triangles=np.empty((0, 3), dtype=np.int32),
+                collider=True,
+            ),
+        ),
+    )
+    scene = build_interior_test_tv_scene_spec(manifest)
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+        scene_spec=scene,
+    )
+
+    original_pose = runner._state.robot_pose
+    runner._apply_step(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.5))
+
+    assert runner._state.robot_pose.x == pytest.approx(original_pose.x, abs=1e-4)
+    assert runner._state.robot_pose.z == pytest.approx(original_pose.z, abs=1e-4)
+
+
+def test_simulation_runtime_selects_interior_test_tv_scene_from_config(tmp_path: Path) -> None:
+    sensor_backend = _FakeSensorBackend()
+    runtime = LivingRoomSimulationRuntime(
+        config=_config(scenario="interior_test_tv_navigation_v1"),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend_factory=lambda _config, _camera_rig: sensor_backend,
+    )
+
+    runner = runtime.create_frame_source()
+
+    assert runner._scene_spec.scene_id == "interior_test_tv_navigation_v1"
+    assert sensor_backend.build_calls == ["interior_test_tv_navigation_v1"]
+
+
+def test_episode_runner_uses_scene_semantic_target_class_in_operator_state(tmp_path: Path) -> None:
+    scene = build_interior_test_tv_scene_spec()
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+        scene_spec=scene,
+    )
+
+    packet = runner.next_frame()
+
+    assert packet is not None
+    assert packet.scenario_state is not None
+    assert packet.scenario_state.semantic_target_class == "tv"
+
+
+def test_simulation_runtime_loads_blend_manifest_for_interior_test_scene(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sensor_backend = _FakeSensorBackend()
+    runtime = LivingRoomSimulationRuntime(
+        config=_config(
+            scenario="interior_test_tv_navigation_v1",
+            blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
+        ),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend_factory=lambda _config, _camera_rig: sensor_backend,
+    )
+    manifest = _interior_manifest()
+    monkeypatch.setattr("obj_recog.simulation.load_blend_scene_manifest", lambda **_kwargs: manifest)
+
+    runner = runtime.create_frame_source()
+
+    assert runner._scene_spec.scene_metadata["blend_manifest"] is manifest
+    assert runner._scene_spec.hidden_goal_pose_xyz == pytest.approx((0.0, 1.25, 3.1260), abs=1e-4)
