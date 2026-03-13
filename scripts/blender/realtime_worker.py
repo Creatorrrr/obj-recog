@@ -15,7 +15,9 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from obj_recog.sim_materials import material_color_rgb
+from obj_recog.sim_materials import material_alpha, material_color_rgb
+from obj_recog.sim_protocol import LivingRoomLightSpec, LivingRoomObjectSpec, LivingRoomSceneSpec, RobotPose
+from obj_recog.sim_scene import build_scene_mesh_components
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +71,8 @@ class SoftwareRendererRuntime:
 
     def _build_scene(self, payload: dict[str, object]) -> dict[str, object]:
         scene_spec = dict(payload["scene_spec"])
-        self._scene_id = str(scene_spec["scene_id"])
+        living_room_scene = _coerce_scene_spec(scene_spec)
+        self._scene_id = str(living_room_scene.scene_id)
         self._image_width = int(payload["image_width"])
         self._image_height = int(payload["image_height"])
         self._horizontal_fov_deg = float(payload["horizontal_fov_deg"])
@@ -82,9 +85,9 @@ class SoftwareRendererRuntime:
             "cx": float(self._image_width) * 0.5,
             "cy": float(self._image_height) * 0.5,
         }
-        room_width, room_height, _room_depth = (float(value) for value in scene_spec["room_size_xyz"])
+        room_width, room_height, _room_depth = (float(value) for value in living_room_scene.room_size_xyz)
         self._scene_center = np.array((0.0, room_height * 0.5, 0.0), dtype=np.float32)
-        self._primitives = _build_primitives(scene_spec)
+        self._primitives = _build_primitives_from_components(living_room_scene)
         self._lights = tuple(
             _RenderLight(
                 light_type=str(item["light_type"]),
@@ -162,6 +165,9 @@ class SoftwareRendererRuntime:
         best_t = np.full(pixel_count, np.inf, dtype=np.float32)
         hit_indices = np.full(pixel_count, -1, dtype=np.int32)
         hit_normals = np.zeros((pixel_count, 3), dtype=np.float32)
+        best_opaque_t = np.full(pixel_count, np.inf, dtype=np.float32)
+        opaque_hit_indices = np.full(pixel_count, -1, dtype=np.int32)
+        opaque_hit_normals = np.zeros((pixel_count, 3), dtype=np.float32)
 
         for index, primitive in enumerate(self._primitives):
             hit_t, hit_mask, hit_normals_world = _intersect_box(
@@ -172,11 +178,17 @@ class SoftwareRendererRuntime:
                 far_plane_m=self._far_plane_m,
             )
             better = hit_mask & (hit_t < best_t)
-            if not np.any(better):
-                continue
-            best_t[better] = hit_t[better]
-            hit_indices[better] = int(index)
-            hit_normals[better] = hit_normals_world[better]
+            if np.any(better):
+                best_t[better] = hit_t[better]
+                hit_indices[better] = int(index)
+                hit_normals[better] = hit_normals_world[better]
+
+            if material_alpha(primitive.material_key) >= 0.999:
+                better_opaque = hit_mask & (hit_t < best_opaque_t)
+                if np.any(better_opaque):
+                    best_opaque_t[better_opaque] = hit_t[better_opaque]
+                    opaque_hit_indices[better_opaque] = int(index)
+                    opaque_hit_normals[better_opaque] = hit_normals_world[better_opaque]
 
         rgb = np.zeros((pixel_count, 3), dtype=np.float32)
         depth = np.full(pixel_count, float(self._far_plane_m), dtype=np.float32)
@@ -195,12 +207,21 @@ class SoftwareRendererRuntime:
                 origin_world.reshape(1, 3) + (dirs_world[hit_mask] * best_t[hit_mask, None])
             )
             hit_points_camera[hit_mask] = dirs_camera[hit_mask] * best_t[hit_mask, None]
-            depth[hit_mask] = np.clip(hit_points_camera[hit_mask, 2], self._near_plane_m, self._far_plane_m)
+
+            opaque_mask = opaque_hit_indices >= 0
+            if np.any(opaque_mask):
+                opaque_points_camera = dirs_camera[opaque_mask] * best_opaque_t[opaque_mask, None]
+                depth[opaque_mask] = np.clip(
+                    opaque_points_camera[:, 2],
+                    self._near_plane_m,
+                    self._far_plane_m,
+                )
 
             for index, primitive in enumerate(self._primitives):
                 primitive_mask = hit_indices == int(index)
                 if not np.any(primitive_mask):
                     continue
+
                 primitive_points = hit_points_world[primitive_mask]
                 primitive_normals = hit_normals[primitive_mask]
                 base_rgb = _textured_material_rgb(
@@ -209,16 +230,75 @@ class SoftwareRendererRuntime:
                     primitive_points,
                     primitive_normals,
                 )
-                lit_rgb = _apply_lighting(
+                front_rgb = _apply_lighting(
                     base_rgb=base_rgb,
                     normals_world=primitive_normals,
                     hit_points_world=primitive_points,
                     lights=self._lights,
                     scene_center=self._scene_center,
                 )
-                rgb[primitive_mask] = lit_rgb
-                semantic[primitive_mask] = np.uint8(primitive.semantic_id)
-                instance[primitive_mask] = np.uint8(primitive.instance_id)
+
+                alpha = material_alpha(primitive.material_key)
+                if alpha >= 0.999:
+                    rgb[primitive_mask] = front_rgb
+                    semantic[primitive_mask] = np.uint8(primitive.semantic_id)
+                    instance[primitive_mask] = np.uint8(primitive.instance_id)
+                    continue
+
+                behind_mask = primitive_mask & (opaque_hit_indices >= 0) & (best_opaque_t > (best_t + 1e-4))
+                blended_rgb = front_rgb.copy()
+                if np.any(behind_mask):
+                    behind_indices = opaque_hit_indices[behind_mask]
+                    behind_points_world = (
+                        origin_world.reshape(1, 3) + (dirs_world[behind_mask] * best_opaque_t[behind_mask, None])
+                    )
+                    behind_normals = opaque_hit_normals[behind_mask]
+                    behind_rgb = np.zeros((behind_points_world.shape[0], 3), dtype=np.float32)
+                    behind_semantic = np.zeros(behind_points_world.shape[0], dtype=np.uint8)
+                    behind_instance = np.zeros(behind_points_world.shape[0], dtype=np.uint8)
+                    for behind_index, behind_primitive in enumerate(self._primitives):
+                        sample_mask = behind_indices == int(behind_index)
+                        if not np.any(sample_mask):
+                            continue
+                        sample_points = behind_points_world[sample_mask]
+                        sample_normals = behind_normals[sample_mask]
+                        sample_base_rgb = _textured_material_rgb(
+                            behind_primitive.material_key,
+                            behind_primitive.semantic_label,
+                            sample_points,
+                            sample_normals,
+                        )
+                        behind_rgb[sample_mask] = _apply_lighting(
+                            base_rgb=sample_base_rgb,
+                            normals_world=sample_normals,
+                            hit_points_world=sample_points,
+                            lights=self._lights,
+                            scene_center=self._scene_center,
+                        )
+                        behind_semantic[sample_mask] = np.uint8(behind_primitive.semantic_id)
+                        behind_instance[sample_mask] = np.uint8(behind_primitive.instance_id)
+
+                    primitive_positions = np.flatnonzero(primitive_mask)
+                    behind_positions = np.flatnonzero(behind_mask)
+                    lookup = {pixel_index: position for position, pixel_index in enumerate(behind_positions.tolist())}
+                    for local_index, pixel_index in enumerate(primitive_positions.tolist()):
+                        behind_position = lookup.get(pixel_index)
+                        if behind_position is None:
+                            background_rgb = _background_rgb(dirs_camera[pixel_index : pixel_index + 1])[0]
+                            blended_rgb[local_index] = (front_rgb[local_index] * alpha) + (
+                                background_rgb * (1.0 - alpha)
+                            )
+                            continue
+                        blended_rgb[local_index] = (front_rgb[local_index] * alpha) + (
+                            behind_rgb[behind_position] * (1.0 - alpha)
+                        )
+                        semantic[pixel_index] = behind_semantic[behind_position]
+                        instance[pixel_index] = behind_instance[behind_position]
+                else:
+                    background_rgb = _background_rgb(dirs_camera[primitive_mask])
+                    blended_rgb = (front_rgb * alpha) + (background_rgb * (1.0 - alpha))
+
+                rgb[primitive_mask] = blended_rgb
 
         rgb = np.clip(rgb, 0.0, 1.0)
         vignette = _vignette(
@@ -276,7 +356,155 @@ def _argv_after_double_dash(argv: list[str]) -> list[str]:
     return argv[index + 1 :]
 
 
-def _build_primitives(scene_spec: dict[str, object]) -> tuple[_RenderPrimitive, ...]:
+def _coerce_scene_spec(scene_spec_obj: dict[str, object]) -> LivingRoomSceneSpec:
+    room_size_xyz = tuple(float(value) for value in scene_spec_obj["room_size_xyz"])
+    wall_thickness_m = float(scene_spec_obj["wall_thickness_m"])
+    hidden_goal_pose_xyz = tuple(float(value) for value in scene_spec_obj["hidden_goal_pose_xyz"])
+    start_pose_data = dict(scene_spec_obj["start_pose"])
+    objects = tuple(
+        LivingRoomObjectSpec(
+            object_id=str(item["object_id"]),
+            semantic_label=str(item["semantic_label"]),
+            center_xyz=tuple(float(value) for value in item["center_xyz"]),
+            size_xyz=tuple(float(value) for value in item["size_xyz"]),
+            yaw_deg=float(item["yaw_deg"]),
+            material_key=str(item["material_key"]),
+            collider=bool(item.get("collider", True)),
+        )
+        for item in list(scene_spec_obj.get("objects") or [])
+    )
+    lights = tuple(
+        LivingRoomLightSpec(
+            light_id=str(item["light_id"]),
+            light_type=str(item["light_type"]),
+            location_xyz=tuple(float(value) for value in item["location_xyz"]),
+            rotation_deg_xyz=tuple(float(value) for value in item["rotation_deg_xyz"]),
+            color_rgb=tuple(float(value) for value in item["color_rgb"]),
+            energy=float(item["energy"]),
+        )
+        for item in list(scene_spec_obj.get("lights") or [])
+    )
+    start_pose = RobotPose(
+        x=float(start_pose_data["x"]),
+        y=float(start_pose_data["y"]),
+        z=float(start_pose_data["z"]),
+        yaw_deg=float(start_pose_data["yaw_deg"]),
+        camera_pan_deg=float(start_pose_data.get("camera_pan_deg", 0.0)),
+    )
+    return LivingRoomSceneSpec(
+        scene_id=str(scene_spec_obj["scene_id"]),
+        room_size_xyz=room_size_xyz,
+        wall_thickness_m=wall_thickness_m,
+        window_wall=str(scene_spec_obj.get("window_wall", "front")),
+        start_pose=start_pose,
+        hidden_goal_pose_xyz=hidden_goal_pose_xyz,
+        objects=objects,
+        lights=lights,
+    )
+
+
+def _extract_box_component(component) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract an OBB primitive from a shared mesh component.
+
+    The software renderer is intentionally box-first: only components that are exact
+    box/slab/panel meshes (8 corners + 12 triangles + consistent corner lattice)
+    are accepted. Any component that cannot be represented as such fails loudly at
+    build time to avoid silent geometry approximation.
+    """
+
+    component_id = str(getattr(component, "component_id", "unknown"))
+    vertices = np.asarray(component.vertices_xyz, dtype=np.float32).reshape((-1, 3))
+    triangles = np.asarray(component.triangles, dtype=np.int64)
+    if vertices.shape != (8, 3):
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: expected 8 vertices")
+    if triangles.ndim != 2 or triangles.shape[1] != 3:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: triangles must be Nx3")
+    if triangles.size == 0:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: no triangles provided")
+    if triangles.min(initial=0) < 0 or triangles.max(initial=0) >= vertices.shape[0]:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: triangle index out of bounds")
+    tri_count = len(triangles)
+    if tri_count != 12:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: expected 12 triangles")
+
+    tri_area = np.linalg.norm(
+        np.cross(vertices[triangles[:, 1]] - vertices[triangles[:, 0]], vertices[triangles[:, 2]] - vertices[triangles[:, 0]]),
+        axis=1,
+    )
+    if np.any(tri_area <= 1e-8):
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: degenerate triangle")
+
+    triangle_edges = np.concatenate(
+        [
+            np.sort(triangles[:, [0, 1]], axis=1),
+            np.sort(triangles[:, [1, 2]], axis=1),
+            np.sort(triangles[:, [2, 0]], axis=1),
+        ],
+        axis=0,
+    )
+    unique_edge_count = len({tuple(edge) for edge in triangle_edges.tolist()})
+    if unique_edge_count < 18:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: invalid edge topology")
+
+    triangle_topology = {tuple(sorted(map(int, tri))) for tri in triangles.tolist()}
+    if len(triangle_topology) != 12:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: expected box-like triangle topology")
+    if np.isnan(vertices).any() or np.isinf(vertices).any():
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: invalid vertex values")
+
+    center = vertices.mean(axis=0)
+    centered = vertices - center
+    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    covariance = np.cov(centered.T)
+    _, eigvecs = np.linalg.eigh(covariance)
+    axes = np.asarray(eigvecs.T, dtype=np.float32)
+    up_scores = np.abs(axes @ world_up)
+    up_axis_index = int(np.argmax(up_scores))
+    up_axis = np.asarray(axes[up_axis_index], dtype=np.float32)
+    if up_scores[up_axis_index] < 0.90:
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: expected near-vertical local Y axis")
+
+    local_axes = [axis for idx, axis in enumerate(axes) if idx != up_axis_index]
+    local_spans = [float((centered @ axis).ptp()) for axis in local_axes]
+    order = np.argsort(local_spans)
+    local_x_axis = np.asarray(local_axes[int(order[1])], dtype=np.float32)
+    local_z_axis = np.asarray(local_axes[int(order[0])], dtype=np.float32)
+
+    rotation_world_to_local = np.stack([local_x_axis, up_axis, local_z_axis]).astype(np.float32)
+    if np.linalg.det(rotation_world_to_local) < 0.0:
+        local_z_axis = -local_z_axis
+        rotation_world_to_local = np.stack([local_x_axis, up_axis, local_z_axis]).astype(np.float32)
+
+    local_vertices = centered @ rotation_world_to_local.T
+    local_min = local_vertices.min(axis=0)
+    local_max = local_vertices.max(axis=0)
+    span = local_max - local_min
+    if np.any(span <= 1e-6):
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: degenerate extents")
+
+    tol = max(1e-5, float(span.max()) * 1e-4)
+    levels: list[list[float]] = []
+    for axis_index in range(3):
+        axis_values = np.sort(local_vertices[:, axis_index])
+        axis_levels = [float(axis_values[0])]
+        for value in axis_values[1:]:
+            if abs(float(value) - axis_levels[-1]) > tol:
+                axis_levels.append(float(value))
+        if len(axis_levels) != 2:
+            raise RuntimeError(
+                f"component '{component_id}' does not satisfy box/slab/panel contract: non-box corner lattice on axis {axis_index}"
+            )
+        levels.append(axis_levels)
+
+    expected = np.array([(x, y, z) for x in levels[0] for y in levels[1] for z in levels[2]], dtype=np.float32)
+    residual = np.linalg.norm(local_vertices[:, None, :] - expected[None, :, :], axis=2).min(axis=1)
+    if float(np.max(residual)) > (tol * 2.0):
+        raise RuntimeError(f"component '{component_id}' does not satisfy box/slab/panel contract: invalid corners")
+
+    return center, span * 0.5, rotation_world_to_local.astype(np.float32)
+
+
+def _build_primitives_from_components(scene_spec: LivingRoomSceneSpec) -> tuple[_RenderPrimitive, ...]:
     semantic_ids: dict[str, int] = {}
     primitives: list[_RenderPrimitive] = []
     next_instance_id = 1
@@ -290,13 +518,12 @@ def _build_primitives(scene_spec: dict[str, object]) -> tuple[_RenderPrimitive, 
         primitive_id: str,
         semantic_label: str,
         center_xyz,
-        size_xyz,
+        half_size_xyz,
         material_key: str,
         *,
-        yaw_deg: float = 0.0,
+        rotation_world_to_local: np.ndarray,
     ) -> None:
         nonlocal next_instance_id
-        rotation_world_to_local = _rotation_y_matrix(float(yaw_deg))
         primitives.append(
             _RenderPrimitive(
                 primitive_id=str(primitive_id),
@@ -305,57 +532,22 @@ def _build_primitives(scene_spec: dict[str, object]) -> tuple[_RenderPrimitive, 
                 instance_id=next_instance_id,
                 material_key=str(material_key),
                 center_xyz=np.asarray(center_xyz, dtype=np.float32).reshape(3),
-                half_size_xyz=(np.asarray(size_xyz, dtype=np.float32).reshape(3) * 0.5),
-                rotation_world_to_local=rotation_world_to_local,
-                rotation_local_to_world=rotation_world_to_local.T,
+                half_size_xyz=np.asarray(half_size_xyz, dtype=np.float32).reshape(3),
+                rotation_world_to_local=np.asarray(rotation_world_to_local, dtype=np.float32),
+                rotation_local_to_world=np.asarray(rotation_world_to_local, dtype=np.float32).T,
             )
         )
         next_instance_id += 1
 
-    room_width, room_height, room_depth = (float(value) for value in scene_spec["room_size_xyz"])
-    wall_thickness = float(scene_spec["wall_thickness_m"])
-    half_w = room_width * 0.5
-    half_d = room_depth * 0.5
-
-    add_primitive("floor", "floor", (0.0, -0.03, 0.0), (room_width, 0.06, room_depth), "wood_floor")
-    add_primitive(
-        "wall_left",
-        "wall",
-        (-half_w + (wall_thickness * 0.5), room_height * 0.5, 0.0),
-        (wall_thickness, room_height, room_depth),
-        "painted_wall",
-    )
-    add_primitive(
-        "wall_right",
-        "wall",
-        (half_w - (wall_thickness * 0.5), room_height * 0.5, 0.0),
-        (wall_thickness, room_height, room_depth),
-        "painted_wall",
-    )
-    add_primitive(
-        "wall_back",
-        "wall",
-        (0.0, room_height * 0.5, -half_d + (wall_thickness * 0.5)),
-        (room_width, room_height, wall_thickness),
-        "painted_wall",
-    )
-    add_primitive(
-        "front_glass",
-        "glass",
-        (0.0, 1.30, half_d - 0.02),
-        (room_width - 0.30, 2.15, 0.04),
-        "tinted_glass",
-    )
-    add_primitive("ceiling", "ceiling", (0.0, room_height + 0.03, 0.0), (room_width, 0.06, room_depth), "matte_ceiling")
-
-    for item in list(scene_spec.get("objects") or []):
+    for component in build_scene_mesh_components(scene_spec):
+        center_xyz, half_size_xyz, rotation_world_to_local = _extract_box_component(component)
         add_primitive(
-            primitive_id=str(item["object_id"]),
-            semantic_label=str(item["semantic_label"]),
-            center_xyz=item["center_xyz"],
-            size_xyz=item["size_xyz"],
-            material_key=str(item["material_key"]),
-            yaw_deg=float(item.get("yaw_deg", 0.0)),
+            primitive_id=str(component.component_id),
+            semantic_label=str(component.semantic_label),
+            center_xyz=center_xyz,
+            half_size_xyz=half_size_xyz,
+            material_key=str(component.material_key),
+            rotation_world_to_local=rotation_world_to_local,
         )
 
     return tuple(primitives)

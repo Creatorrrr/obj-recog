@@ -61,13 +61,13 @@ It uses:
 Run it like this:
 
 ```bash
-OPENAI_API_KEY=... PYTHONPATH=src python -m obj_recog.main \
+PYTHONPATH=src python -m obj_recog.main \
   --input-source sim \
   --scenario living_room_navigation_v1 \
   --blender-exec /Applications/Blender.app/Contents/MacOS/Blender \
   --width 640 \
   --height 360 \
-  --device cpu \
+  --device auto \
   --depth-profile fast \
   --segmentation-mode panoptic \
   --sim-planner-model gpt-5-mini \

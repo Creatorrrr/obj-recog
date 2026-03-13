@@ -1137,13 +1137,18 @@ def test_environment_viewer_renders_room_object_meshes_and_camera_marker() -> No
     assert fake_o3d.io.read_calls == ["/tmp/chair_modern.ply", "/tmp/backpack_canvas.ply"]
 
 
-def test_environment_viewer_excludes_front_glass_from_structural_room_mesh_for_scene_spec() -> None:
+def test_environment_viewer_includes_window_frame_in_structural_room_mesh_for_scene_spec() -> None:
     scene = build_living_room_scene_spec()
     components = build_scene_mesh_components(scene)
     expected_room_vertices = sum(
         int(component.vertices_xyz.shape[0])
         for component in components
-        if component.semantic_label in {"floor", "wall", "ceiling"}
+        if component.semantic_label in {"floor", "wall", "ceiling", "window_frame"}
+    )
+    expected_object_vertices = sum(
+        int(component.vertices_xyz.shape[0])
+        for component in components
+        if component.semantic_label not in {"floor", "wall", "ceiling", "window_frame", "glass"}
     )
 
     viewer = Open3DEnvironmentViewer(o3d_module=_FakeO3D())
@@ -1156,6 +1161,34 @@ def test_environment_viewer_excludes_front_glass_from_structural_room_mesh_for_s
     )
 
     assert viewer._room_mesh.vertices.data.shape[0] == expected_room_vertices
+    assert viewer._object_mesh.vertices.data.shape[0] == expected_object_vertices
+
+
+def test_environment_viewer_excludes_glass_from_solid_mesh_for_scene_spec() -> None:
+    scene = build_living_room_scene_spec()
+    components = build_scene_mesh_components(scene)
+    glass_vertices = sum(
+        int(component.vertices_xyz.shape[0])
+        for component in components
+        if component.semantic_label == "glass"
+    )
+    solid_object_vertices = sum(
+        int(component.vertices_xyz.shape[0])
+        for component in components
+        if component.semantic_label not in {"floor", "wall", "ceiling", "window_frame", "glass"}
+    )
+
+    viewer = Open3DEnvironmentViewer(o3d_module=_FakeO3D())
+    viewer.update(
+        OperatorSceneState(
+            scene_spec=scene,
+            robot_pose=scene.start_pose,
+            phase=EpisodePhase.SELF_CALIBRATING,
+        )
+    )
+
+    assert glass_vertices > 0
+    assert viewer._object_mesh.vertices.data.shape[0] == solid_object_vertices
 
 
 def test_environment_viewer_keeps_floor_below_ceiling_in_display_coordinates() -> None:

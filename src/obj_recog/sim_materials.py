@@ -26,3 +26,7 @@ MATERIAL_SPECS: dict[str, MaterialSpec] = {
 
 def material_color_rgb(material_key: str) -> tuple[float, float, float]:
     return MATERIAL_SPECS.get(material_key, MATERIAL_SPECS["painted_wall"]).base_color_rgb
+
+
+def material_alpha(material_key: str) -> float:
+    return float(MATERIAL_SPECS.get(material_key, MATERIAL_SPECS["painted_wall"]).alpha)

@@ -1082,12 +1082,12 @@ class Open3DEnvironmentViewer:
             room_component_meshes = [
                 (component.vertices_xyz, component.triangles, component.vertex_colors)
                 for component in scene_components
-                if component.semantic_label in {"floor", "wall", "ceiling"}
+                if component.semantic_label in {"floor", "wall", "window_frame", "ceiling"}
             ]
             object_component_meshes = [
                 (component.vertices_xyz, component.triangles, component.vertex_colors)
                 for component in scene_components
-                if component.semantic_label not in {"floor", "wall", "glass", "ceiling"}
+                if component.semantic_label not in {"floor", "wall", "window_frame", "ceiling", "glass"}
             ]
             room_vertices, room_triangles, room_colors = _combine_triangle_meshes(room_component_meshes)
             object_vertices, object_triangles, object_colors = _combine_triangle_meshes(object_component_meshes)

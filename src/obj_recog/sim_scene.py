@@ -184,6 +184,34 @@ def build_scene_mesh_components(scene: LivingRoomSceneSpec) -> tuple[SceneMeshCo
             material_key="tinted_glass",
         ),
         _make_box_component(
+            "front_window_left_frame",
+            "window_frame",
+            center_xyz=(-(room_width - 0.30) * 0.5 + 0.07, 1.30, half_d - 0.02),
+            size_xyz=(0.08, 2.15, 0.08),
+            material_key="painted_wall",
+        ),
+        _make_box_component(
+            "front_window_right_frame",
+            "window_frame",
+            center_xyz=((room_width - 0.30) * 0.5 - 0.07, 1.30, half_d - 0.02),
+            size_xyz=(0.08, 2.15, 0.08),
+            material_key="painted_wall",
+        ),
+        _make_box_component(
+            "front_window_top_frame",
+            "window_frame",
+            center_xyz=(0.0, 2.30, half_d - 0.02),
+            size_xyz=(room_width - 0.30, 0.18, 0.08),
+            material_key="painted_wall",
+        ),
+        _make_box_component(
+            "front_window_bottom_frame",
+            "window_frame",
+            center_xyz=(0.0, 0.21, half_d - 0.02),
+            size_xyz=(room_width - 0.30, 0.16, 0.08),
+            material_key="painted_wall",
+        ),
+        _make_box_component(
             "ceiling",
             "ceiling",
             center_xyz=(0.0, room_height + 0.03, 0.0),
@@ -193,16 +221,25 @@ def build_scene_mesh_components(scene: LivingRoomSceneSpec) -> tuple[SceneMeshCo
     ]
 
     for item in scene.objects:
-        components.append(
-            _make_box_component(
-                item.object_id,
-                item.semantic_label,
-                center_xyz=item.center_xyz,
-                size_xyz=item.size_xyz,
-                material_key=item.material_key,
-                yaw_deg=item.yaw_deg,
+        if item.object_id == "sofa":
+            components.extend(_build_sofa_components(item))
+        elif item.object_id.startswith("dining_chair"):
+            components.extend(_build_dining_chair_components(item))
+        elif item.object_id == "dining_table":
+            components.extend(_build_dining_table_components(item))
+        elif item.object_id == "tv_console":
+            components.extend(_build_tv_console_components(item))
+        else:
+            components.append(
+                _make_box_component(
+                    item.object_id,
+                    item.semantic_label,
+                    center_xyz=item.center_xyz,
+                    size_xyz=item.size_xyz,
+                    material_key=item.material_key,
+                    yaw_deg=item.yaw_deg,
+                )
             )
-        )
     return tuple(components)
 
 
@@ -210,6 +247,273 @@ def pose_distance_to_goal(scene: LivingRoomSceneSpec, pose: RobotPose) -> float:
     goal = np.asarray(scene.hidden_goal_pose_xyz, dtype=np.float32)
     robot = np.asarray((pose.x, pose.y, pose.z), dtype=np.float32)
     return float(np.linalg.norm(goal - robot))
+
+
+def _build_sofa_components(item: LivingRoomObjectSpec) -> tuple[SceneMeshComponent, ...]:
+    width, height, depth = item.size_xyz
+    x, y, z = item.center_xyz
+
+    base_y = y - (height * 0.5) + 0.16
+    base = _make_box_component(
+        f"{item.object_id}_base",
+        item.semantic_label,
+        center_xyz=(x, base_y, z),
+        size_xyz=(width * 0.97, 0.32, depth * 0.97),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    seat = _make_box_component(
+        f"{item.object_id}_seat",
+        item.semantic_label,
+        center_xyz=(x, y - 0.16, z),
+        size_xyz=(width * 0.88, 0.16, depth * 0.58),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    backrest = _make_box_component(
+        f"{item.object_id}_backrest",
+        item.semantic_label,
+        center_xyz=(x, y + 0.02, z - (depth * 0.22)),
+        size_xyz=(width * 0.93, 0.45, depth * 0.20),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    left_arm = _make_box_component(
+        f"{item.object_id}_left_arm",
+        item.semantic_label,
+        center_xyz=(x - width * 0.47, y + 0.05, z),
+        size_xyz=(0.18, 0.50, depth * 0.78),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    right_arm = _make_box_component(
+        f"{item.object_id}_right_arm",
+        item.semantic_label,
+        center_xyz=(x + width * 0.47, y + 0.05, z),
+        size_xyz=(0.18, 0.50, depth * 0.78),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    seat_cushion = _make_box_component(
+        f"{item.object_id}_seat_cushion_a",
+        item.semantic_label,
+        center_xyz=(x - 0.35, y - 0.11, z + 0.02),
+        size_xyz=(width * 0.42, 0.10, depth * 0.54),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    seat_cushion_b = _make_box_component(
+        f"{item.object_id}_seat_cushion_b",
+        item.semantic_label,
+        center_xyz=(x + 0.35, y - 0.11, z + 0.02),
+        size_xyz=(width * 0.42, 0.10, depth * 0.54),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    back_cushion_a = _make_box_component(
+        f"{item.object_id}_back_cushion_a",
+        item.semantic_label,
+        center_xyz=(x - 0.55, y + 0.13, z - (depth * 0.16)),
+        size_xyz=(width * 0.18, 0.09, depth * 0.26),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    back_cushion_b = _make_box_component(
+        f"{item.object_id}_back_cushion_b",
+        item.semantic_label,
+        center_xyz=(x + 0.55, y + 0.13, z - (depth * 0.16)),
+        size_xyz=(width * 0.18, 0.09, depth * 0.26),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    return (
+        base,
+        seat,
+        backrest,
+        left_arm,
+        right_arm,
+        seat_cushion,
+        seat_cushion_b,
+        back_cushion_a,
+        back_cushion_b,
+    )
+
+
+def _build_dining_table_components(item: LivingRoomObjectSpec) -> tuple[SceneMeshComponent, ...]:
+    width, height, depth = item.size_xyz
+    x, y, z = item.center_xyz
+    # Keep the table geometry nontrivial while preserving compact top and support logic.
+    top = _make_box_component(
+        f"{item.object_id}_top",
+        item.semantic_label,
+        center_xyz=(x, y + 0.43, z),
+        size_xyz=(width * 0.88, 0.08, depth * 0.80),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    apron = _make_box_component(
+        f"{item.object_id}_apron",
+        item.semantic_label,
+        center_xyz=(x, y + 0.23, z),
+        size_xyz=(width * 0.88, 0.10, depth * 0.88),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    leg_size = (0.08, 0.45, 0.08)
+    leg_z_offset = (depth * 0.88) * 0.45
+    leg_x_offset = (width * 0.88) * 0.45
+    leg_y = y - (height * 0.5) + (leg_size[1] * 0.5)
+    legs = (
+        _make_box_component(
+            f"{item.object_id}_leg_front_left",
+            item.semantic_label,
+            center_xyz=(x - leg_x_offset, leg_y, z - leg_z_offset),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+        _make_box_component(
+            f"{item.object_id}_leg_front_right",
+            item.semantic_label,
+            center_xyz=(x + leg_x_offset, leg_y, z - leg_z_offset),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+        _make_box_component(
+            f"{item.object_id}_leg_back_left",
+            item.semantic_label,
+            center_xyz=(x - leg_x_offset, leg_y, z + leg_z_offset),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+        _make_box_component(
+            f"{item.object_id}_leg_back_right",
+            item.semantic_label,
+            center_xyz=(x + leg_x_offset, leg_y, z + leg_z_offset),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+    )
+    return (top, apron, *legs)
+
+
+def _build_dining_chair_components(item: LivingRoomObjectSpec) -> tuple[SceneMeshComponent, ...]:
+    width, height, depth = item.size_xyz
+    x, y, z = item.center_xyz
+    seat_y = y - (height * 0.5) + 0.14
+    seat = _make_box_component(
+        f"{item.object_id}_seat",
+        item.semantic_label,
+        center_xyz=(x, seat_y, z),
+        size_xyz=(width * 0.86, 0.09, depth * 0.86),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    backrest = _make_box_component(
+        f"{item.object_id}_backrest",
+        item.semantic_label,
+        center_xyz=(x, y + 0.12, z + (depth * 0.28)),
+        size_xyz=(width * 0.86, 0.60, 0.05),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    leg_y = y - (height * 0.5) + (0.36 * 0.5)
+    leg_size = (0.06, 0.36, 0.06)
+    x_off = width * 0.38
+    z_off = depth * 0.38
+    legs = (
+        _make_box_component(
+            f"{item.object_id}_leg_front_left",
+            item.semantic_label,
+            center_xyz=(x - x_off, leg_y, z - z_off),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+        _make_box_component(
+            f"{item.object_id}_leg_front_right",
+            item.semantic_label,
+            center_xyz=(x + x_off, leg_y, z - z_off),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+        _make_box_component(
+            f"{item.object_id}_leg_back_left",
+            item.semantic_label,
+            center_xyz=(x - x_off, leg_y, z + z_off),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+        _make_box_component(
+            f"{item.object_id}_leg_back_right",
+            item.semantic_label,
+            center_xyz=(x + x_off, leg_y, z + z_off),
+            size_xyz=leg_size,
+            material_key=item.material_key,
+            yaw_deg=item.yaw_deg,
+        ),
+    )
+    return (seat, backrest, *legs)
+
+
+def _build_tv_console_components(item: LivingRoomObjectSpec) -> tuple[SceneMeshComponent, ...]:
+    width, height, depth = item.size_xyz
+    x, y, z = item.center_xyz
+    top = _make_box_component(
+        f"{item.object_id}_top",
+        item.semantic_label,
+        center_xyz=(x, y + 0.18, z),
+        size_xyz=(width * 0.96, 0.08, depth * 0.82),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    shell = _make_box_component(
+        f"{item.object_id}_shell",
+        item.semantic_label,
+        center_xyz=(x, y + 0.01, z),
+        size_xyz=(width * 0.94, 0.28, depth * 0.88),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    side_left = _make_box_component(
+        f"{item.object_id}_left_side",
+        item.semantic_label,
+        center_xyz=(x - width * 0.45, y + 0.14, z),
+        size_xyz=(0.10, 0.60, depth * 0.82),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    side_right = _make_box_component(
+        f"{item.object_id}_right_side",
+        item.semantic_label,
+        center_xyz=(x + width * 0.45, y + 0.14, z),
+        size_xyz=(0.10, 0.60, depth * 0.82),
+        material_key=item.material_key,
+        yaw_deg=item.yaw_deg,
+    )
+
+    return (top, shell, side_left, side_right)
 
 
 def _make_box_component(
