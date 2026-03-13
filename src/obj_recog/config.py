@@ -109,6 +109,13 @@ class DepthProfileSettings:
     depth_sampling_stride: int
 
 
+def _default_slam_vocabulary() -> str | None:
+    bundled_vocabulary = Path(__file__).resolve().parents[2] / "third_party" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
+    if bundled_vocabulary.is_file():
+        return str(bundled_vocabulary)
+    return None
+
+
 DEFAULT_DETECTION_INTERVAL = 2
 DEFAULT_INFERENCE_WIDTH = 640
 DEFAULT_ORB_FEATURES = 1200
@@ -272,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recalibrate", action="store_true")
     parser.add_argument("--disable-slam-calibration", action="store_true")
     parser.add_argument("--calibration-cache-dir", type=str, default=None)
-    parser.add_argument("--slam-vocabulary", type=str, default=None)
+    parser.add_argument("--slam-vocabulary", type=str, default=_default_slam_vocabulary())
     parser.add_argument("--slam-width", type=_positive_int, default=DEFAULT_SLAM_WIDTH)
     parser.add_argument("--slam-height", type=_positive_int, default=DEFAULT_SLAM_HEIGHT)
     parser.add_argument("--list-cameras", action="store_true")

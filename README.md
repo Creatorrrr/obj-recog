@@ -38,6 +38,10 @@ PYTHONPATH=src python -m obj_recog.main \
   --explanation-mode on
 ```
 
+When running from this repository, the bundled ORB-SLAM3 vocabulary at
+`third_party/ORB_SLAM3/Vocabulary/ORBvoc.txt` is picked up automatically. If you
+run from a different install layout, pass `--slam-vocabulary /absolute/path/to/ORBvoc.txt`.
+
 Useful runtime controls:
 
 - Press `e` or click the bottom-right toggle to turn the explanation window on or off.

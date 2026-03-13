@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from obj_recog.config import AppConfig, build_parser, parse_config, resolve_device
@@ -18,6 +20,9 @@ _SCENARIO_IDS = (
 def test_parse_config_uses_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
     config = parse_config([])
+    bundled_vocabulary = (
+        Path(__file__).resolve().parents[1] / "third_party" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
+    )
 
     assert config.camera_index == 0
     assert config.width == 1280
@@ -42,7 +47,7 @@ def test_parse_config_uses_expected_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert config.segmentation_interval == 6
     assert config.segmentation_input_size == 512
     assert config.camera_calibration is None
-    assert config.slam_vocabulary is None
+    assert config.slam_vocabulary == str(bundled_vocabulary)
     assert config.slam_width == 640
     assert config.slam_height == 360
     assert config.input_source == "live"
