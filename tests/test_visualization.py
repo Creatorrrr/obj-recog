@@ -6,10 +6,13 @@ import numpy as np
 from PIL import Image
 
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
+from obj_recog.sim_protocol import EpisodePhase, OperatorSceneState
+from obj_recog.sim_scene import build_living_room_scene_spec, build_scene_mesh_components
 from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
     Open3DMeshViewer,
+    _display_points_for_environment_view,
     _display_points_for_view,
     draw_detections,
     explanation_button_rect,
@@ -1134,6 +1137,39 @@ def test_environment_viewer_renders_room_object_meshes_and_camera_marker() -> No
     assert fake_o3d.io.read_calls == ["/tmp/chair_modern.ply", "/tmp/backpack_canvas.ply"]
 
 
+def test_environment_viewer_excludes_front_glass_from_structural_room_mesh_for_scene_spec() -> None:
+    scene = build_living_room_scene_spec()
+    components = build_scene_mesh_components(scene)
+    expected_room_vertices = sum(
+        int(component.vertices_xyz.shape[0])
+        for component in components
+        if component.semantic_label in {"floor", "wall", "ceiling"}
+    )
+
+    viewer = Open3DEnvironmentViewer(o3d_module=_FakeO3D())
+    viewer.update(
+        OperatorSceneState(
+            scene_spec=scene,
+            robot_pose=scene.start_pose,
+            phase=EpisodePhase.SELF_CALIBRATING,
+        )
+    )
+
+    assert viewer._room_mesh.vertices.data.shape[0] == expected_room_vertices
+
+
+def test_environment_viewer_keeps_floor_below_ceiling_in_display_coordinates() -> None:
+    scene = build_living_room_scene_spec()
+    components = build_scene_mesh_components(scene)
+    floor = next(component for component in components if component.component_id == "floor")
+    ceiling = next(component for component in components if component.component_id == "ceiling")
+
+    floor_display = _display_points_for_environment_view(floor.vertices_xyz)
+    ceiling_display = _display_points_for_environment_view(ceiling.vertices_xyz)
+
+    assert float(floor_display[:, 1].mean()) < float(ceiling_display[:, 1].mean())
+
+
 def test_draw_detections_renders_perception_diagnostics_status_lines() -> None:
     class _FakeCV2:
         FONT_HERSHEY_SIMPLEX = 0
@@ -1199,6 +1235,29 @@ def test_display_points_for_view_flips_y_and_z_axes() -> None:
             [
                 [1.0, -2.0, -3.0],
                 [-4.0, 5.0, -6.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_display_points_for_environment_view_preserves_height_axis() -> None:
+    points = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [-4.0, -5.0, 6.0],
+        ],
+        dtype=np.float32,
+    )
+
+    transformed = _display_points_for_environment_view(points)
+
+    assert np.allclose(
+        transformed,
+        np.array(
+            [
+                [1.0, 2.0, -3.0],
+                [-4.0, -5.0, -6.0],
             ],
             dtype=np.float32,
         ),

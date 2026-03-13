@@ -5,7 +5,7 @@ import numpy as np
 from obj_recog.camera import CameraSession
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket, LiveCameraFrameSource
-from obj_recog.main import process_frame
+from obj_recog.main import _legacy_tracking_to_slam_result, process_frame
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.types import Detection
 
@@ -372,6 +372,72 @@ def test_process_frame_runtime_sim_mode_marks_benchmark_valid_runtime_sources() 
     assert artifacts.perception_diagnostics.pose_source == "runtime"
     assert artifacts.perception_diagnostics.gt_target_visible is False
     assert artifacts.perception_diagnostics.benchmark_valid is True
+
+
+def test_process_frame_can_use_sensor_depth_without_ground_truth_pose() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        sim_perception_mode="runtime",
+    )
+    frame = np.full((8, 8, 3), 90, dtype=np.uint8)
+    packet = FramePacket(
+        frame_bgr=frame,
+        timestamp_sec=1.0,
+        depth_map=np.full((8, 8), 2.75, dtype=np.float32),
+        pose_world_gt=np.eye(4, dtype=np.float32),
+        intrinsics_gt=CameraIntrinsics(fx=8.0, fy=8.0, cx=4.0, cy=4.0),
+    )
+    detector = _CountingDetector()
+    depth_estimator = _CountingDepthEstimator()
+    tracker = _CountingTracker()
+
+    artifacts, cached = process_frame(
+        frame_bgr=frame,
+        detector=detector,
+        depth_estimator=depth_estimator,
+        map_builder=_FakeMapBuilder(),
+        config=config,
+        frame_index=0,
+        timestamp_sec=1.0,
+        cached_detections=[],
+        tracker=tracker,
+        frame_packet=packet,
+        prefer_frame_packet_depth_sensor=True,
+        cv2_module=object(),
+    )
+
+    assert cached[0].label == "runtime-target"
+    assert depth_estimator.calls == 0
+    assert tracker.calls == 1
+    assert np.allclose(artifacts.depth_map, packet.depth_map)
+    assert artifacts.perception_diagnostics is not None
+    assert artifacts.perception_diagnostics.depth_source == "sensor"
+    assert artifacts.perception_diagnostics.pose_source == "runtime"
+
+
+def test_legacy_tracking_to_slam_result_assigns_frame_keyframe_id_on_reset() -> None:
+    tracking_result = type(
+        "TrackingResult",
+        (),
+        {
+            "camera_pose_world": np.eye(4, dtype=np.float32),
+            "tracking_ok": True,
+            "did_reset": True,
+        },
+    )()
+
+    slam_result = _legacy_tracking_to_slam_result(tracking_result, frame_index=7)
+
+    assert slam_result.tracking_state == "TRACKING"
+    assert slam_result.keyframe_inserted is True
+    assert slam_result.keyframe_id == 7
 
 
 def test_process_frame_passes_resized_raw_camera_frame_to_detector() -> None:

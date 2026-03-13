@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import sys
+import subprocess
 
 import numpy as np
 import pytest
@@ -196,3 +199,76 @@ def test_blender_worker_client_raises_timeout_when_no_json_response_arrives() ->
             ),
             timeout_sec=0.25,
         )
+
+
+def test_blender_worker_client_skips_non_json_stdout_lines_before_response() -> None:
+    fake_stdin = _FakeWritable()
+    fake_process = _FakeProcess(
+        stdin=fake_stdin,
+        stdout=_FakeReadable(
+            [
+                b"Blender 5.0.1 (hash example)\n",
+                b'{"status":"ready","scene_id":"living_room_navigation_v1"}\n',
+            ]
+        ),
+        stderr=_FakeReadable([]),
+        poll_result=None,
+    )
+    client = BlenderWorkerClient(
+        command=["blender", "--background", "--python", "worker.py"],
+        popen_factory=lambda *_args, **_kwargs: fake_process,
+        selector=lambda reads, _writes, _errors, _timeout: (reads, [], []),
+    )
+    client.start()
+
+    response = client.build_scene(
+        BlenderSceneBuildRequest(
+            scene_spec=build_living_room_scene_spec(),
+            image_width=16,
+            image_height=12,
+            horizontal_fov_deg=72.0,
+            near_plane_m=0.2,
+            far_plane_m=8.0,
+        ),
+        timeout_sec=0.5,
+    )
+
+    assert response.scene_id == "living_room_navigation_v1"
+
+
+def test_realtime_worker_script_runs_as_subprocess_without_pythonpath(tmp_path: Path) -> None:
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "blender" / "realtime_worker.py"
+    payload = {
+        "kind": "build_scene",
+        "scene_spec": {
+            "scene_id": "living_room_navigation_v1",
+            "room_size_xyz": [7.2, 2.5, 5.4],
+            "wall_thickness_m": 0.12,
+            "window_wall": "front",
+            "start_pose": {"x": -2.4, "y": 1.25, "z": -1.85, "yaw_deg": 0.0, "camera_pan_deg": 0.0},
+            "hidden_goal_pose_xyz": [1.75, 1.25, 0.45],
+            "objects": [],
+            "lights": [],
+        },
+        "image_width": 16,
+        "image_height": 12,
+        "horizontal_fov_deg": 72.0,
+        "near_plane_m": 0.2,
+        "far_plane_m": 8.0,
+    }
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.Popen(
+        [sys.executable, str(script_path), "--", "--output-root", str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert proc.stdin is not None
+    stdout, stderr = proc.communicate((json.dumps(payload) + "\n").encode("utf-8"), timeout=5)
+
+    assert proc.returncode == 0, stderr.decode("utf-8", "replace")
+    output_lines = [json.loads(line) for line in stdout.decode("utf-8").splitlines() if line.strip()]
+    assert output_lines[0]["scene_id"] == "living_room_navigation_v1"

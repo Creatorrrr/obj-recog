@@ -26,6 +26,15 @@ def _display_points_for_view(points_xyz: np.ndarray) -> np.ndarray:
     return transformed
 
 
+def _display_points_for_environment_view(points_xyz: np.ndarray) -> np.ndarray:
+    points_xyz = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+    if points_xyz.size == 0:
+        return points_xyz.copy()
+    transformed = points_xyz.copy()
+    transformed[:, 2] *= -1.0
+    return transformed
+
+
 def _measure_text(cv2, text: str, font: int, scale: float, thickness: int) -> tuple[int, int]:
     get_text_size = getattr(cv2, "getTextSize", None)
     if callable(get_text_size):
@@ -1073,7 +1082,7 @@ class Open3DEnvironmentViewer:
             room_component_meshes = [
                 (component.vertices_xyz, component.triangles, component.vertex_colors)
                 for component in scene_components
-                if component.semantic_label in {"floor", "wall", "glass", "ceiling"}
+                if component.semantic_label in {"floor", "wall", "ceiling"}
             ]
             object_component_meshes = [
                 (component.vertices_xyz, component.triangles, component.vertex_colors)
@@ -1109,7 +1118,9 @@ class Open3DEnvironmentViewer:
             rig_z = float(getattr(scenario_state, "rig_z", 0.0))
             yaw_deg = float(getattr(scenario_state, "yaw_deg", 0.0))
 
-        self._room_mesh.vertices = self._o3d.utility.Vector3dVector(_display_points_for_view(room_vertices))
+        self._room_mesh.vertices = self._o3d.utility.Vector3dVector(
+            _display_points_for_environment_view(room_vertices)
+        )
         self._room_mesh.triangles = self._o3d.utility.Vector3iVector(room_triangles)
         self._room_mesh.vertex_colors = self._o3d.utility.Vector3dVector(room_colors)
         compute_room_normals = getattr(self._room_mesh, "compute_vertex_normals", None)
@@ -1117,7 +1128,9 @@ class Open3DEnvironmentViewer:
             compute_room_normals()
         self._vis.update_geometry(self._room_mesh)
 
-        self._object_mesh.vertices = self._o3d.utility.Vector3dVector(_display_points_for_view(object_vertices))
+        self._object_mesh.vertices = self._o3d.utility.Vector3dVector(
+            _display_points_for_environment_view(object_vertices)
+        )
         self._object_mesh.triangles = self._o3d.utility.Vector3iVector(object_triangles)
         self._object_mesh.vertex_colors = self._o3d.utility.Vector3dVector(object_colors)
         compute_object_normals = getattr(self._object_mesh, "compute_vertex_normals", None)
@@ -1131,13 +1144,32 @@ class Open3DEnvironmentViewer:
             rig_z=rig_z,
             yaw_deg=yaw_deg,
         )
-        self._camera_lines.points = self._o3d.utility.Vector3dVector(_display_points_for_view(camera_points))
+        self._camera_lines.points = self._o3d.utility.Vector3dVector(
+            _display_points_for_environment_view(camera_points)
+        )
         self._camera_lines.lines = self._o3d.utility.Vector2iVector(camera_lines)
         self._camera_lines.colors = self._o3d.utility.Vector3dVector(camera_colors)
         self._vis.update_geometry(self._camera_lines)
 
         if not self._has_fitted_view and (room_vertices.size > 0 or object_vertices.size > 0):
             self._vis.reset_view_point(True)
+            get_view_control = getattr(self._vis, "get_view_control", None)
+            if callable(get_view_control):
+                control = get_view_control()
+                if control is not None:
+                    set_lookat = getattr(control, "set_lookat", None)
+                    set_front = getattr(control, "set_front", None)
+                    set_up = getattr(control, "set_up", None)
+                    set_zoom = getattr(control, "set_zoom", None)
+                    scene_center_display = np.array([0.0, 1.1, 0.0], dtype=np.float64)
+                    if callable(set_lookat):
+                        set_lookat(scene_center_display)
+                    if callable(set_front):
+                        set_front(np.array([0.52, -0.26, -0.81], dtype=np.float64))
+                    if callable(set_up):
+                        set_up(np.array([0.0, 1.0, 0.0], dtype=np.float64))
+                    if callable(set_zoom):
+                        set_zoom(0.72)
             self._has_fitted_view = True
         is_active = self._vis.poll_events()
         self._vis.update_renderer()

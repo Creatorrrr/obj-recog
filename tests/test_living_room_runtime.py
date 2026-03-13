@@ -156,14 +156,14 @@ def test_living_room_runtime_marks_success_when_robot_reaches_hidden_goal(tmp_pa
         ]
     )
     runner = LivingRoomEpisodeRunner(
-        config=_config(),
+        config=_config(sim_camera_fps=10.0),
         report_path=tmp_path / "episode.json",
         planner=planner,
         sensor_backend=_FakeSensorBackend(),
         scene_spec=scene,
     )
 
-    for _ in range(12):
+    for _ in range(80):
         packet = runner.next_frame()
         if packet is None:
             break
@@ -192,3 +192,55 @@ def test_living_room_runtime_writes_episode_artifacts(tmp_path: Path) -> None:
     assert (tmp_path / "planner_turns.jsonl").is_file()
     assert (tmp_path / "self_calibration.json").is_file()
     assert (tmp_path / "episode_report.json").is_file()
+
+
+def test_living_room_runtime_uses_tracking_safe_self_calibration_motion_steps(tmp_path: Path) -> None:
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+    )
+
+    selfcal_steps = list(runner._selfcal_actions)
+
+    assert [step.primitive.value for step in selfcal_steps] == [
+        "camera_pan_left",
+        "camera_pan_right",
+        "turn_left",
+        "turn_right",
+        "move_forward",
+    ]
+    assert float(selfcal_steps[0].value) <= 8.0
+    assert float(selfcal_steps[1].value) <= 8.0
+    assert float(selfcal_steps[2].value) <= 8.0
+    assert float(selfcal_steps[3].value) <= 8.0
+    assert float(selfcal_steps[4].value) <= 0.15
+
+
+def test_living_room_runtime_chunks_large_schedule_steps_into_tracking_safe_substeps(tmp_path: Path) -> None:
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.EXECUTING_SCHEDULE
+    runner._current_schedule = ActionSchedule(
+        steps=(
+            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 30.0),
+            ActionStep(ActionPrimitive.MOVE_FORWARD, 0.5),
+        ),
+        rationale="chunk test",
+        model="fake-planner",
+        issued_at_frame=0,
+    )
+    runner._state.schedule_cursor = 0
+
+    runner._execute_one_step()
+
+    assert runner._state.robot_pose.camera_pan_deg == 6.0
+    assert runner.current_schedule is not None
+    assert runner.current_schedule.steps[0].primitive == ActionPrimitive.CAMERA_PAN_LEFT
+    assert float(runner.current_schedule.steps[0].value) == 24.0
+    assert runner.current_phase == EpisodePhase.EXECUTING_SCHEDULE

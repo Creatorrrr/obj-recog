@@ -176,16 +176,52 @@ class BlenderWorkerClient:
         assert process.stdout is not None
         process.stdin.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n")
         process.stdin.flush()
-        line = _read_stdout_line(process.stdout, timeout_sec=timeout_sec, selector=self._selector)
-        if line is None:
-            raise TimeoutError(f"Blender worker response timed out after {timeout_sec} seconds")
-        try:
-            decoded = json.loads(line.decode("utf-8").strip())
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Blender worker returned invalid JSON") from exc
-        if not isinstance(decoded, dict):
-            raise RuntimeError("Blender worker response must be a JSON object")
-        return decoded
+        deadline = None if timeout_sec is None else (time.monotonic() + float(timeout_sec))
+        skipped_stdout: list[str] = []
+
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            line = _read_stdout_line(process.stdout, timeout_sec=remaining, selector=self._selector)
+            if line is None:
+                stderr_excerpt = _stderr_excerpt(process)
+                if stderr_excerpt:
+                    raise RuntimeError(
+                        "Blender worker did not produce a JSON response before timeout. "
+                        f"stderr: {stderr_excerpt}"
+                    )
+                raise TimeoutError(f"Blender worker response timed out after {timeout_sec} seconds")
+
+            decoded_line = line.decode("utf-8", errors="replace").strip()
+            if not decoded_line:
+                if process.poll() is not None:
+                    stderr_excerpt = _stderr_excerpt(process)
+                    if stderr_excerpt:
+                        raise RuntimeError(
+                            "Blender worker exited before returning JSON. "
+                            f"stderr: {stderr_excerpt}"
+                        )
+                    raise RuntimeError("Blender worker exited before returning JSON")
+                continue
+
+            try:
+                decoded = json.loads(decoded_line)
+            except json.JSONDecodeError:
+                skipped_stdout.append(decoded_line)
+                if process.poll() is not None:
+                    stderr_excerpt = _stderr_excerpt(process)
+                    stdout_excerpt = " | ".join(skipped_stdout[-3:])
+                    details = stdout_excerpt
+                    if stderr_excerpt:
+                        details = f"stdout: {stdout_excerpt}; stderr: {stderr_excerpt}"
+                    raise RuntimeError(
+                        "Blender worker exited before returning JSON. "
+                        f"{details}"
+                    )
+                continue
+
+            if not isinstance(decoded, dict):
+                raise RuntimeError("Blender worker response must be a JSON object")
+            return decoded
 
     def _require_process(self) -> subprocess.Popen[bytes]:
         if self._process is None:
@@ -202,6 +238,21 @@ def _read_stdout_line(stdout, *, timeout_sec: float | None, selector) -> bytes |
             return None
     line = stdout.readline()
     return None if not line else line
+
+
+def _stderr_excerpt(process: subprocess.Popen[bytes], *, max_chars: int = 800) -> str:
+    stderr = getattr(process, "stderr", None)
+    if stderr is None:
+        return ""
+    if process.poll() is None:
+        return ""
+    try:
+        content = stderr.read()
+    except Exception:
+        return ""
+    if not content:
+        return ""
+    return content.decode("utf-8", errors="replace").strip()[:max_chars]
 
 
 def _require_payload_field(payload: dict[str, object], key: str) -> object:

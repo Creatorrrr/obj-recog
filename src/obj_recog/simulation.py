@@ -150,11 +150,11 @@ class LivingRoomEpisodeRunner:
             robot_pose=self._scene_spec.start_pose,
         )
         self._selfcal_actions = (
-            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 20.0),
-            ActionStep(ActionPrimitive.CAMERA_PAN_RIGHT, 20.0),
-            ActionStep(ActionPrimitive.TURN_LEFT, 18.0),
-            ActionStep(ActionPrimitive.TURN_RIGHT, 18.0),
-            ActionStep(ActionPrimitive.MOVE_FORWARD, 0.35),
+            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 6.0),
+            ActionStep(ActionPrimitive.CAMERA_PAN_RIGHT, 6.0),
+            ActionStep(ActionPrimitive.TURN_LEFT, 6.0),
+            ActionStep(ActionPrimitive.TURN_RIGHT, 6.0),
+            ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),
         )
         self._action_history: list[str] = []
         self._planner_turn_logs: list[dict[str, object]] = []
@@ -172,6 +172,24 @@ class LivingRoomEpisodeRunner:
     @property
     def current_schedule(self) -> ActionSchedule | None:
         return self._current_schedule
+
+    @staticmethod
+    def _tracking_safe_step_limit(primitive: ActionPrimitive) -> float | None:
+        if primitive in {
+            ActionPrimitive.MOVE_FORWARD,
+            ActionPrimitive.MOVE_BACKWARD,
+            ActionPrimitive.STRAFE_LEFT,
+            ActionPrimitive.STRAFE_RIGHT,
+        }:
+            return 0.12
+        if primitive in {
+            ActionPrimitive.TURN_LEFT,
+            ActionPrimitive.TURN_RIGHT,
+            ActionPrimitive.CAMERA_PAN_LEFT,
+            ActionPrimitive.CAMERA_PAN_RIGHT,
+        }:
+            return 6.0
+        return None
 
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
         _ = timeout_sec
@@ -307,12 +325,36 @@ class LivingRoomEpisodeRunner:
         if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
             self._state.phase = EpisodePhase.REASSESS
             return
-        step = self._current_schedule.steps[self._state.schedule_cursor]
+        step = self._next_tracking_safe_step()
+        if step is None:
+            self._state.phase = EpisodePhase.REASSESS
+            return
         self._apply_step(step)
         self._action_history.append(f"{step.primitive.value}:{step.value}")
-        self._state.schedule_cursor += 1
         if self._state.schedule_cursor >= len(self._current_schedule.steps):
             self._state.phase = EpisodePhase.REASSESS
+
+    def _next_tracking_safe_step(self) -> ActionStep | None:
+        if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
+            return None
+        cursor = int(self._state.schedule_cursor)
+        step = self._current_schedule.steps[cursor]
+        limit = self._tracking_safe_step_limit(step.primitive)
+        if limit is None or abs(float(step.value)) <= limit + 1e-9:
+            self._state.schedule_cursor += 1
+            return step
+
+        chunk_value = math.copysign(limit, float(step.value))
+        residual_value = float(step.value) - chunk_value
+        updated_steps = list(self._current_schedule.steps)
+        updated_steps[cursor] = ActionStep(step.primitive, residual_value)
+        self._current_schedule = ActionSchedule(
+            steps=tuple(updated_steps),
+            rationale=self._current_schedule.rationale,
+            model=self._current_schedule.model,
+            issued_at_frame=self._current_schedule.issued_at_frame,
+        )
+        return ActionStep(step.primitive, chunk_value)
 
     def _apply_step(self, step: ActionStep) -> None:
         pose = self._state.robot_pose

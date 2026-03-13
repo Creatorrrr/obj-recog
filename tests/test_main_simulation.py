@@ -122,6 +122,15 @@ class _CountingTracker:
         return None
 
 
+class _TrackerFactoryRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return _CountingTracker()
+
+
 class _FakeMapBuilder:
     requires_point_cloud = True
 
@@ -243,7 +252,50 @@ def test_run_sim_mode_keeps_runtime_models_active_and_suppresses_explanation_win
     )
 
     assert detector.calls == 2
-    assert depth_estimator.calls == 2
+    assert depth_estimator.calls == 0
     assert tracker.calls == 2
     assert "Situation Explanation" not in fake_cv2.imshow_calls
     assert len(source.runtime_observations) == 2
+    assert all(
+        observation[1].perception_diagnostics is not None
+        and observation[1].perception_diagnostics.depth_source == "sensor"
+        and observation[1].perception_diagnostics.pose_source == "runtime"
+        for observation in source.runtime_observations
+    )
+
+
+def test_run_sim_mode_uses_relaxed_tracker_thresholds_for_sensor_rendering() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        detection_interval=1,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+    )
+    source = _FakeFrameSource([_packet(0.0)])
+    tracker_factory = _TrackerFactoryRecorder()
+
+    run(
+        config,
+        cv2_module=_FakeCV2(),
+        detector_factory=lambda **_kwargs: _CountingDetector(),
+        depth_estimator_factory=lambda **_kwargs: _CountingDepthEstimator(),
+        tracker_factory=tracker_factory,
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: _FakeViewer(),
+        environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+    )
+
+    assert tracker_factory.calls
+    assert tracker_factory.calls[0]["min_correspondences"] == 4
+    assert tracker_factory.calls[0]["min_inliers"] == 4

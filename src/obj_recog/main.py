@@ -83,15 +83,16 @@ def resize_for_slam(frame_bgr: np.ndarray, slam_width: int, slam_height: int, *,
     return cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
 
-def _legacy_tracking_to_slam_result(tracking_result) -> SlamFrameResult:
+def _legacy_tracking_to_slam_result(tracking_result, *, frame_index: int | None = None) -> SlamFrameResult:
     pose_world = getattr(tracking_result, "camera_pose_world", None)
     if pose_world is None:
         pose_world = getattr(tracking_result, "pose_world")
+    inserted_keyframe = bool(getattr(tracking_result, "did_reset", False))
     return SlamFrameResult(
         tracking_state="TRACKING" if getattr(tracking_result, "tracking_ok", False) else "LOST",
         pose_world=np.asarray(pose_world, dtype=np.float32),
-        keyframe_inserted=bool(getattr(tracking_result, "did_reset", False)),
-        keyframe_id=None,
+        keyframe_inserted=inserted_keyframe,
+        keyframe_id=(int(frame_index) if inserted_keyframe and frame_index is not None else None),
         optimized_keyframe_poses={},
         sparse_map_points_xyz=np.empty((0, 3), dtype=np.float32),
         loop_closure_applied=False,
@@ -227,6 +228,7 @@ def process_frame(
     tracker=None,
     frame_packet: FramePacket | None = None,
     prefer_frame_packet_ground_truth: bool = False,
+    prefer_frame_packet_depth_sensor: bool = False,
     assist_frame_packet_ground_truth: bool = False,
     cv2_module=None,
 ) -> tuple[FrameArtifacts, list[Detection]]:
@@ -249,7 +251,12 @@ def process_frame(
     packet_depth_map = None if frame_packet is None else frame_packet.depth_map
     depth_map = (
         packet_depth_map
-        if (prefer_frame_packet_ground_truth or assist_frame_packet_ground_truth) and packet_depth_map is not None
+        if (
+            prefer_frame_packet_ground_truth
+            or assist_frame_packet_ground_truth
+            or prefer_frame_packet_depth_sensor
+        )
+        and packet_depth_map is not None
         else depth_estimator.estimate(inference_frame)
     )
     if depth_map.shape != frame_bgr.shape[:2]:
@@ -297,7 +304,7 @@ def process_frame(
             depth_map=depth_map,
             intrinsics=intrinsics,
         )
-        slam_result = _legacy_tracking_to_slam_result(tracking_result)
+        slam_result = _legacy_tracking_to_slam_result(tracking_result, frame_index=frame_index)
     else:
         raise RuntimeError("process_frame requires either slam_bridge or tracker")
 
@@ -326,7 +333,11 @@ def process_frame(
     depth_source = (
         "ground_truth"
         if (prefer_frame_packet_ground_truth or assist_frame_packet_ground_truth) and packet_depth_map is not None
-        else "runtime"
+        else (
+            "sensor"
+            if prefer_frame_packet_depth_sensor and packet_depth_map is not None
+            else "runtime"
+        )
     )
     pose_source = (
         "ground_truth"
@@ -733,6 +744,7 @@ def run(
     sim_perception_mode = "runtime" if config.input_source == "sim" else getattr(config, "sim_perception_mode", "runtime")
     use_frame_packet_ground_truth = False
     assist_frame_packet_ground_truth = False
+    prefer_frame_packet_depth_sensor = bool(config.input_source == "sim")
 
     def _default_sim_frame_source(current_config: AppConfig):
         run_stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1042,7 +1054,14 @@ def run(
                 ),
             )
         else:
-            tracker = tracker_factory(orb_features=config.orb_features)
+            tracker_kwargs = {"orb_features": config.orb_features}
+            if config.input_source == "sim":
+                tracker_kwargs.update(
+                    min_correspondences=4,
+                    min_inliers=4,
+                    reprojection_error_threshold=4.5,
+                )
+            tracker = tracker_factory(**tracker_kwargs)
             map_builder = _build_map_builder(
                 map_builder_factory,
                 dict(
@@ -1177,6 +1196,7 @@ def run(
                 ),
                 frame_packet=frame_packet,
                 prefer_frame_packet_ground_truth=use_frame_packet_ground_truth,
+                prefer_frame_packet_depth_sensor=prefer_frame_packet_depth_sensor,
                 assist_frame_packet_ground_truth=assist_frame_packet_ground_truth,
                 cv2_module=cv2,
             )
