@@ -2,83 +2,90 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import select
-import time
 import subprocess
+import time
 from typing import Any, Callable
 
 import numpy as np
 
-
-def build_blender_worker_command(
-    *,
-    blender_exec: str,
-    worker_script: str | Path,
-    blend_file: str | Path | None = None,
-    extra_args: list[str] | tuple[str, ...] = (),
-) -> list[str]:
-    command = [str(blender_exec)]
-    if blend_file is not None:
-        command.append(str(blend_file))
-    command.extend(["--background", "--python", str(worker_script)])
-    if extra_args:
-        command.extend(["--", *[str(item) for item in extra_args]])
-    return command
+from obj_recog.sim_protocol import LivingRoomSceneSpec, RobotPose
 
 
 def build_realtime_blender_worker_command(
     *,
     blender_exec: str,
     repo_root: str | Path,
-    scene_manifest_path: str | Path,
-    render_root: str | Path,
-    asset_cache_dir: str | Path,
-    quality: str,
+    output_root: str | Path,
     blend_file: str | Path | None = None,
 ) -> list[str]:
     root = Path(repo_root)
     worker_script = root / "scripts" / "blender" / "realtime_worker.py"
-    extra_args = [
-        "--scene-manifest",
-        str(scene_manifest_path),
-        "--render-root",
-        str(render_root),
-        "--asset-cache-dir",
-        str(asset_cache_dir),
-        "--quality",
-        str(quality),
-    ]
-    return build_blender_worker_command(
-        blender_exec=blender_exec,
-        worker_script=worker_script,
-        blend_file=blend_file,
-        extra_args=extra_args,
+    command = [str(blender_exec)]
+    if blend_file is not None:
+        command.append(str(blend_file))
+    command.extend(
+        [
+            "--background",
+            "--python",
+            str(worker_script),
+            "--",
+            "--output-root",
+            str(output_root),
+        ]
     )
+    return command
+
+
+@dataclass(frozen=True, slots=True)
+class BlenderSceneBuildRequest:
+    scene_spec: LivingRoomSceneSpec
+    image_width: int
+    image_height: int
+    horizontal_fov_deg: float
+    near_plane_m: float
+    far_plane_m: float
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "kind": "build_scene",
+            "scene_spec": _json_ready(self.scene_spec),
+            "image_width": int(self.image_width),
+            "image_height": int(self.image_height),
+            "horizontal_fov_deg": float(self.horizontal_fov_deg),
+            "near_plane_m": float(self.near_plane_m),
+            "far_plane_m": float(self.far_plane_m),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BlenderSceneBuildResponse:
+    status: str
+    scene_id: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> BlenderSceneBuildResponse:
+        return cls(
+            status=str(payload.get("status", "")),
+            scene_id=str(payload.get("scene_id", "")),
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class BlenderFrameRequest:
     frame_index: int
     timestamp_sec: float
-    scenario_id: str
+    robot_pose: RobotPose
     camera_pose_world: np.ndarray
-    intrinsics: dict[str, float]
-    dynamic_actor_transforms: dict[str, np.ndarray]
-    lighting_seed: int
 
     def to_payload(self) -> dict[str, object]:
         return {
+            "kind": "render_frame",
             "frame_index": int(self.frame_index),
             "timestamp_sec": float(self.timestamp_sec),
-            "scenario_id": str(self.scenario_id),
+            "robot_pose": _json_ready(self.robot_pose),
             "camera_pose_world": _json_ready(self.camera_pose_world),
-            "intrinsics": {str(key): float(value) for key, value in self.intrinsics.items()},
-            "dynamic_actor_transforms": {
-                str(key): _json_ready(value) for key, value in self.dynamic_actor_transforms.items()
-            },
-            "lighting_seed": int(self.lighting_seed),
         }
 
 
@@ -86,43 +93,26 @@ class BlenderFrameRequest:
 class BlenderFrameResponse:
     rgb_path: str
     depth_path: str
-    semantic_mask_path: str | None
-    instance_mask_path: str | None
-    pose_world_gt: np.ndarray
-    intrinsics_gt: dict[str, float]
+    semantic_mask_path: str
+    instance_mask_path: str
+    camera_pose_world: np.ndarray
+    intrinsics: dict[str, float]
     render_time_ms: float | None
-    worker_state: str | None
-    detections: tuple[dict[str, object], ...] = ()
+    worker_state: str | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> BlenderFrameResponse:
-        pose_world_gt = _require_payload_field(payload, "pose_world_gt")
-        intrinsics_gt = _require_payload_field(payload, "intrinsics_gt")
+        camera_pose_world = _require_payload_field(payload, "camera_pose_world")
+        intrinsics = _require_payload_field(payload, "intrinsics")
         return cls(
             rgb_path=str(payload["rgb_path"]),
             depth_path=str(payload["depth_path"]),
-            semantic_mask_path=(
-                None if payload.get("semantic_mask_path") in (None, "") else str(payload["semantic_mask_path"])
-            ),
-            instance_mask_path=(
-                None if payload.get("instance_mask_path") in (None, "") else str(payload["instance_mask_path"])
-            ),
-            detections=tuple(
-                dict(item)
-                for item in (payload.get("detections") or [])
-                if isinstance(item, dict)
-            ),
-            pose_world_gt=np.asarray(pose_world_gt, dtype=np.float32).reshape(4, 4),
-            intrinsics_gt={
-                str(key): float(value)
-                for key, value in dict(intrinsics_gt).items()
-            },
-            render_time_ms=(
-                None if payload.get("render_time_ms") is None else float(payload["render_time_ms"])
-            ),
-            worker_state=(
-                None if payload.get("worker_state") in (None, "") else str(payload["worker_state"])
-            ),
+            semantic_mask_path=str(payload["semantic_mask_path"]),
+            instance_mask_path=str(payload["instance_mask_path"]),
+            camera_pose_world=np.asarray(camera_pose_world, dtype=np.float32).reshape(4, 4),
+            intrinsics={str(key): float(value) for key, value in dict(intrinsics).items()},
+            render_time_ms=None if payload.get("render_time_ms") is None else float(payload["render_time_ms"]),
+            worker_state=None if payload.get("worker_state") is None else str(payload["worker_state"]),
         )
 
 
@@ -138,10 +128,7 @@ class BlenderWorkerClient:
         self._popen_factory = popen_factory
         self._selector = selector
         self._process: subprocess.Popen[bytes] | None = None
-
-    @property
-    def command(self) -> list[str]:
-        return list(self._command)
+        self._scene_built = False
 
     def start(self) -> None:
         process = self._popen_factory(
@@ -151,9 +138,18 @@ class BlenderWorkerClient:
             stderr=subprocess.PIPE,
         )
         if process.poll() is not None or process.stdin is None or process.stdout is None:
-            stderr = _read_stderr_line(process)
-            raise RuntimeError(f"Blender worker failed to start. {stderr}".strip())
+            raise RuntimeError("Blender worker failed to start")
         self._process = process
+
+    def build_scene(
+        self,
+        request: BlenderSceneBuildRequest,
+        *,
+        timeout_sec: float | None = None,
+    ) -> BlenderSceneBuildResponse:
+        payload = self._request(request.to_payload(), timeout_sec=timeout_sec)
+        self._scene_built = True
+        return BlenderSceneBuildResponse.from_payload(payload)
 
     def request_frame(
         self,
@@ -161,34 +157,10 @@ class BlenderWorkerClient:
         *,
         timeout_sec: float | None = None,
     ) -> BlenderFrameResponse:
-        process = self._require_process()
-        if process.stdin is None or process.stdout is None:
-            raise RuntimeError("Blender worker streams are unavailable")
-        packet = json.dumps(request.to_payload(), separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
-        process.stdin.write(packet)
-        process.stdin.flush()
-        deadline = None if timeout_sec is None else time.monotonic() + float(timeout_sec)
-        while True:
-            remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
-            response_line = _read_stdout_line(
-                process.stdout,
-                timeout_sec=remaining_timeout,
-                selector=self._selector,
-            )
-            if response_line is None:
-                raise TimeoutError(f"Blender worker response timed out after {timeout_sec} seconds")
-            stripped = response_line.strip()
-            if not stripped:
-                continue
-            if stripped[:1] not in (b"{", b"["):
-                continue
-            try:
-                payload = json.loads(stripped.decode("utf-8"))
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("Blender worker returned invalid JSON") from exc
-            if not isinstance(payload, dict):
-                raise RuntimeError("Blender worker response must be a JSON object")
-            return BlenderFrameResponse.from_payload(payload)
+        if not self._scene_built:
+            raise RuntimeError("Blender worker build_scene must complete before request_frame")
+        payload = self._request(request.to_payload(), timeout_sec=timeout_sec)
+        return BlenderFrameResponse.from_payload(payload)
 
     def close(self) -> None:
         process = self._process
@@ -196,62 +168,40 @@ class BlenderWorkerClient:
         if process is None or process.poll() is not None:
             return
         process.terminate()
+        process.wait(timeout=1.0)
+
+    def _request(self, payload: dict[str, object], *, timeout_sec: float | None) -> dict[str, object]:
+        process = self._require_process()
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n")
+        process.stdin.flush()
+        line = _read_stdout_line(process.stdout, timeout_sec=timeout_sec, selector=self._selector)
+        if line is None:
+            raise TimeoutError(f"Blender worker response timed out after {timeout_sec} seconds")
         try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1.0)
+            decoded = json.loads(line.decode("utf-8").strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Blender worker returned invalid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Blender worker response must be a JSON object")
+        return decoded
 
     def _require_process(self) -> subprocess.Popen[bytes]:
         if self._process is None:
             raise RuntimeError("Blender worker has not been started")
         if self._process.poll() is not None:
-            stderr = _read_stderr_line(self._process)
-            raise RuntimeError(f"Blender worker is not running. {stderr}".strip())
+            raise RuntimeError("Blender worker is not running")
         return self._process
 
 
 def _read_stdout_line(stdout, *, timeout_sec: float | None, selector) -> bytes | None:
-    fileno = getattr(stdout, "fileno", None)
-    if callable(fileno):
-        try:
-            return _read_stdout_line_from_fd(stdout, timeout_sec=timeout_sec, selector=selector)
-        except (OSError, ValueError):
-            pass
     if timeout_sec is not None:
         readable, _, _ = selector([stdout], [], [], timeout_sec)
         if not readable:
             return None
-    return stdout.readline()
-
-
-def _read_stdout_line_from_fd(stdout, *, timeout_sec: float | None, selector) -> bytes | None:
-    fd = stdout.fileno()
-    deadline = None if timeout_sec is None else time.monotonic() + float(timeout_sec)
-    buffer = bytearray()
-    while True:
-        newline_index = buffer.find(b"\n")
-        if newline_index >= 0:
-            return bytes(buffer[: newline_index + 1])
-        remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
-        if remaining_timeout is not None and remaining_timeout <= 0.0:
-            return None
-        readable, _, _ = selector([stdout], [], [], remaining_timeout)
-        if not readable:
-            return None
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            return None if not buffer else bytes(buffer)
-        buffer.extend(chunk)
-
-
-def _read_stderr_line(process: subprocess.Popen[bytes]) -> str:
-    if process.stderr is None:
-        return ""
-    try:
-        return process.stderr.readline().decode("utf-8", errors="replace").strip()
-    except Exception:
-        return ""
+    line = stdout.readline()
+    return None if not line else line
 
 
 def _require_payload_field(payload: dict[str, object], key: str) -> object:
@@ -263,12 +213,50 @@ def _require_payload_field(payload: dict[str, object], key: str) -> object:
 def _json_ready(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, RobotPose):
+        return {
+            "x": float(value.x),
+            "y": float(value.y),
+            "z": float(value.z),
+            "yaw_deg": float(value.yaw_deg),
+            "camera_pan_deg": float(value.camera_pan_deg),
+        }
+    if isinstance(value, LivingRoomSceneSpec):
+        return {
+            "scene_id": value.scene_id,
+            "room_size_xyz": list(value.room_size_xyz),
+            "wall_thickness_m": float(value.wall_thickness_m),
+            "window_wall": value.window_wall,
+            "start_pose": _json_ready(value.start_pose),
+            "hidden_goal_pose_xyz": list(value.hidden_goal_pose_xyz),
+            "objects": [
+                {
+                    "object_id": item.object_id,
+                    "semantic_label": item.semantic_label,
+                    "center_xyz": list(item.center_xyz),
+                    "size_xyz": list(item.size_xyz),
+                    "yaw_deg": float(item.yaw_deg),
+                    "material_key": item.material_key,
+                    "collider": bool(item.collider),
+                }
+                for item in value.objects
+            ],
+            "lights": [
+                {
+                    "light_id": light.light_id,
+                    "light_type": light.light_type,
+                    "location_xyz": list(light.location_xyz),
+                    "rotation_deg_xyz": list(light.rotation_deg_xyz),
+                    "color_rgb": list(light.color_rgb),
+                    "energy": float(light.energy),
+                }
+                for light in value.lights
+            ],
+        }
     if isinstance(value, (list, tuple)):
         return [_json_ready(item) for item in value]
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, np.floating):
-        return float(value)
-    if isinstance(value, np.integer):
-        return int(value)
     return value

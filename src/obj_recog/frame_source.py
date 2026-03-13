@@ -22,6 +22,7 @@ class FramePacket:
     intrinsics_gt: CameraIntrinsics | None = None
     detections: list[Detection] | None = None
     scenario_state: Any | None = None
+    planner_context: Any | None = None
     tracking_state: str = "TRACKING"
     keyframe_inserted: bool = False
     keyframe_id: int | None = None

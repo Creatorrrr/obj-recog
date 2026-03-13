@@ -1,7 +1,7 @@
 {
   "asset_manifest_id": "61791ef984a2",
   "benchmark_valid": false,
-  "detection_fallback_frames": 8,
+  "detection_fallback_frames": 37,
   "difficulty_level": 6,
   "dynamic_actor_count": 4,
   "failure_reason": "aborted",
@@ -25,11 +25,11 @@
   "selfcal_converged": false,
   "sim_perception_mode": "assisted",
   "sim_profile": "lightweight",
-  "steps": 15,
+  "steps": 73,
   "target_class": "suitcase",
-  "target_detected_frames_runtime": 5,
+  "target_detected_frames_runtime": 31,
   "target_first_detect_sec_runtime": 0.5,
-  "target_visible_frames_gt": 12,
-  "time_to_first_valid_view": null,
+  "target_visible_frames_gt": 64,
+  "time_to_first_valid_view": 4.6,
   "tracking_uptime": 1.0
 }

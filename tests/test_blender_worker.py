@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-import os
 from pathlib import Path
-import select
 
 import numpy as np
 import pytest
@@ -12,16 +10,17 @@ import pytest
 from obj_recog.blender_worker import (
     BlenderFrameRequest,
     BlenderFrameResponse,
+    BlenderSceneBuildRequest,
+    BlenderSceneBuildResponse,
     BlenderWorkerClient,
-    build_blender_worker_command,
     build_realtime_blender_worker_command,
 )
+from obj_recog.sim_scene import build_living_room_scene_spec
 
 
 class _FakeReadable:
-    def __init__(self, lines: list[bytes], *, fileno_value: int = 11) -> None:
+    def __init__(self, lines: list[bytes]) -> None:
         self._lines = list(lines)
-        self._fileno_value = fileno_value
 
     def readline(self) -> bytes:
         if not self._lines:
@@ -29,7 +28,7 @@ class _FakeReadable:
         return self._lines.pop(0)
 
     def fileno(self) -> int:
-        return self._fileno_value
+        raise OSError("no fd")
 
 
 class _FakeWritable(io.BytesIO):
@@ -42,61 +41,32 @@ class _FakeWritable(io.BytesIO):
 
 
 class _FakeProcess:
-    def __init__(
-        self,
-        *,
-        stdout: _FakeReadable | None = None,
-        stderr: _FakeReadable | None = None,
-        stdin: _FakeWritable | None = None,
-        poll_result: int | None = None,
-    ) -> None:
+    def __init__(self, *, stdout=None, stderr=None, stdin=None, poll_result=None) -> None:
         self.stdout = stdout
         self.stderr = stderr
         self.stdin = stdin
         self._poll_result = poll_result
         self.terminate_calls = 0
-        self.kill_calls = 0
-        self.wait_calls: list[float | None] = []
+        self.wait_calls = []
 
-    def poll(self) -> int | None:
+    def poll(self):
         return self._poll_result
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._poll_result = 0
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
         self._poll_result = 0
         return 0
 
-    def terminate(self) -> None:
-        self.terminate_calls += 1
-        self._poll_result = 0
 
-    def kill(self) -> None:
-        self.kill_calls += 1
-        self._poll_result = 0
-
-
-def test_build_blender_worker_command_uses_expected_invocation_shape() -> None:
-    command = build_blender_worker_command(
-        blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
-        worker_script=Path("/tmp/realtime_worker.py"),
-    )
-
-    assert command == [
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-        "--background",
-        "--python",
-        "/tmp/realtime_worker.py",
-    ]
-
-
-def test_build_realtime_blender_worker_command_adds_scene_bootstrap_arguments() -> None:
+def test_build_realtime_blender_worker_command_points_at_realtime_worker_script() -> None:
     command = build_realtime_blender_worker_command(
         blender_exec="/Applications/Blender.app/Contents/MacOS/Blender",
         repo_root=Path("/workspace"),
-        scene_manifest_path=Path("/tmp/scene.json"),
-        render_root=Path("/tmp/render-bundle"),
-        asset_cache_dir=Path("/tmp/assets"),
-        quality="high",
+        output_root=Path("/tmp/reports"),
         blend_file=Path("/workspace/scripts/blender/scene_template/base_scene.blend"),
     )
 
@@ -107,96 +77,19 @@ def test_build_realtime_blender_worker_command_adds_scene_bootstrap_arguments() 
         "--python",
         "/workspace/scripts/blender/realtime_worker.py",
         "--",
-        "--scene-manifest",
-        "/tmp/scene.json",
-        "--render-root",
-        "/tmp/render-bundle",
-        "--asset-cache-dir",
-        "/tmp/assets",
-        "--quality",
-        "high",
+        "--output-root",
+        "/tmp/reports",
     ]
 
 
-def test_blender_worker_client_starts_with_expected_command() -> None:
-    captured_commands: list[list[str]] = []
-    fake_process = _FakeProcess(
-        stdin=_FakeWritable(),
-        stdout=_FakeReadable([b'{"status":"ok"}\n']),
-        stderr=_FakeReadable([]),
-        poll_result=None,
-    )
-
-    def _popen(command: list[str], **_kwargs):
-        captured_commands.append(list(command))
-        return fake_process
-
-    client = BlenderWorkerClient(
-        command=["blender", "--background", "--python", "worker.py"],
-        popen_factory=_popen,
-    )
-    client.start()
-
-    assert captured_commands == [["blender", "--background", "--python", "worker.py"]]
-
-
-def test_blender_worker_client_request_frame_round_trips_json() -> None:
+def test_blender_worker_client_builds_scene_before_rendering_frames() -> None:
     fake_stdin = _FakeWritable()
-    response_payload = {
-        "rgb_path": "/tmp/rgb.png",
-        "depth_path": "/tmp/depth.npy",
-        "semantic_mask_path": "/tmp/semantic.png",
-        "instance_mask_path": "/tmp/instance.png",
-        "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
-        "intrinsics_gt": {"fx": 10.0, "fy": 11.0, "cx": 4.0, "cy": 3.0},
-        "render_time_ms": 14.5,
-        "worker_state": "ready",
-    }
     fake_process = _FakeProcess(
         stdin=fake_stdin,
-        stdout=_FakeReadable([json.dumps(response_payload).encode("utf-8") + b"\n"]),
-        stderr=_FakeReadable([]),
-        poll_result=None,
-    )
-
-    client = BlenderWorkerClient(
-        command=["blender", "--background", "--python", "worker.py"],
-        popen_factory=lambda *_args, **_kwargs: fake_process,
-        selector=lambda reads, _writes, _errors, _timeout: (reads, [], []),
-    )
-    client.start()
-    response = client.request_frame(
-        BlenderFrameRequest(
-            frame_index=3,
-            timestamp_sec=0.25,
-            scenario_id="studio_open_v1",
-            camera_pose_world=np.eye(4, dtype=np.float32),
-            intrinsics={"fx": 10.0, "fy": 10.0, "cx": 4.0, "cy": 3.0},
-            dynamic_actor_transforms={"actor-1": np.eye(4, dtype=np.float32)},
-            lighting_seed=7,
-        ),
-        timeout_sec=0.5,
-    )
-
-    assert isinstance(response, BlenderFrameResponse)
-    assert response.rgb_path == "/tmp/rgb.png"
-    assert response.depth_path == "/tmp/depth.npy"
-    np.testing.assert_allclose(response.pose_world_gt, np.eye(4, dtype=np.float32))
-    assert response.intrinsics_gt == {"fx": 10.0, "fy": 11.0, "cx": 4.0, "cy": 3.0}
-    written = fake_stdin.getvalue().decode("utf-8").strip()
-    payload = json.loads(written)
-    assert payload["frame_index"] == 3
-    assert payload["scenario_id"] == "studio_open_v1"
-    assert fake_stdin.flush_calls == 1
-
-
-def test_blender_worker_client_skips_non_json_stdout_logs() -> None:
-    fake_process = _FakeProcess(
-        stdin=_FakeWritable(),
         stdout=_FakeReadable(
             [
-                b"Blender 4.2.0 startup banner\n",
-                b'{"rgb_path":"/tmp/rgb.png","depth_path":"/tmp/depth.npy","pose_world_gt":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],"intrinsics_gt":{"fx":10.0,"fy":10.0,"cx":3.0,"cy":2.0}}\n',
+                b'{"status":"ready","scene_id":"living_room_navigation_v1"}\n',
+                b'{"rgb_path":"/tmp/rgb.npy","depth_path":"/tmp/depth.npy","semantic_mask_path":"/tmp/semantic.npy","instance_mask_path":"/tmp/instance.npy","camera_pose_world":[[1,0,0,0],[0,1,0,1.25],[0,0,1,0],[0,0,0,1]],"intrinsics":{"fx":10.0,"fy":10.0,"cx":8.0,"cy":6.0},"render_time_ms":8.2,"worker_state":"ready"}\n',
             ]
         ),
         stderr=_FakeReadable([]),
@@ -208,68 +101,82 @@ def test_blender_worker_client_skips_non_json_stdout_logs() -> None:
         selector=lambda reads, _writes, _errors, _timeout: (reads, [], []),
     )
     client.start()
-
-    response = client.request_frame(
+    build_response = client.build_scene(
+        BlenderSceneBuildRequest(
+            scene_spec=build_living_room_scene_spec(),
+            image_width=16,
+            image_height=12,
+            horizontal_fov_deg=72.0,
+            near_plane_m=0.2,
+            far_plane_m=8.0,
+        ),
+        timeout_sec=0.5,
+    )
+    frame_response = client.request_frame(
         BlenderFrameRequest(
-            frame_index=1,
-            timestamp_sec=0.1,
-            scenario_id="studio_open_v1",
+            frame_index=3,
+            timestamp_sec=1.5,
+            robot_pose=build_living_room_scene_spec().start_pose,
             camera_pose_world=np.eye(4, dtype=np.float32),
-            intrinsics={"fx": 10.0, "fy": 10.0, "cx": 4.0, "cy": 3.0},
-            dynamic_actor_transforms={},
-            lighting_seed=1,
         ),
         timeout_sec=0.5,
     )
 
-    assert response.rgb_path == "/tmp/rgb.png"
+    assert isinstance(build_response, BlenderSceneBuildResponse)
+    assert build_response.scene_id == "living_room_navigation_v1"
+    assert isinstance(frame_response, BlenderFrameResponse)
+    assert frame_response.rgb_path == "/tmp/rgb.npy"
+    written_packets = [json.loads(line) for line in fake_stdin.getvalue().decode("utf-8").splitlines()]
+    assert written_packets[0]["kind"] == "build_scene"
+    assert written_packets[1]["kind"] == "render_frame"
+    assert fake_stdin.flush_calls == 2
 
 
-def test_blender_frame_response_requires_gt_pose_and_intrinsics() -> None:
-    with pytest.raises(ValueError, match="pose_world_gt"):
+def test_blender_worker_client_rejects_render_before_scene_build() -> None:
+    client = BlenderWorkerClient(command=["blender"])
+
+    with pytest.raises(RuntimeError, match="build_scene"):
+        client.request_frame(
+            BlenderFrameRequest(
+                frame_index=0,
+                timestamp_sec=0.0,
+                robot_pose=build_living_room_scene_spec().start_pose,
+                camera_pose_world=np.eye(4, dtype=np.float32),
+            )
+        )
+
+
+def test_blender_worker_response_requires_pose_and_intrinsics() -> None:
+    with pytest.raises(ValueError, match="camera_pose_world"):
         BlenderFrameResponse.from_payload(
             {
-                "rgb_path": "/tmp/rgb.png",
+                "rgb_path": "/tmp/rgb.npy",
                 "depth_path": "/tmp/depth.npy",
-                "intrinsics_gt": {"fx": 10.0, "fy": 10.0, "cx": 3.0, "cy": 2.0},
+                "semantic_mask_path": "/tmp/semantic.npy",
+                "instance_mask_path": "/tmp/instance.npy",
+                "intrinsics": {"fx": 10.0, "fy": 10.0, "cx": 8.0, "cy": 6.0},
             }
         )
 
-    with pytest.raises(ValueError, match="intrinsics_gt"):
+    with pytest.raises(ValueError, match="intrinsics"):
         BlenderFrameResponse.from_payload(
             {
-                "rgb_path": "/tmp/rgb.png",
+                "rgb_path": "/tmp/rgb.npy",
                 "depth_path": "/tmp/depth.npy",
-                "pose_world_gt": np.eye(4, dtype=np.float32).tolist(),
+                "semantic_mask_path": "/tmp/semantic.npy",
+                "instance_mask_path": "/tmp/instance.npy",
+                "camera_pose_world": np.eye(4, dtype=np.float32).tolist(),
             }
         )
 
 
-def test_blender_worker_client_raises_clean_error_when_process_fails_to_start() -> None:
-    fake_process = _FakeProcess(
-        stdin=_FakeWritable(),
-        stdout=_FakeReadable([]),
-        stderr=_FakeReadable([b"boom\n"]),
-        poll_result=2,
-    )
-
-    client = BlenderWorkerClient(
-        command=["blender", "--background", "--python", "worker.py"],
-        popen_factory=lambda *_args, **_kwargs: fake_process,
-    )
-
-    with pytest.raises(RuntimeError, match="failed to start"):
-        client.start()
-
-
-def test_blender_worker_client_raises_clean_timeout_on_response_wait() -> None:
+def test_blender_worker_client_raises_timeout_when_no_json_response_arrives() -> None:
     fake_process = _FakeProcess(
         stdin=_FakeWritable(),
         stdout=_FakeReadable([]),
         stderr=_FakeReadable([]),
         poll_result=None,
     )
-
     client = BlenderWorkerClient(
         command=["blender", "--background", "--python", "worker.py"],
         popen_factory=lambda *_args, **_kwargs: fake_process,
@@ -278,80 +185,14 @@ def test_blender_worker_client_raises_clean_timeout_on_response_wait() -> None:
     client.start()
 
     with pytest.raises(TimeoutError, match="timed out"):
-        client.request_frame(
-            BlenderFrameRequest(
-                frame_index=0,
-                timestamp_sec=0.0,
-                scenario_id="studio_open_v1",
-                camera_pose_world=np.eye(4, dtype=np.float32),
-                intrinsics={"fx": 10.0, "fy": 10.0, "cx": 4.0, "cy": 3.0},
-                dynamic_actor_transforms={},
-                lighting_seed=3,
+        client.build_scene(
+            BlenderSceneBuildRequest(
+                scene_spec=build_living_room_scene_spec(),
+                image_width=16,
+                image_height=12,
+                horizontal_fov_deg=72.0,
+                near_plane_m=0.2,
+                far_plane_m=8.0,
             ),
             timeout_sec=0.25,
         )
-
-
-def test_blender_worker_client_times_out_on_partial_stdout_without_newline() -> None:
-    read_stream = None
-    write_stream = None
-    read_fd, write_fd = os.pipe()
-    try:
-        read_stream = os.fdopen(read_fd, "rb", buffering=0)
-        write_stream = os.fdopen(write_fd, "wb", buffering=0)
-        write_stream.write(b'{"rgb_path":"/tmp/rgb.png"')
-        write_stream.flush()
-        fake_process = _FakeProcess(
-            stdin=_FakeWritable(),
-            stdout=read_stream,
-            stderr=_FakeReadable([]),
-            poll_result=None,
-        )
-        client = BlenderWorkerClient(
-            command=["blender", "--background", "--python", "worker.py"],
-            popen_factory=lambda *_args, **_kwargs: fake_process,
-            selector=select.select,
-        )
-        client.start()
-
-        with pytest.raises(TimeoutError, match="timed out"):
-            client.request_frame(
-                BlenderFrameRequest(
-                    frame_index=2,
-                    timestamp_sec=0.2,
-                    scenario_id="studio_open_v1",
-                    camera_pose_world=np.eye(4, dtype=np.float32),
-                    intrinsics={"fx": 10.0, "fy": 10.0, "cx": 4.0, "cy": 3.0},
-                    dynamic_actor_transforms={},
-                    lighting_seed=5,
-                ),
-                timeout_sec=0.05,
-            )
-    finally:
-        try:
-            write_stream.close()
-        except Exception:
-            pass
-        try:
-            read_stream.close()
-        except Exception:
-            pass
-
-
-def test_blender_worker_client_close_terminates_process() -> None:
-    fake_process = _FakeProcess(
-        stdin=_FakeWritable(),
-        stdout=_FakeReadable([]),
-        stderr=_FakeReadable([]),
-        poll_result=None,
-    )
-    client = BlenderWorkerClient(
-        command=["blender", "--background", "--python", "worker.py"],
-        popen_factory=lambda *_args, **_kwargs: fake_process,
-    )
-    client.start()
-
-    client.close()
-
-    assert fake_process.terminate_calls == 1
-    assert fake_process.wait_calls == [1.0]

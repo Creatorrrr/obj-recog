@@ -697,8 +697,9 @@ def run(
     scene_graph_memory = None
     calibration = None
     runtime_settings_path = config.camera_calibration
+    sim_explanation_enabled = bool(config.explanation_enabled and config.input_source != "sim")
     explanation_status = (
-        ExplanationStatus.IDLE if config.explanation_enabled else None
+        ExplanationStatus.IDLE if sim_explanation_enabled else None
     )
     explanation_result = ExplanationResult(
         text="",
@@ -729,16 +730,23 @@ def run(
     depth_debug_level = "basic"
     calibration_source = "disabled/approx"
     frame_source = None
-    sim_perception_mode = getattr(config, "sim_perception_mode", "assisted")
-    use_frame_packet_ground_truth = config.input_source == "sim" and sim_perception_mode == "ground_truth"
-    assist_frame_packet_ground_truth = config.input_source == "sim" and sim_perception_mode == "assisted"
+    sim_perception_mode = "runtime" if config.input_source == "sim" else getattr(config, "sim_perception_mode", "runtime")
+    use_frame_packet_ground_truth = False
+    assist_frame_packet_ground_truth = False
 
     def _default_sim_frame_source(current_config: AppConfig):
-        report_path = Path.cwd() / "reports" / f"{current_config.scenario}-seed{current_config.sim_seed}.json"
+        run_stamp = time.strftime("%Y%m%d-%H%M%S")
+        report_path = (
+            Path.cwd()
+            / "reports"
+            / "sim"
+            / str(current_config.scenario)
+            / run_stamp
+            / "episode_report.json"
+        )
         return SimulationRuntime(
             config=current_config,
             report_path=report_path,
-            cv2_module=cv2,
         ).create_frame_source()
 
     def _live_frame_timestamp() -> float | None:
@@ -800,7 +808,7 @@ def run(
         nonlocal explanation_result
         nonlocal explanation_refresh_status
         nonlocal last_explanation_request_time
-        if not config.explanation_enabled or explanation_worker is None:
+        if not sim_explanation_enabled or explanation_worker is None:
             return False
         preserve_displayed_explanation = bool((explanation_result.text or "").strip()) and (
             explanation_status == ExplanationStatus.READY
@@ -848,7 +856,7 @@ def run(
         nonlocal latest_explanation_timestamp
         nonlocal explanation_refresh_status
         nonlocal last_explanation_request_time
-        if not config.explanation_enabled or explanation_worker is None:
+        if not sim_explanation_enabled or explanation_worker is None:
             explanation_auto_refresh_enabled = False
             explanation_refresh_status = "idle"
             return
@@ -971,7 +979,7 @@ def run(
                 debug_log("segmentation init done")
             except Exception as exc:
                 debug_log(f"segmentation disabled ({exc})")
-        if config.explanation_enabled:
+        if sim_explanation_enabled:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 explanation_status = ExplanationStatus.DISABLED
@@ -1000,7 +1008,7 @@ def run(
                     debug_log(f"explanation disabled ({exc})")
         if validation_probe is not None and hasattr(validation_probe, "on_start"):
             validation_probe.on_start(
-                explanation_api_available=bool(config.explanation_enabled and os.getenv("OPENAI_API_KEY"))
+                explanation_api_available=bool(sim_explanation_enabled and os.getenv("OPENAI_API_KEY"))
             )
         tracker = None
         if use_slam_bridge:
@@ -1065,7 +1073,11 @@ def run(
             layout_primary_height=int(config.height),
         )
         debug_log("viewer init done")
-        if config.input_source == "sim" and environment_viewer_factory is not None:
+        if (
+            config.input_source == "sim"
+            and bool(getattr(config, "sim_open3d_view", True))
+            and environment_viewer_factory is not None
+        ):
             environment_viewer = _build_viewer(
                 environment_viewer_factory,
                 layout_primary_width=int(config.width),
@@ -1128,7 +1140,7 @@ def run(
                 explanation_refresh_status = "idle"
                 last_explanation_request_time = None
                 explanation_button_state["pending_toggle"] = False
-                if config.explanation_enabled:
+                if sim_explanation_enabled:
                     explanation_result = ExplanationResult(
                         text="",
                         status=ExplanationStatus.IDLE,
@@ -1332,17 +1344,17 @@ def run(
                     frame_width=overlay.shape[1],
                     frame_height=overlay.shape[0],
                 )
-                if config.explanation_enabled
+                if sim_explanation_enabled
                 else None
             )
             if (
-                config.explanation_enabled
+                sim_explanation_enabled
                 and not explanation_mouse_callback_registered
                 and callable(getattr(cv2, "setMouseCallback", None))
             ):
                 cv2.setMouseCallback("Object Recognition", _handle_object_window_mouse)
                 explanation_mouse_callback_registered = True
-            if config.explanation_enabled:
+            if sim_explanation_enabled:
                 if int(explanation_panel_state["pending_scroll"]) != 0:
                     explanation_panel_state["scroll_offset"] = max(
                         0,
@@ -1430,7 +1442,7 @@ def run(
                 latest_explanation_request_id = None
                 explanation_refresh_status = "idle"
                 last_explanation_request_time = None
-                if config.explanation_enabled:
+                if sim_explanation_enabled:
                     explanation_result = ExplanationResult(
                         text="",
                         status=ExplanationStatus.IDLE,

@@ -7,6 +7,7 @@ import numpy as np
 
 from obj_recog.opencv_runtime import load_cv2
 from obj_recog.scene_graph import SceneGraphSnapshot
+from obj_recog.sim_scene import build_scene_mesh_components
 from obj_recog.situation_explainer import ExplanationStatus, wrap_explanation_text
 from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
 
@@ -1065,14 +1066,49 @@ class Open3DEnvironmentViewer:
                 render_option.mesh_show_back_face = True
 
     def update(self, scenario_state, *_unused, **_unused_kwargs) -> bool:
-        room_width_m = float(getattr(scenario_state, "room_width_m", 0.0))
-        room_depth_m = float(getattr(scenario_state, "room_depth_m", 0.0))
-        room_height_m = float(getattr(scenario_state, "room_height_m", 0.0))
-        room_vertices, room_triangles, room_colors = _room_mesh_arrays(
-            room_width_m=max(room_width_m, 1.0),
-            room_depth_m=max(room_depth_m, 1.0),
-            room_height_m=max(room_height_m, 1.0),
-        )
+        scene_spec = getattr(scenario_state, "scene_spec", None)
+        robot_pose = getattr(scenario_state, "robot_pose", None)
+        if scene_spec is not None:
+            scene_components = build_scene_mesh_components(scene_spec)
+            room_component_meshes = [
+                (component.vertices_xyz, component.triangles, component.vertex_colors)
+                for component in scene_components
+                if component.semantic_label in {"floor", "wall", "glass", "ceiling"}
+            ]
+            object_component_meshes = [
+                (component.vertices_xyz, component.triangles, component.vertex_colors)
+                for component in scene_components
+                if component.semantic_label not in {"floor", "wall", "glass", "ceiling"}
+            ]
+            room_vertices, room_triangles, room_colors = _combine_triangle_meshes(room_component_meshes)
+            object_vertices, object_triangles, object_colors = _combine_triangle_meshes(object_component_meshes)
+            rig_x = float(getattr(robot_pose, "x", 0.0))
+            rig_y = float(getattr(robot_pose, "y", 1.25))
+            rig_z = float(getattr(robot_pose, "z", 0.0))
+            yaw_deg = float(getattr(robot_pose, "yaw_deg", 0.0))
+        else:
+            room_width_m = float(getattr(scenario_state, "room_width_m", 0.0))
+            room_depth_m = float(getattr(scenario_state, "room_depth_m", 0.0))
+            room_height_m = float(getattr(scenario_state, "room_height_m", 0.0))
+            room_vertices, room_triangles, room_colors = _room_mesh_arrays(
+                room_width_m=max(room_width_m, 1.0),
+                room_depth_m=max(room_depth_m, 1.0),
+                room_height_m=max(room_height_m, 1.0),
+            )
+            object_meshes = [
+                _object_mesh_arrays(
+                    dict(obj),
+                    o3d_module=self._o3d,
+                    preview_mesh_cache=self._preview_mesh_cache,
+                )
+                for obj in tuple(getattr(scenario_state, "environment_objects", ()) or ())
+            ]
+            object_vertices, object_triangles, object_colors = _combine_triangle_meshes(object_meshes)
+            rig_x = float(getattr(scenario_state, "rig_x", 0.0))
+            rig_y = float(getattr(scenario_state, "rig_y", 1.6))
+            rig_z = float(getattr(scenario_state, "rig_z", 0.0))
+            yaw_deg = float(getattr(scenario_state, "yaw_deg", 0.0))
+
         self._room_mesh.vertices = self._o3d.utility.Vector3dVector(_display_points_for_view(room_vertices))
         self._room_mesh.triangles = self._o3d.utility.Vector3iVector(room_triangles)
         self._room_mesh.vertex_colors = self._o3d.utility.Vector3dVector(room_colors)
@@ -1081,15 +1117,6 @@ class Open3DEnvironmentViewer:
             compute_room_normals()
         self._vis.update_geometry(self._room_mesh)
 
-        object_meshes = [
-            _object_mesh_arrays(
-                dict(obj),
-                o3d_module=self._o3d,
-                preview_mesh_cache=self._preview_mesh_cache,
-            )
-            for obj in tuple(getattr(scenario_state, "environment_objects", ()) or ())
-        ]
-        object_vertices, object_triangles, object_colors = _combine_triangle_meshes(object_meshes)
         self._object_mesh.vertices = self._o3d.utility.Vector3dVector(_display_points_for_view(object_vertices))
         self._object_mesh.triangles = self._o3d.utility.Vector3iVector(object_triangles)
         self._object_mesh.vertex_colors = self._o3d.utility.Vector3dVector(object_colors)
@@ -1099,10 +1126,10 @@ class Open3DEnvironmentViewer:
         self._vis.update_geometry(self._object_mesh)
 
         camera_points, camera_lines, camera_colors = _camera_marker_lines(
-            rig_x=float(getattr(scenario_state, "rig_x", 0.0)),
-            rig_y=float(getattr(scenario_state, "rig_y", 1.6)),
-            rig_z=float(getattr(scenario_state, "rig_z", 0.0)),
-            yaw_deg=float(getattr(scenario_state, "yaw_deg", 0.0)),
+            rig_x=rig_x,
+            rig_y=rig_y,
+            rig_z=rig_z,
+            yaw_deg=yaw_deg,
         )
         self._camera_lines.points = self._o3d.utility.Vector3dVector(_display_points_for_view(camera_points))
         self._camera_lines.lines = self._o3d.utility.Vector2iVector(camera_lines)

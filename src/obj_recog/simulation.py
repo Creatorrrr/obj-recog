@@ -1,101 +1,38 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass
 import json
 import math
-import os
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 import numpy as np
 
-from obj_recog.auto_calibration import create_approximate_calibration, refine_focal_lengths
 from obj_recog.blender_worker import (
     BlenderFrameRequest,
-    BlenderFrameResponse,
+    BlenderSceneBuildRequest,
     BlenderWorkerClient,
     build_realtime_blender_worker_command,
 )
-from obj_recog.config import AppConfig, SIM_SCENARIO_CHOICES
+from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
-from obj_recog.opencv_runtime import load_cv2
 from obj_recog.reconstruct import CameraIntrinsics
-from obj_recog.sim_assets import (
-    build_scenario_asset_manifest,
-    photoreal_asset_preflight_issues,
-    write_blender_scene_manifest,
+from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context
+from obj_recog.sim_protocol import (
+    ActionPrimitive,
+    ActionSchedule,
+    ActionStep,
+    EpisodePhase,
+    EpisodeReport,
+    HiddenWorldState,
+    OperatorSceneState,
+    RobotPose,
+    SensorFrame,
 )
-from obj_recog.slam_bridge import KeyframeObservation, TRACKING_OK_STATES
-from obj_recog.types import Detection, FrameArtifacts
+from obj_recog.sim_scene import build_living_room_scene_spec, pose_distance_to_goal
 
 
-_TARGET_LABEL = "target"
-_CAMERA_HEIGHT_METERS = 1.4
-_ROOM_WIDTH_METERS = 6.0
-_ROOM_DEPTH_METERS = 8.0
-_ROOM_HEIGHT_METERS = 3.0
-_PHOTOREAL_STARTUP_TIMEOUT_SEC = 15.0
-_PHOTOREAL_FRAME_TIMEOUT_SEC = 5.0
-_GOAL_SELECTOR_SYSTEM_INSTRUCTIONS = (
-    "You are a camera navigation goal selector. "
-    "Return JSON only with keys target_label, desired_bearing, desired_distance_band, reason, confidence. "
-    "desired_bearing must be a number in radians relative to the current camera forward direction. "
-    "desired_distance_band must be a two-item array [near, far] in meters. "
-    "Do not return coordinates, speed commands, or extra keys."
-)
-_GOAL_SELECTOR_RESPONSE_SCHEMA = {
-    "type": "json_schema",
-    "name": "navigation_goal",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "target_label": {"type": "string"},
-            "desired_bearing": {"type": "number"},
-            "desired_distance_band": {
-                "type": "array",
-                "items": {"type": "number"},
-                "minItems": 2,
-                "maxItems": 2,
-            },
-            "reason": {"type": "string"},
-            "confidence": {"type": "number"},
-        },
-        "required": [
-            "target_label",
-            "desired_bearing",
-            "desired_distance_band",
-            "reason",
-            "confidence",
-        ],
-    },
-}
-
-
-def _response_text(response) -> str:
-    text = getattr(response, "output_text", None)
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-
-    output = getattr(response, "output", None) or []
-    chunks: list[str] = []
-    for item in output:
-        for content in getattr(item, "content", []) or []:
-            value = getattr(content, "text", None)
-            if isinstance(value, str) and value.strip():
-                chunks.append(value.strip())
-    return "\n".join(chunks).strip()
-
-
-@dataclass(frozen=True, slots=True)
-class NavigationGoal:
-    target_label: str
-    desired_bearing: float
-    desired_distance_band: tuple[float, float]
-    reason: str
-    confidence: float
-    source: str = "heuristic"
+SCENARIO_SPECS = {"living_room_navigation_v1": build_living_room_scene_spec()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,11 +43,7 @@ class CameraRigSpec:
     horizontal_fov_deg: float
     near_plane_m: float
     far_plane_m: float
-    enable_distortion: bool
-    depth_noise_std: float
-    motion_blur: float
-    yaw_rate_limit_deg: float
-    linear_velocity_limit_mps: float
+    camera_height_m: float = 1.25
 
     @classmethod
     def from_config(cls, config: AppConfig) -> CameraRigSpec:
@@ -121,2398 +54,457 @@ class CameraRigSpec:
             horizontal_fov_deg=float(config.sim_camera_fov_deg),
             near_plane_m=float(config.sim_camera_near),
             far_plane_m=float(config.sim_camera_far),
-            enable_distortion=bool(config.sim_enable_distortion),
-            depth_noise_std=max(0.0, float(config.sim_depth_noise_std)),
-            motion_blur=float(np.clip(config.sim_motion_blur, 0.0, 0.95)),
-            yaw_rate_limit_deg=float(config.sim_yaw_rate_limit_deg),
-            linear_velocity_limit_mps=float(config.sim_linear_velocity_limit),
         )
 
 
-@dataclass(frozen=True, slots=True)
-class EnvironmentSpec:
-    room_width_m: float
-    room_depth_m: float
-    room_height_m: float
-    start_x: float = 0.0
-    start_z: float = 0.0
-    start_yaw_deg: float = -25.0
-    landmark_points: tuple[tuple[float, float, float], ...] = ()
-    wall_palette_bgr: tuple[tuple[int, int, int], ...] = ((126, 118, 111), (151, 143, 138))
-    floor_palette_bgr: tuple[tuple[int, int, int], ...] = ((82, 74, 65), (57, 51, 45))
-    accent_palette_bgr: tuple[tuple[int, int, int], ...] = ((84, 128, 178), (70, 100, 132))
-
-
-@dataclass(frozen=True, slots=True)
-class LightingSpec:
-    ambient_strength: float = 0.72
-    key_light_strength: float = 0.58
-    shadow_strength: float = 0.3
-    vignette_strength: float = 0.08
-
-
-@dataclass(frozen=True, slots=True)
-class MaterialVariantSpec:
-    floor_texture: str = "wood"
-    wall_texture: str = "paint"
-    accent_texture: str = "matte"
-
-
-@dataclass(frozen=True, slots=True)
-class StaticObjectSpec:
-    label: str
-    center_world: tuple[float, float, float]
-    size_xyz: tuple[float, float, float]
-    color_bgr: tuple[int, int, int]
-
-
-@dataclass(frozen=True, slots=True)
-class DynamicActorSpec:
-    actor_id: str
-    actor_type: str
-    label: str
-    size_xyz: tuple[float, float, float]
-    color_bgr: tuple[int, int, int]
-    base_center_world: tuple[float, float, float]
-    waypoints_world: tuple[tuple[float, float, float], ...]
-    loop_duration_sec: float
-    start_time_sec: float = 0.0
-    phase_offset_sec: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class MissionSpec:
-    target_label: str = _TARGET_LABEL
-    verify_required_streak: int = 3
-    center_tolerance_x_ratio: float = 0.12
-    center_tolerance_y_ratio: float = 0.3
-    min_area_ratio: float = 0.03
-    depth_band_m: tuple[float, float] = (3.2, 5.0)
-    eval_budget_sec_override: float | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ScenarioSpec:
-    scene_id: str
-    scenario_family: str
-    difficulty_level: int
-    environment: EnvironmentSpec
-    static_objects: tuple[StaticObjectSpec, ...]
-    dynamic_actors: tuple[DynamicActorSpec, ...]
-    mission: MissionSpec
-    lighting: LightingSpec = field(default_factory=LightingSpec)
-    material_variant: MaterialVariantSpec = field(default_factory=MaterialVariantSpec)
-
-
-@dataclass(frozen=True, slots=True)
-class SimulationScenarioState:
-    scene_id: str
-    difficulty_level: int
-    phase: str
-    step_index: int
-    elapsed_sec: float
-    selfcal_converged: bool
-    rig_x: float
-    rig_y: float
-    rig_z: float
-    yaw_deg: float
-    room_width_m: float
-    room_depth_m: float
-    room_height_m: float
-    visible_labels: tuple[str, ...]
-    active_goal: NavigationGoal | None
-    target_motion_state: str
-    render_backend: str
-    render_profile: str
-    semantic_target_class: str
-    asset_manifest_id: str
-    environment_objects: tuple[dict[str, object], ...] = ()
-    semantic_mask_path: str | None = None
-    instance_mask_path: str | None = None
-    worker_state: str | None = None
-    render_time_ms: float | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _SceneObject:
-    label: str
-    center_world: tuple[float, float, float]
-    size_xyz: tuple[float, float, float]
-    color_bgr: tuple[int, int, int]
-    yaw_deg: float = 0.0
-    asset_id: str | None = None
-    preview_sprite_path: str | None = None
-    preview_mesh_path: str | None = None
-    asset_metadata_path: str | None = None
-    asset_provenance: str | None = None
-    target_role: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _VisibleObject:
-    label: str
-    bbox: tuple[int, int, int, int]
-    depth_m: float
-    bearing_rad: float
-    area_pixels: int
-    color_bgr: tuple[int, int, int]
-    asset_id: str | None = None
-    target_role: bool = False
-    preview_sprite_path: str | None = None
-    preview_mesh_path: str | None = None
-
-
-@dataclass(slots=True)
-class _RuntimeObservation:
-    timestamp_sec: float | None
-    visible_objects: list[_VisibleObject]
-    tracking_state: str
-    pose_error_m: float | None
-
-
-@dataclass(frozen=True, slots=True)
-class _RenderOutput:
-    frame_bgr: np.ndarray
-    depth_map: np.ndarray
-    visible_objects: list[_VisibleObject]
-    backend: str
-
-
-def _static_object(
-    label: str,
-    center_world: tuple[float, float, float],
-    size_xyz: tuple[float, float, float],
-    color_bgr: tuple[int, int, int],
-) -> StaticObjectSpec:
-    return StaticObjectSpec(
-        label=label,
-        center_world=center_world,
-        size_xyz=size_xyz,
-        color_bgr=color_bgr,
-    )
-
-
-def _dynamic_actor(
-    actor_id: str,
-    actor_type: str,
-    label: str,
-    base_center_world: tuple[float, float, float],
-    size_xyz: tuple[float, float, float],
-    color_bgr: tuple[int, int, int],
-    waypoints_world: tuple[tuple[float, float, float], ...],
-    loop_duration_sec: float,
-    *,
-    start_time_sec: float = 0.0,
-    phase_offset_sec: float = 0.0,
-) -> DynamicActorSpec:
-    return DynamicActorSpec(
-        actor_id=actor_id,
-        actor_type=actor_type,
-        label=label,
-        base_center_world=base_center_world,
-        size_xyz=size_xyz,
-        color_bgr=color_bgr,
-        waypoints_world=waypoints_world,
-        loop_duration_sec=loop_duration_sec,
-        start_time_sec=start_time_sec,
-        phase_offset_sec=phase_offset_sec,
-    )
-
-
-SCENARIO_SPECS: dict[str, ScenarioSpec] = {
-    "studio_open_v1": ScenarioSpec(
-        scene_id="studio_open_v1",
-        scenario_family="studio",
-        difficulty_level=1,
-        environment=EnvironmentSpec(
-            room_width_m=6.0,
-            room_depth_m=8.0,
-            room_height_m=3.0,
-        ),
-        static_objects=(
-            _static_object("table", (0.0, 0.45, 3.1), (1.5, 0.9, 0.8), (95, 145, 190)),
-            _static_object("chair", (-1.1, 0.55, 4.4), (0.7, 1.1, 0.7), (60, 180, 120)),
-            _static_object("plant", (1.8, 0.7, 4.8), (0.6, 1.4, 0.6), (55, 155, 85)),
-            _static_object(_TARGET_LABEL, (1.5, 0.45, 5.4), (0.8, 0.9, 0.8), (40, 80, 225)),
-        ),
-        dynamic_actors=(),
-        mission=MissionSpec(),
-    ),
-    "office_clutter_v1": ScenarioSpec(
-        scene_id="office_clutter_v1",
-        scenario_family="office",
-        difficulty_level=2,
-        environment=EnvironmentSpec(
-            room_width_m=6.5,
-            room_depth_m=8.5,
-            room_height_m=3.0,
-        ),
-        static_objects=(
-            _static_object("desk", (-0.8, 0.45, 3.2), (1.4, 0.9, 0.75), (90, 150, 190)),
-            _static_object("desk", (1.0, 0.45, 4.0), (1.5, 0.9, 0.8), (90, 150, 190)),
-            _static_object("chair", (-1.7, 0.55, 4.5), (0.7, 1.1, 0.7), (60, 180, 120)),
-            _static_object("cabinet", (0.7, 0.85, 4.8), (0.7, 1.7, 0.6), (120, 120, 145)),
-            _static_object("box", (-0.2, 0.35, 5.0), (0.7, 0.7, 0.7), (150, 120, 90)),
-            _static_object(_TARGET_LABEL, (1.7, 0.45, 5.7), (0.8, 0.9, 0.8), (40, 80, 225)),
-        ),
-        dynamic_actors=(),
-        mission=MissionSpec(),
-    ),
-    "lab_corridor_v1": ScenarioSpec(
-        scene_id="lab_corridor_v1",
-        scenario_family="lab",
-        difficulty_level=3,
-        environment=EnvironmentSpec(
-            room_width_m=5.5,
-            room_depth_m=9.5,
-            room_height_m=3.0,
-        ),
-        static_objects=(
-            _static_object("partition", (-1.2, 1.1, 4.6), (0.5, 2.2, 2.0), (110, 110, 120)),
-            _static_object("partition", (0.8, 1.1, 5.1), (0.5, 2.2, 2.3), (110, 110, 120)),
-            _static_object("cart", (-0.2, 0.55, 3.8), (0.9, 1.1, 0.7), (65, 160, 180)),
-            _static_object("pillar", (1.9, 1.0, 5.8), (0.45, 2.0, 0.45), (125, 125, 135)),
-            _static_object(_TARGET_LABEL, (2.1, 0.45, 6.6), (0.8, 0.9, 0.8), (40, 80, 225)),
-        ),
-        dynamic_actors=(),
-        mission=MissionSpec(),
-    ),
-    "showroom_occlusion_v1": ScenarioSpec(
-        scene_id="showroom_occlusion_v1",
-        scenario_family="showroom",
-        difficulty_level=4,
-        environment=EnvironmentSpec(
-            room_width_m=6.8,
-            room_depth_m=8.8,
-            room_height_m=3.2,
-        ),
-        static_objects=(
-            _static_object("display", (-1.6, 0.75, 4.9), (0.9, 1.5, 0.9), (55, 90, 205)),
-            _static_object("display", (-0.3, 0.75, 5.4), (0.9, 1.5, 0.9), (70, 110, 210)),
-            _static_object("display", (0.6, 0.75, 5.0), (0.9, 1.5, 0.9), (58, 95, 208)),
-            _static_object("pedestal", (2.0, 0.5, 4.6), (0.7, 1.0, 0.7), (165, 150, 110)),
-            _static_object(_TARGET_LABEL, (1.4, 0.45, 5.7), (0.85, 0.95, 0.85), (40, 80, 225)),
-        ),
-        dynamic_actors=(
-            _dynamic_actor(
-                "showroom-occluder",
-                "occluder",
-                "occluder",
-                (0.5, 0.8, 5.15),
-                (1.0, 1.6, 0.9),
-                (180, 180, 190),
-                ((0.1, 0.8, 5.0), (1.6, 0.8, 5.2)),
-                4.0,
-                start_time_sec=8.0,
-                phase_offset_sec=0.8,
-            ),
-        ),
-        mission=MissionSpec(),
-    ),
-    "office_crossflow_v1": ScenarioSpec(
-        scene_id="office_crossflow_v1",
-        scenario_family="office",
-        difficulty_level=5,
-        environment=EnvironmentSpec(
-            room_width_m=7.0,
-            room_depth_m=9.0,
-            room_height_m=3.0,
-        ),
-        static_objects=(
-            _static_object("desk", (-1.5, 0.45, 3.6), (1.3, 0.9, 0.8), (90, 150, 190)),
-            _static_object("desk", (1.2, 0.45, 4.2), (1.4, 0.9, 0.8), (90, 150, 190)),
-            _static_object("doorframe", (0.0, 1.1, 5.0), (0.8, 2.2, 0.35), (135, 125, 110)),
-            _static_object("cabinet", (2.1, 0.85, 6.0), (0.8, 1.7, 0.6), (120, 120, 145)),
-            _static_object(_TARGET_LABEL, (1.7, 0.45, 6.3), (0.8, 0.9, 0.8), (40, 80, 225)),
-        ),
-        dynamic_actors=(
-            _dynamic_actor(
-                "crossflow-left",
-                "distractor",
-                "distractor",
-                (-1.8, 0.6, 4.9),
-                (0.7, 1.2, 0.7),
-                (80, 190, 225),
-                ((-2.1, 0.6, 4.7), (0.6, 0.6, 4.7)),
-                5.5,
-                start_time_sec=8.0,
-            ),
-            _dynamic_actor(
-                "crossflow-right",
-                "distractor",
-                "distractor",
-                (1.8, 0.6, 5.6),
-                (0.75, 1.2, 0.75),
-                (130, 185, 75),
-                ((1.9, 0.6, 5.8), (-0.8, 0.6, 5.2)),
-                6.0,
-                start_time_sec=8.0,
-                phase_offset_sec=1.2,
-            ),
-        ),
-        mission=MissionSpec(),
-    ),
-    "warehouse_moving_target_v1": ScenarioSpec(
-        scene_id="warehouse_moving_target_v1",
-        scenario_family="warehouse",
-        difficulty_level=6,
-        environment=EnvironmentSpec(
-            room_width_m=8.0,
-            room_depth_m=10.0,
-            room_height_m=3.5,
-        ),
-        static_objects=(
-            _static_object("shelf", (-2.0, 1.0, 5.0), (0.8, 2.0, 2.8), (110, 130, 170)),
-            _static_object("shelf", (2.3, 1.0, 5.6), (0.8, 2.0, 2.8), (110, 130, 170)),
-            _static_object("pillar", (-0.2, 1.0, 6.0), (0.45, 2.0, 0.45), (135, 135, 145)),
-            _static_object("box", (1.0, 0.4, 4.6), (0.8, 0.8, 0.8), (155, 120, 90)),
-            _static_object("crate", (-1.1, 0.45, 6.9), (0.9, 0.9, 0.9), (145, 105, 82)),
-        ),
-        dynamic_actors=(
-            _dynamic_actor(
-                "warehouse-target",
-                "moving_target",
-                _TARGET_LABEL,
-                (1.8, 0.45, 5.8),
-                (0.8, 0.9, 0.8),
-                (40, 80, 225),
-                ((1.8, 0.45, 5.8), (0.7, 0.45, 6.4), (-0.4, 0.45, 5.8), (0.9, 0.45, 5.1)),
-                6.5,
-            ),
-            _dynamic_actor(
-                "warehouse-occluder",
-                "occluder",
-                "occluder",
-                (0.2, 0.8, 5.1),
-                (0.95, 1.6, 0.85),
-                (180, 180, 190),
-                ((-0.6, 0.8, 5.0), (1.4, 0.8, 5.2)),
-                4.5,
-                start_time_sec=8.0,
-                phase_offset_sec=0.4,
-            ),
-            _dynamic_actor(
-                "warehouse-distractor-a",
-                "distractor",
-                "distractor",
-                (-1.6, 0.55, 4.8),
-                (0.75, 1.1, 0.75),
-                (80, 190, 225),
-                ((-1.8, 0.55, 4.5), (0.4, 0.55, 4.8)),
-                5.0,
-                start_time_sec=8.0,
-            ),
-            _dynamic_actor(
-                "warehouse-distractor-b",
-                "distractor",
-                "distractor",
-                (1.9, 0.55, 6.6),
-                (0.75, 1.1, 0.75),
-                (130, 185, 75),
-                ((2.1, 0.55, 6.7), (-0.5, 0.55, 6.0)),
-                6.0,
-                start_time_sec=8.0,
-                phase_offset_sec=1.0,
-            ),
-        ),
-        mission=MissionSpec(),
-    ),
-}
-
-if tuple(SCENARIO_SPECS) != tuple(SIM_SCENARIO_CHOICES):
-    raise RuntimeError("scenario registry does not match configured CLI scenario choices")
-
-
-class GoalSelector(Protocol):
-    def select_goal(self, *, visible_objects: list[_VisibleObject], target_label: str) -> NavigationGoal | None:
+class LivingRoomSensorBackend(Protocol):
+    def build_scene(self, scene_spec) -> None:
         ...
 
-
-class SceneRenderer(Protocol):
-    backend_name: str
-
-    def render(
-        self,
-        *,
-        pose_world: np.ndarray,
-        intrinsics: CameraIntrinsics,
-        scene_objects: list[_SceneObject],
-        previous_frame_bgr: np.ndarray | None,
-    ) -> _RenderOutput:
-        ...
-
-
-def _pose_world_matrix(x: float, z: float, yaw_rad: float) -> np.ndarray:
-    c = math.cos(yaw_rad)
-    s = math.sin(yaw_rad)
-    pose = np.eye(4, dtype=np.float32)
-    pose[:3, :3] = np.array(
-        [
-            [c, 0.0, s],
-            [0.0, 1.0, 0.0],
-            [-s, 0.0, c],
-        ],
-        dtype=np.float32,
-    )
-    pose[:3, 3] = np.array([x, _CAMERA_HEIGHT_METERS, z], dtype=np.float32)
-    return pose
-
-
-def _translation_pose_matrix(center_world: tuple[float, float, float], *, yaw_rad: float = 0.0) -> np.ndarray:
-    c = math.cos(yaw_rad)
-    s = math.sin(yaw_rad)
-    pose = np.eye(4, dtype=np.float32)
-    pose[:3, :3] = np.array(
-        [
-            [c, 0.0, s],
-            [0.0, 1.0, 0.0],
-            [-s, 0.0, c],
-        ],
-        dtype=np.float32,
-    )
-    pose[:3, 3] = np.asarray(center_world, dtype=np.float32)
-    return pose
-
-
-def _object_corners(item: _SceneObject) -> np.ndarray:
-    center = np.asarray(item.center_world, dtype=np.float32)
-    half = np.asarray(item.size_xyz, dtype=np.float32) * 0.5
-    corners: list[np.ndarray] = []
-    for dx in (-half[0], half[0]):
-        for dy in (-half[1], half[1]):
-            for dz in (-half[2], half[2]):
-                corners.append(center + np.array([dx, dy, dz], dtype=np.float32))
-    return np.asarray(corners, dtype=np.float32)
-
-
-def _project_points(
-    points_world: np.ndarray,
-    *,
-    pose_world: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    near_plane_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    world_to_camera = np.linalg.inv(np.asarray(pose_world, dtype=np.float32))
-    homogeneous = np.concatenate(
-        (points_world.astype(np.float32), np.ones((points_world.shape[0], 1), dtype=np.float32)),
-        axis=1,
-    )
-    camera = (world_to_camera @ homogeneous.T).T[:, :3]
-    valid = camera[:, 2] > max(float(near_plane_m), 1e-3)
-    projected = np.empty((points_world.shape[0], 2), dtype=np.float32)
-    projected[:, 0] = intrinsics.fx * (camera[:, 0] / np.maximum(camera[:, 2], 1e-6)) + intrinsics.cx
-    projected[:, 1] = intrinsics.fy * (-camera[:, 1] / np.maximum(camera[:, 2], 1e-6)) + intrinsics.cy
-    return projected, valid
-
-
-def _visible_object(
-    item: _SceneObject,
-    *,
-    pose_world: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    rig: CameraRigSpec,
-) -> _VisibleObject | None:
-    corners = _object_corners(item)
-    projected, valid = _project_points(
-        corners,
-        pose_world=pose_world,
-        intrinsics=intrinsics,
-        near_plane_m=rig.near_plane_m,
-    )
-    if not np.any(valid):
-        return None
-
-    center = np.asarray(item.center_world, dtype=np.float32).reshape(1, 3)
-    center_camera = (np.linalg.inv(pose_world) @ np.append(center[0], 1.0).astype(np.float32))[:3]
-    if center_camera[2] <= max(float(rig.near_plane_m), 1e-3):
-        return None
-
-    valid_projected = projected[valid]
-    width = rig.image_width
-    height = rig.image_height
-    x1 = max(0, int(math.floor(float(np.min(valid_projected[:, 0])))))
-    y1 = max(0, int(math.floor(float(np.min(valid_projected[:, 1])))))
-    x2 = min(width, int(math.ceil(float(np.max(valid_projected[:, 0])))))
-    y2 = min(height, int(math.ceil(float(np.max(valid_projected[:, 1])))))
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        return None
-
-    bearing = math.atan2(float(center_camera[0]), float(center_camera[2]))
-    area = max(0, x2 - x1) * max(0, y2 - y1)
-    return _VisibleObject(
-        label=item.label,
-        bbox=(x1, y1, x2, y2),
-        depth_m=float(center_camera[2]),
-        bearing_rad=bearing,
-        area_pixels=area,
-        color_bgr=item.color_bgr,
-        asset_id=item.asset_id,
-        target_role=item.target_role,
-        preview_sprite_path=item.preview_sprite_path,
-        preview_mesh_path=item.preview_mesh_path,
-    )
-
-
-def _visible_objects_for_scene(
-    *,
-    scene_objects: list[_SceneObject],
-    pose_world: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    rig: CameraRigSpec,
-) -> list[_VisibleObject]:
-    candidates = [
-        item
-        for item in (_visible_object(obj, pose_world=pose_world, intrinsics=intrinsics, rig=rig) for obj in scene_objects)
-        if item is not None
-    ]
-    return _filter_occluded_visible_objects(candidates)
-
-
-def _bbox_intersection_area(
-    left: tuple[int, int, int, int],
-    right: tuple[int, int, int, int],
-) -> int:
-    x1 = max(int(left[0]), int(right[0]))
-    y1 = max(int(left[1]), int(right[1]))
-    x2 = min(int(left[2]), int(right[2]))
-    y2 = min(int(left[3]), int(right[3]))
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-
-def _filter_occluded_visible_objects(visible_objects: list[_VisibleObject]) -> list[_VisibleObject]:
-    if len(visible_objects) < 2:
-        return sorted(visible_objects, key=lambda item: float(item.depth_m), reverse=True)
-
-    kept_near_first: list[_VisibleObject] = []
-    for candidate in sorted(visible_objects, key=lambda item: float(item.depth_m)):
-        occluded = False
-        for closer in kept_near_first:
-            overlap_area = _bbox_intersection_area(candidate.bbox, closer.bbox)
-            overlap_ratio = overlap_area / max(float(candidate.area_pixels), 1.0)
-            if overlap_ratio >= 0.6 and float(closer.depth_m) + 0.15 < float(candidate.depth_m):
-                occluded = True
-                break
-        if not occluded:
-            kept_near_first.append(candidate)
-    kept_near_first.sort(key=lambda item: float(item.depth_m), reverse=True)
-    return kept_near_first
-
-
-def _lerp_point(
-    start: tuple[float, float, float],
-    end: tuple[float, float, float],
-    alpha: float,
-) -> tuple[float, float, float]:
-    return (
-        float(start[0] + ((end[0] - start[0]) * alpha)),
-        float(start[1] + ((end[1] - start[1]) * alpha)),
-        float(start[2] + ((end[2] - start[2]) * alpha)),
-    )
-
-
-def _resolve_waypoint_loop_position(actor: DynamicActorSpec, *, elapsed_sec: float) -> tuple[float, float, float]:
-    if not actor.waypoints_world:
-        return actor.base_center_world
-    if len(actor.waypoints_world) == 1:
-        return actor.waypoints_world[0]
-    effective_elapsed = max(0.0, float(elapsed_sec) - float(actor.start_time_sec)) + float(actor.phase_offset_sec)
-    loop_duration = max(float(actor.loop_duration_sec), 1e-6)
-    segment_duration = loop_duration / float(len(actor.waypoints_world))
-    phase_time = effective_elapsed % loop_duration
-    segment_index = int(phase_time / segment_duration) % len(actor.waypoints_world)
-    next_index = (segment_index + 1) % len(actor.waypoints_world)
-    alpha = (phase_time - (segment_index * segment_duration)) / max(segment_duration, 1e-6)
-    return _lerp_point(
-        actor.waypoints_world[segment_index],
-        actor.waypoints_world[next_index],
-        float(alpha),
-    )
-
-
-def _scene_object_from_specs(
-    *,
-    label: str,
-    center_world: tuple[float, float, float],
-    size_xyz: tuple[float, float, float],
-    color_bgr: tuple[int, int, int],
-    yaw_deg: float = 0.0,
-    asset_id: str | None = None,
-    preview_sprite_path: str | None = None,
-    preview_mesh_path: str | None = None,
-    asset_metadata_path: str | None = None,
-    asset_provenance: str | None = None,
-    target_role: bool = False,
-) -> _SceneObject:
-    return _SceneObject(
-        label=label,
-        center_world=center_world,
-        size_xyz=size_xyz,
-        color_bgr=color_bgr,
-        yaw_deg=float(yaw_deg),
-        asset_id=asset_id,
-        preview_sprite_path=preview_sprite_path,
-        preview_mesh_path=preview_mesh_path,
-        asset_metadata_path=asset_metadata_path,
-        asset_provenance=asset_provenance,
-        target_role=target_role,
-    )
-
-
-def _environment_object_snapshots(
-    scene_objects: list[object] | tuple[object, ...],
-    *,
-    visible_objects: list[_VisibleObject] | tuple[_VisibleObject, ...] = (),
-) -> tuple[dict[str, object], ...]:
-    visible_keys = {
-        (str(item.label), bool(getattr(item, "target_role", False)))
-        for item in visible_objects
-    }
-    snapshots: list[dict[str, object]] = []
-    for item in scene_objects:
-        raw_label = getattr(item, "label", None)
-        if raw_label is None:
-            raw_label = getattr(item, "semantic_class")
-        label = str(raw_label)
-        target_role = bool(getattr(item, "target_role", False))
-        snapshots.append(
-            {
-                "label": label,
-                "asset_id": getattr(item, "asset_id", None),
-                "center_world": tuple(float(value) for value in getattr(item, "center_world")),
-                "size_xyz": tuple(float(value) for value in getattr(item, "size_xyz")),
-                "yaw_deg": float(getattr(item, "yaw_deg", 0.0)),
-                "color_bgr": tuple(int(value) for value in getattr(item, "color_bgr")),
-                "preview_sprite_path": getattr(item, "preview_sprite_path", None),
-                "preview_mesh_path": getattr(item, "preview_mesh_path", None),
-                "asset_metadata_path": getattr(item, "asset_metadata_path", None),
-                "asset_provenance": getattr(item, "asset_provenance", None),
-                "render_representation": getattr(item, "render_representation", "mesh"),
-                "target_role": target_role,
-                "visible": (label, target_role) in visible_keys,
-            }
-        )
-    return tuple(snapshots)
-
-
-def _get_scenario_spec(scene_id: str) -> ScenarioSpec:
-    if scene_id not in SCENARIO_SPECS:
-        raise ValueError(f"unsupported scenario: {scene_id}")
-    return SCENARIO_SPECS[scene_id]
-
-
-class OpenAINavigationGoalSelector:
-    def __init__(
-        self,
-        *,
-        model: str,
-        timeout_sec: float,
-        api_key: str | None = None,
-        client=None,
-    ) -> None:
-        self._model = model
-        self._timeout_sec = float(timeout_sec)
-        self._api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self._client = client
-        self._client_disabled = False
-
-    def _ensure_client(self):
-        if self._client is not None:
-            return self._client
-        if self._client_disabled or not self._api_key:
-            return None
-        try:
-            from openai import OpenAI
-        except ImportError:  # pragma: no cover - depends on local install.
-            self._client_disabled = True
-            return None
-        try:
-            self._client = OpenAI(api_key=self._api_key, timeout=self._timeout_sec)
-        except Exception:
-            self._client_disabled = True
-            return None
-        return self._client
-
-    def select_goal(self, *, visible_objects: list[_VisibleObject], target_label: str) -> NavigationGoal | None:
-        client = self._ensure_client()
-        if client is None:
-            return None
-        summary = {
-            "target_label": target_label,
-            "visible_objects": [
-                {
-                    "label": item.label,
-                    "bearing_rad": round(float(item.bearing_rad), 4),
-                    "depth_m": round(float(item.depth_m), 4),
-                    "area_pixels": int(item.area_pixels),
-                    "bbox": list(item.bbox),
-                }
-                for item in visible_objects[:8]
-            ],
-        }
-        request_kwargs = dict(
-            model=self._model,
-            instructions=_GOAL_SELECTOR_SYSTEM_INSTRUCTIONS,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": json.dumps(summary, ensure_ascii=False)},
-                    ],
-                }
-            ],
-            max_output_tokens=180,
-            timeout=self._timeout_sec,
-            text={"format": dict(_GOAL_SELECTOR_RESPONSE_SCHEMA), "verbosity": "low"},
-        )
-        if str(self._model).startswith("gpt-5"):
-            request_kwargs["reasoning"] = {"effort": "minimal"}
-
-        try:
-            response = client.responses.create(**request_kwargs)
-            payload = json.loads(_response_text(response))
-        except Exception:
-            return None
-
-        try:
-            distance_band = tuple(float(value) for value in payload["desired_distance_band"])
-            if len(distance_band) != 2:
-                return None
-            return NavigationGoal(
-                target_label=str(payload["target_label"]),
-                desired_bearing=float(payload["desired_bearing"]),
-                desired_distance_band=(distance_band[0], distance_band[1]),
-                reason=str(payload["reason"]),
-                confidence=float(payload["confidence"]),
-                source="llm",
-            )
-        except Exception:
-            return None
-
-
-class HeuristicGoalSelector:
-    def select_goal(self, *, visible_objects: list[_VisibleObject], target_label: str) -> NavigationGoal | None:
-        for item in visible_objects:
-            if item.label != target_label:
-                continue
-            return NavigationGoal(
-                target_label=target_label,
-                desired_bearing=0.0,
-                desired_distance_band=(3.1, 3.6),
-                reason="Keep the target centered and close enough for verification.",
-                confidence=0.98,
-            )
-        return None
-
-
-class AnalyticSceneRenderer:
-    backend_name = "analytic"
-
-    def __init__(
-        self,
-        *,
-        rig: CameraRigSpec,
-        rng=None,
-        environment: EnvironmentSpec | None = None,
-        lighting: LightingSpec | None = None,
-        material_variant: MaterialVariantSpec | None = None,
-        cv2_module=None,
-    ) -> None:
-        self._rig = rig
-        self._rng = rng or np.random.default_rng(0)
-        self._environment = environment
-        self._lighting = lighting or LightingSpec()
-        self._material_variant = material_variant or MaterialVariantSpec()
-        self._cv2 = load_cv2(cv2_module)
-        self._sprite_cache: dict[str, np.ndarray] = {}
-
-    def render(
-        self,
-        *,
-        pose_world: np.ndarray,
-        intrinsics: CameraIntrinsics,
-        scene_objects: list[_SceneObject],
-        previous_frame_bgr: np.ndarray | None,
-    ) -> _RenderOutput:
-        frame = self._render_room_background()
-        depth_map = np.full(frame.shape[:2], float(self._rig.far_plane_m), dtype=np.float32)
-
-        visible_objects = _visible_objects_for_scene(
-            scene_objects=scene_objects,
-            pose_world=pose_world,
-            intrinsics=intrinsics,
-            rig=self._rig,
-        )
-        for item in visible_objects:
-            x1, y1, x2, y2 = item.bbox
-            if x2 <= x1 or y2 <= y1:
-                continue
-            self._draw_shadow(frame, item)
-            sprite = self._load_sprite(item.preview_sprite_path, item.color_bgr)
-            sprite = self._cv2.resize(sprite, (x2 - x1, y2 - y1), interpolation=self._cv2.INTER_LINEAR)
-            self._alpha_composite(frame, sprite, x1, y1, brightness=max(0.58, 1.15 - (item.depth_m * 0.09)))
-            noise = self._rng.normal(0.0, float(self._rig.depth_noise_std), size=(y2 - y1, x2 - x1))
-            depth_map[y1:y2, x1:x2] = np.clip(
-                float(item.depth_m)
-                + np.linspace(-0.08, 0.08, y2 - y1, dtype=np.float32)[:, None]
-                + noise.astype(np.float32),
-                float(self._rig.near_plane_m),
-                float(self._rig.far_plane_m),
-            )
-
-        if previous_frame_bgr is not None and float(self._rig.motion_blur) > 0.0:
-            alpha = float(self._rig.motion_blur)
-            frame = np.clip(
-                ((1.0 - alpha) * frame.astype(np.float32)) + (alpha * previous_frame_bgr.astype(np.float32)),
-                0.0,
-                255.0,
-            ).astype(np.uint8)
-
-        return _RenderOutput(
-            frame_bgr=frame,
-            depth_map=depth_map,
-            visible_objects=visible_objects,
-            backend=self.backend_name,
-        )
-
-    def _render_room_background(self) -> np.ndarray:
-        height = self._rig.image_height
-        width = self._rig.image_width
-        frame = np.zeros((height, width, 3), dtype=np.uint8)
-        horizon = max(1, int(height * 0.46))
-        wall_top = np.asarray(self._environment.wall_palette_bgr[0], dtype=np.float32)
-        wall_bottom = np.asarray(self._environment.wall_palette_bgr[-1], dtype=np.float32)
-        floor_near = np.asarray(self._environment.floor_palette_bgr[0], dtype=np.float32)
-        floor_far = np.asarray(self._environment.floor_palette_bgr[-1], dtype=np.float32)
-
-        for y in range(horizon):
-            alpha = y / max(horizon - 1, 1)
-            row = ((1.0 - alpha) * wall_top) + (alpha * wall_bottom)
-            frame[y, :, :] = np.clip(row, 0.0, 255.0).astype(np.uint8)
-        for y in range(horizon, height):
-            alpha = (y - horizon) / max(height - horizon - 1, 1)
-            row = ((1.0 - alpha) * floor_far) + (alpha * floor_near)
-            frame[y, :, :] = np.clip(row, 0.0, 255.0).astype(np.uint8)
-
-        xs = np.linspace(-1.0, 1.0, width, dtype=np.float32)
-        vignette = 1.0 - (self._lighting.vignette_strength * np.square(xs))[None, :, None]
-        frame = np.clip(frame.astype(np.float32) * vignette, 0.0, 255.0).astype(np.uint8)
-
-        self._draw_floor_perspective(frame, horizon)
-        noise = self._rng.normal(0.0, 5.0, size=frame.shape).astype(np.float32)
-        frame = np.clip(frame.astype(np.float32) + noise, 0.0, 255.0).astype(np.uint8)
-        return frame
-
-    def _draw_floor_perspective(self, frame: np.ndarray, horizon: int) -> None:
-        height, width = frame.shape[:2]
-        vanishing_x = width // 2
-        grid_color = tuple(int(v) for v in self._environment.accent_palette_bgr[0])
-        for offset in range(-5, 6):
-            start_x = int(((offset + 6) / 12.0) * width)
-            self._cv2.line(frame, (start_x, height - 1), (vanishing_x, horizon), grid_color, 1, self._cv2.LINE_AA)
-        for row in range(1, 7):
-            y = int(horizon + (1.0 - (0.78 ** row)) * (height - horizon))
-            self._cv2.line(frame, (0, y), (width, y), grid_color, 1, self._cv2.LINE_AA)
-        self._cv2.rectangle(frame, (0, 0), (width, max(1, horizon // 8)), tuple(int(v) for v in self._environment.accent_palette_bgr[-1]), -1)
-
-    def _draw_shadow(self, frame: np.ndarray, item: _VisibleObject) -> None:
-        x1, y1, x2, y2 = item.bbox
-        shadow = np.zeros_like(frame)
-        center = (int((x1 + x2) * 0.5), max(y1 + 2, int(y2 - max(4, (y2 - y1) * 0.08))))
-        axes = (
-            max(4, int((x2 - x1) * 0.48)),
-            max(2, int((y2 - y1) * 0.14)),
-        )
-        self._cv2.ellipse(shadow, center, axes, 0.0, 0.0, 360.0, (18, 20, 22), -1, self._cv2.LINE_AA)
-        blur = self._cv2.GaussianBlur(shadow, (0, 0), sigmaX=3.2, sigmaY=2.4)
-        mask = np.any(blur > 0, axis=2, keepdims=True)
-        darkened = np.clip((frame.astype(np.float32) * 0.92) - (blur.astype(np.float32) * 0.18), 0.0, 255.0)
-        frame[:] = np.where(mask, darkened.astype(np.uint8), frame)
-
-    def _load_sprite(self, preview_sprite_path: str | None, color_bgr: tuple[int, int, int]) -> np.ndarray:
-        if preview_sprite_path is None:
-            sprite = np.zeros((128, 128, 4), dtype=np.uint8)
-            sprite[:, :, :3] = np.asarray(color_bgr, dtype=np.uint8)
-            sprite[:, :, 3] = 255
-            return sprite
-        cache_key = str(preview_sprite_path)
-        cached = self._sprite_cache.get(cache_key)
-        if cached is not None:
-            return cached.copy()
-        sprite = self._cv2.imread(cache_key, self._cv2.IMREAD_UNCHANGED)
-        if sprite is None:
-            sprite = np.zeros((128, 128, 4), dtype=np.uint8)
-            sprite[:, :, :3] = np.asarray(color_bgr, dtype=np.uint8)
-            sprite[:, :, 3] = 255
-        elif sprite.ndim == 2:
-            sprite = np.repeat(sprite[:, :, None], 4, axis=2)
-        elif sprite.shape[2] == 3:
-            alpha = np.full(sprite.shape[:2] + (1,), 255, dtype=np.uint8)
-            sprite = np.concatenate((sprite, alpha), axis=2)
-        self._sprite_cache[cache_key] = sprite
-        return sprite.copy()
-
-    def _alpha_composite(
-        self,
-        frame: np.ndarray,
-        sprite_rgba: np.ndarray,
-        x: int,
-        y: int,
-        *,
-        brightness: float,
-    ) -> None:
-        sprite = sprite_rgba.astype(np.float32).copy()
-        sprite[:, :, :3] = np.clip(sprite[:, :, :3] * float(brightness), 0.0, 255.0)
-        height, width = sprite.shape[:2]
-        x2 = min(frame.shape[1], x + width)
-        y2 = min(frame.shape[0], y + height)
-        if x >= x2 or y >= y2:
-            return
-        sprite = sprite[: y2 - y, : x2 - x]
-        alpha = (sprite[:, :, 3:4] / 255.0).astype(np.float32)
-        base = frame[y:y2, x:x2].astype(np.float32)
-        blended = (sprite[:, :, :3] * alpha) + (base * (1.0 - alpha))
-        frame[y:y2, x:x2] = np.clip(blended, 0.0, 255.0).astype(np.uint8)
-
-
-class Open3DSceneRenderer:
-    backend_name = "open3d"
-
-    def __init__(
-        self,
-        *,
-        rig: CameraRigSpec,
-        environment: EnvironmentSpec | None = None,
-        o3d_module=None,
-    ) -> None:
-        if o3d_module is None:
-            import open3d as o3d
-        else:
-            o3d = o3d_module
-        self._o3d = o3d
-        self._rig = rig
-        self._environment = environment or EnvironmentSpec(
-            room_width_m=_ROOM_WIDTH_METERS,
-            room_depth_m=_ROOM_DEPTH_METERS,
-            room_height_m=_ROOM_HEIGHT_METERS,
-        )
-        rendering = getattr(getattr(o3d, "visualization", None), "rendering", None)
-        offscreen_renderer = None if rendering is None else getattr(rendering, "OffscreenRenderer", None)
-        if rendering is None or offscreen_renderer is None:
-            raise RuntimeError("open3d rendering.OffscreenRenderer is required for open3d sim rendering")
-        self._rendering = rendering
-        self._renderer = offscreen_renderer(rig.image_width, rig.image_height)
-
-    def render(
-        self,
-        *,
-        pose_world: np.ndarray,
-        intrinsics: CameraIntrinsics,
-        scene_objects: list[_SceneObject],
-        previous_frame_bgr: np.ndarray | None,
-    ) -> _RenderOutput:
-        scene = self._renderer.scene
-        clear_geometry = getattr(scene, "clear_geometry", None)
-        if callable(clear_geometry):
-            clear_geometry()
-        set_background = getattr(scene, "set_background", None)
-        if callable(set_background):
-            set_background(np.array([0.08, 0.08, 0.10, 1.0], dtype=np.float32))
-
-        material = self._rendering.MaterialRecord()
-        material.shader = "defaultLit"
-        self._add_room_geometry(scene, material)
-        for index, item in enumerate(scene_objects):
-            mesh = self._create_box_mesh(item)
-            color_bgr = np.asarray(item.color_bgr, dtype=np.float32) / 255.0
-            mesh.paint_uniform_color(color_bgr[::-1].tolist())
-            scene.add_geometry(f"obj-{index}-{item.label}", mesh, material)
-
-        eye = np.asarray(pose_world[:3, 3], dtype=np.float32)
-        forward = np.asarray(pose_world[:3, 2], dtype=np.float32)
-        center = eye + forward * 3.0
-        up = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
-        vertical_fov_deg = math.degrees(
-            2.0 * math.atan((self._rig.image_height * 0.5) / max(float(intrinsics.fy), 1e-6))
-        )
-        self._renderer.setup_camera(float(vertical_fov_deg), center, eye, up)
-
-        color_image = np.asarray(self._renderer.render_to_image())
-        if color_image.ndim == 2:
-            color_image = np.repeat(color_image[:, :, None], 3, axis=2)
-        if color_image.shape[-1] == 4:
-            color_image = color_image[:, :, :3]
-        frame = np.asarray(color_image[:, :, ::-1], dtype=np.uint8).copy()
-        depth_image = np.asarray(self._renderer.render_to_depth_image(z_in_view_space=True), dtype=np.float32)
-        depth_map = np.where(np.isfinite(depth_image), depth_image, float(self._rig.far_plane_m)).astype(np.float32)
-        depth_map = np.clip(depth_map, float(self._rig.near_plane_m), float(self._rig.far_plane_m))
-        if previous_frame_bgr is not None and float(self._rig.motion_blur) > 0.0:
-            alpha = float(self._rig.motion_blur)
-            frame = np.clip(
-                ((1.0 - alpha) * frame.astype(np.float32)) + (alpha * previous_frame_bgr.astype(np.float32)),
-                0.0,
-                255.0,
-            ).astype(np.uint8)
-
-        visible_objects = _visible_objects_for_scene(
-            scene_objects=scene_objects,
-            pose_world=pose_world,
-            intrinsics=intrinsics,
-            rig=self._rig,
-        )
-        return _RenderOutput(
-            frame_bgr=frame,
-            depth_map=depth_map,
-            visible_objects=visible_objects,
-            backend=self.backend_name,
-        )
-
-    def _create_box_mesh(self, item: _SceneObject):
-        mesh = self._o3d.geometry.TriangleMesh.create_box(
-            width=float(item.size_xyz[0]),
-            height=float(item.size_xyz[1]),
-            depth=float(item.size_xyz[2]),
-        )
-        mesh.translate(
-            np.array(
-                [
-                    float(item.center_world[0] - item.size_xyz[0] * 0.5),
-                    float(item.center_world[1] - item.size_xyz[1] * 0.5),
-                    float(item.center_world[2] - item.size_xyz[2] * 0.5),
-                ],
-                dtype=np.float64,
-            )
-        )
-        compute_normals = getattr(mesh, "compute_vertex_normals", None)
-        if callable(compute_normals):
-            compute_normals()
-        return mesh
-
-    def _add_room_geometry(self, scene, material) -> None:
-        environment = self._environment
-        room_surfaces = [
-            ("floor", (environment.room_width_m, 0.05, environment.room_depth_m), (0.0, -0.025, environment.room_depth_m * 0.5), (0.35, 0.35, 0.38)),
-            ("back-wall", (environment.room_width_m, environment.room_height_m, 0.05), (0.0, environment.room_height_m * 0.5, environment.room_depth_m), (0.45, 0.42, 0.40)),
-            ("left-wall", (0.05, environment.room_height_m, environment.room_depth_m), (-environment.room_width_m * 0.5, environment.room_height_m * 0.5, environment.room_depth_m * 0.5), (0.42, 0.40, 0.38)),
-            ("right-wall", (0.05, environment.room_height_m, environment.room_depth_m), (environment.room_width_m * 0.5, environment.room_height_m * 0.5, environment.room_depth_m * 0.5), (0.42, 0.40, 0.38)),
-        ]
-        for name, size, center, color in room_surfaces:
-            mesh = self._o3d.geometry.TriangleMesh.create_box(*map(float, size))
-            mesh.translate(
-                np.array(
-                    [
-                        float(center[0] - size[0] * 0.5),
-                        float(center[1] - size[1] * 0.5),
-                        float(center[2] - size[2] * 0.5),
-                    ],
-                    dtype=np.float64,
-                )
-            )
-            mesh.paint_uniform_color(list(color))
-            compute_normals = getattr(mesh, "compute_vertex_normals", None)
-            if callable(compute_normals):
-                compute_normals()
-            scene.add_geometry(name, mesh, material)
-
-
-class ExternalManifestFrameSource:
-    def __init__(self, *, manifest_path: str | Path, cv2_module=None) -> None:
-        self._manifest_path = Path(manifest_path)
-        self._root = self._manifest_path.parent
-        self._cv2_module = cv2_module
-        self._frames = list((json.loads(self._manifest_path.read_text(encoding="utf-8"))).get("frames") or [])
-        self._index = 0
-
-    def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
-        _ = timeout_sec
-        if self._index >= len(self._frames):
-            return None
-        frame_entry = dict(self._frames[self._index])
-        self._index += 1
-
-        frame_bgr = self._load_array_or_image(frame_entry["rgb_path"])
-        depth_path = frame_entry.get("depth_path")
-        depth_map = None if depth_path is None else np.asarray(self._load_array_or_image(depth_path), dtype=np.float32)
-        semantic_mask_path = frame_entry.get("semantic_mask_path")
-        semantic_mask = (
-            None
-            if semantic_mask_path is None
-            else np.asarray(self._load_array_or_image(semantic_mask_path), dtype=np.uint8)
-        )
-        instance_mask_path = frame_entry.get("instance_mask_path")
-        instance_mask = (
-            None
-            if instance_mask_path is None
-            else np.asarray(self._load_array_or_image(instance_mask_path), dtype=np.uint8)
-        )
-        pose_world_gt = frame_entry.get("pose_world_gt")
-        intrinsics_gt = frame_entry.get("intrinsics_gt")
-        detections = [
-            Detection(
-                xyxy=tuple(int(value) for value in detection["xyxy"]),
-                class_id=int(detection["class_id"]),
-                label=str(detection["label"]),
-                confidence=float(detection["confidence"]),
-                color=tuple(int(value) for value in detection.get("color", (0, 255, 0))),
-            )
-            for detection in frame_entry.get("detections") or []
-        ] or None
-
-        return FramePacket(
-            frame_bgr=np.asarray(frame_bgr, dtype=np.uint8),
-            timestamp_sec=None if frame_entry.get("timestamp_sec") is None else float(frame_entry["timestamp_sec"]),
-            depth_map=depth_map,
-            semantic_mask=semantic_mask,
-            instance_mask=instance_mask,
-            pose_world_gt=None if pose_world_gt is None else np.asarray(pose_world_gt, dtype=np.float32),
-            intrinsics_gt=None if intrinsics_gt is None else CameraIntrinsics(
-                fx=float(intrinsics_gt["fx"]),
-                fy=float(intrinsics_gt["fy"]),
-                cx=float(intrinsics_gt["cx"]),
-                cy=float(intrinsics_gt["cy"]),
-            ),
-            detections=detections,
-            scenario_state=frame_entry.get("scenario_state"),
-            calibration_source=frame_entry.get("calibration_source"),
-        )
-
-    def _load_array_or_image(self, relative_or_absolute_path: str) -> np.ndarray:
-        return _load_array_or_image(
-            relative_or_absolute_path,
-            root=self._root,
-            cv2_module=self._cv2_module,
-        )
-
-    def close(self) -> None:
-        return None
-
-
-class RealtimePhotorealFrameSource(Protocol):
-    backend_name: str
-
-    def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
+    def render_frame(self, *, world_state: HiddenWorldState, frame_index: int, timestamp_sec: float) -> SensorFrame:
         ...
 
     def close(self) -> None:
         ...
 
 
-class BlenderRealtimeFrameSource:
-    backend_name = "blender-realtime"
-
+class BlenderLivingRoomSensorBackend:
     def __init__(
         self,
         *,
         config: AppConfig,
-        scenario: ScenarioSpec,
         camera_rig: CameraRigSpec,
-        asset_manifest: object,
-        report_path: str | Path | None = None,
-        worker_client,
-        cv2_module=None,
+        worker_client: BlenderWorkerClient,
     ) -> None:
-        _ = report_path
         self._config = config
-        self._scenario = scenario
         self._camera_rig = camera_rig
-        self._asset_manifest = asset_manifest
         self._worker_client = worker_client
-        self._cv2_module = cv2_module
-        self._frame_index = 0
         self._started = False
-        self._pose_world = _pose_world_matrix(
-            float(scenario.environment.start_x),
-            float(scenario.environment.start_z),
-            math.radians(float(scenario.environment.start_yaw_deg)),
-        )
-        self._intrinsics = _intrinsics_from_rig(camera_rig)
 
-    def set_pose_world(self, pose_world: np.ndarray) -> None:
-        self._pose_world = np.asarray(pose_world, dtype=np.float32).reshape(4, 4).copy()
-
-    def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
+    def build_scene(self, scene_spec) -> None:
         if not self._started:
-            start = getattr(self._worker_client, "start", None)
-            if callable(start):
-                start()
+            self._worker_client.start()
             self._started = True
-        effective_timeout = self._effective_worker_timeout(timeout_sec)
-        request = BlenderFrameRequest(
-            frame_index=self._frame_index,
-            timestamp_sec=self._elapsed_sec,
-            scenario_id=self._scenario.scene_id,
-            camera_pose_world=self._pose_world,
-            intrinsics={
-                "fx": float(self._intrinsics.fx),
-                "fy": float(self._intrinsics.fy),
-                "cx": float(self._intrinsics.cx),
-                "cy": float(self._intrinsics.cy),
-            },
-            dynamic_actor_transforms=self._dynamic_actor_transforms(),
-            lighting_seed=int(self._config.sim_seed),
-        )
-        response = self._worker_client.request_frame(request, timeout_sec=effective_timeout)
-        if isinstance(response, dict):
-            response = BlenderFrameResponse.from_payload(response)
-        if not isinstance(response, BlenderFrameResponse):
-            raise RuntimeError("Blender realtime worker returned an unsupported response type")
-        frame_bgr = np.asarray(
-            _load_array_or_image(response.rgb_path, cv2_module=self._cv2_module),
-            dtype=np.uint8,
-        )
-        depth_map = np.asarray(
-            _load_array_or_image(response.depth_path, cv2_module=self._cv2_module),
-            dtype=np.float32,
-        )
-        semantic_mask = (
-            None
-            if response.semantic_mask_path is None
-            else np.asarray(_load_array_or_image(response.semantic_mask_path, cv2_module=self._cv2_module), dtype=np.uint8)
-        )
-        instance_mask = (
-            None
-            if response.instance_mask_path is None
-            else np.asarray(_load_array_or_image(response.instance_mask_path, cv2_module=self._cv2_module), dtype=np.uint8)
-        )
-        pose_world_gt = np.asarray(response.pose_world_gt, dtype=np.float32)
-        intrinsics_gt = CameraIntrinsics(
-            fx=float(response.intrinsics_gt["fx"]),
-            fy=float(response.intrinsics_gt["fy"]),
-            cx=float(response.intrinsics_gt["cx"]),
-            cy=float(response.intrinsics_gt["cy"]),
-        )
-        detections = [
-            Detection(
-                xyxy=tuple(int(value) for value in detection["xyxy"]),
-                class_id=int(detection["class_id"]),
-                label=str(detection["label"]),
-                confidence=float(detection["confidence"]),
-                color=tuple(int(value) for value in detection.get("color", (0, 255, 0))),
-            )
-            for detection in response.detections
-            if "xyxy" in detection and "class_id" in detection and "label" in detection and "confidence" in detection
-        ] or None
-        scenario_state = SimulationScenarioState(
-            scene_id=self._scenario.scene_id,
-            difficulty_level=self._scenario.difficulty_level,
-            phase="PHOTOREAL_PREVIEW",
-            step_index=self._frame_index,
-            elapsed_sec=self._elapsed_sec,
-            selfcal_converged=False,
-            rig_x=float(self._pose_world[0, 3]),
-            rig_y=float(self._pose_world[1, 3]),
-            rig_z=float(self._pose_world[2, 3]),
-            yaw_deg=float(self._scenario.environment.start_yaw_deg),
-            room_width_m=float(self._scenario.environment.room_width_m),
-            room_depth_m=float(self._scenario.environment.room_depth_m),
-            room_height_m=float(self._scenario.environment.room_height_m),
-            visible_labels=tuple(item.label for item in (detections or ())),
-            active_goal=None,
-            target_motion_state=(
-                "moving" if any(item.actor_type == "moving_target" for item in self._scenario.dynamic_actors) else "static"
+        self._worker_client.build_scene(
+            BlenderSceneBuildRequest(
+                scene_spec=scene_spec,
+                image_width=self._camera_rig.image_width,
+                image_height=self._camera_rig.image_height,
+                horizontal_fov_deg=self._camera_rig.horizontal_fov_deg,
+                near_plane_m=self._camera_rig.near_plane_m,
+                far_plane_m=self._camera_rig.far_plane_m,
             ),
-            render_backend=self.backend_name,
-            render_profile="photoreal",
-            semantic_target_class=str(self._asset_manifest.semantic_target_class),
-            asset_manifest_id=str(self._asset_manifest.manifest_id),
-            environment_objects=self._environment_object_snapshots(),
-            semantic_mask_path=response.semantic_mask_path,
-            instance_mask_path=response.instance_mask_path,
-            worker_state=response.worker_state,
+            timeout_sec=15.0,
+        )
+
+    def render_frame(self, *, world_state: HiddenWorldState, frame_index: int, timestamp_sec: float) -> SensorFrame:
+        pose_world = _pose_matrix(world_state.robot_pose)
+        response = self._worker_client.request_frame(
+            BlenderFrameRequest(
+                frame_index=frame_index,
+                timestamp_sec=timestamp_sec,
+                robot_pose=world_state.robot_pose,
+                camera_pose_world=pose_world,
+            ),
+            timeout_sec=10.0,
+        )
+        return SensorFrame(
+            frame_index=frame_index,
+            timestamp_sec=timestamp_sec,
+            frame_bgr=np.asarray(_load_sensor_array(response.rgb_path), dtype=np.uint8),
+            depth_map=np.asarray(_load_sensor_array(response.depth_path), dtype=np.float32),
+            semantic_mask=np.asarray(_load_sensor_array(response.semantic_mask_path), dtype=np.uint8),
+            instance_mask=np.asarray(_load_sensor_array(response.instance_mask_path), dtype=np.uint8),
+            camera_pose_world=np.asarray(response.camera_pose_world, dtype=np.float32),
+            intrinsics=dict(response.intrinsics),
             render_time_ms=response.render_time_ms,
+            metadata={"worker_state": response.worker_state},
         )
-        packet = FramePacket(
-            frame_bgr=frame_bgr,
-            timestamp_sec=self._elapsed_sec,
-            depth_map=depth_map,
-            semantic_mask=semantic_mask,
-            instance_mask=instance_mask,
-            pose_world_gt=pose_world_gt,
-            intrinsics_gt=intrinsics_gt,
-            detections=detections,
-            scenario_state=scenario_state,
-            calibration_source="blender-ground-truth",
-        )
-        self._frame_index += 1
-        return packet
 
     def close(self) -> None:
-        close = getattr(self._worker_client, "close", None)
-        if callable(close):
-            close()
-
-    def _effective_worker_timeout(self, timeout_sec: float | None) -> float | None:
-        requested = None if timeout_sec is None else float(timeout_sec)
-        if self._frame_index == 0:
-            floor = _PHOTOREAL_STARTUP_TIMEOUT_SEC
-        else:
-            floor = _PHOTOREAL_FRAME_TIMEOUT_SEC
-        if requested is None:
-            return floor
-        return max(requested, floor)
-
-    def _dynamic_actor_transforms(self) -> dict[str, np.ndarray]:
-        transforms: dict[str, np.ndarray] = {}
-        for actor in self._scenario.dynamic_actors:
-            if self._elapsed_sec < float(actor.start_time_sec):
-                center_world = actor.base_center_world
-            else:
-                center_world = _resolve_waypoint_loop_position(actor, elapsed_sec=self._elapsed_sec)
-            transforms[str(actor.actor_id)] = _translation_pose_matrix(center_world)
-        return transforms
-
-    def _environment_object_snapshots(self) -> tuple[dict[str, object], ...]:
-        dynamic_centers = {
-            actor_id: tuple(float(value) for value in transform[:3, 3])
-            for actor_id, transform in self._dynamic_actor_transforms().items()
-        }
-        placements: list[object] = []
-        for placement in self._asset_manifest.placements:
-            if placement.source_kind == "dynamic" and str(placement.source_key) in dynamic_centers:
-                placements.append(replace(placement, center_world=dynamic_centers[str(placement.source_key)]))
-            else:
-                placements.append(placement)
-        return _environment_object_snapshots(placements)
-
-    @property
-    def _elapsed_sec(self) -> float:
-        fps = max(float(self._camera_rig.fps), 1.0)
-        return float(self._frame_index) / fps
+        self._worker_client.close()
 
 
-class SimulationFrameSource:
+class LivingRoomEpisodeRunner:
     def __init__(
         self,
         *,
         config: AppConfig,
         report_path: str | Path,
-        goal_selector: GoalSelector | None = None,
-        fallback_goal_selector: GoalSelector | None = None,
+        planner,
+        sensor_backend: LivingRoomSensorBackend,
+        scene_spec=None,
         camera_rig: CameraRigSpec | None = None,
-        refine_intrinsics=refine_focal_lengths,
-        renderer: SceneRenderer | None = None,
-        external_frame_source: ExternalManifestFrameSource | RealtimePhotorealFrameSource | None = None,
     ) -> None:
         self._config = config
-        self._report_path = Path(report_path)
+        self._scene_spec = scene_spec or build_living_room_scene_spec()
         self._camera_rig = camera_rig or CameraRigSpec.from_config(config)
-        self._scenario = _get_scenario_spec(str(config.scenario))
-        self._asset_manifest = build_scenario_asset_manifest(
-            self._scenario,
-            seed=int(config.sim_seed),
-            cache_dir=config.asset_cache_dir,
-            quality=config.asset_quality,
+        self._planner = planner
+        self._sensor_backend = sensor_backend
+        self._report_dir = Path(report_path).parent
+        self._report_dir.mkdir(parents=True, exist_ok=True)
+        self._sensor_backend.build_scene(self._scene_spec)
+
+        self._state = HiddenWorldState(
+            scene_spec=self._scene_spec,
+            robot_pose=self._scene_spec.start_pose,
         )
-        self._mission = replace(self._scenario.mission, target_label=self._asset_manifest.semantic_target_class)
-        self._goal_selector = goal_selector or HeuristicGoalSelector()
-        self._fallback_goal_selector = fallback_goal_selector
-        if self._fallback_goal_selector is None and goal_selector is not None and not isinstance(goal_selector, HeuristicGoalSelector):
-            self._fallback_goal_selector = HeuristicGoalSelector()
-        self._refine_intrinsics = refine_intrinsics
-        self._rng = np.random.default_rng(int(config.sim_seed))
-        self._frame_index = 0
-        self._phase = "BOOTSTRAP_SELF_CAL"
-        self._warmup_start_x = float(self._scenario.environment.start_x)
-        self._warmup_start_z = float(self._scenario.environment.start_z)
-        self._warmup_start_yaw_rad = math.radians(float(self._scenario.environment.start_yaw_deg))
-        self._x = self._warmup_start_x
-        self._z = self._warmup_start_z
-        self._yaw_rad = self._warmup_start_yaw_rad
-        self._active_goal: NavigationGoal | None = None
-        self._selfcal_converged = False
-        self._report_emitted = False
-        self._mission_success = False
-        self._first_valid_view_sec: float | None = None
-        self._goal_request_count = 0
-        self._llm_goal_accept_count = 0
-        self._fallback_count = 0
-        self._verify_streak = 0
-        self._failure_reason: str | None = None
-        self._target_seen_once = False
-        self._target_missing_after_acquire_frames = 0
-        self._current_intrinsics = create_approximate_calibration(
-            image_width=self._camera_rig.image_width,
-            image_height=self._camera_rig.image_height,
+        self._selfcal_actions = (
+            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 20.0),
+            ActionStep(ActionPrimitive.CAMERA_PAN_RIGHT, 20.0),
+            ActionStep(ActionPrimitive.TURN_LEFT, 18.0),
+            ActionStep(ActionPrimitive.TURN_RIGHT, 18.0),
+            ActionStep(ActionPrimitive.MOVE_FORWARD, 0.35),
         )
-        self._true_intrinsics = self._build_true_intrinsics()
-        self._warmup_keyframe_poses: dict[int, np.ndarray] = {}
-        self._warmup_observations: list[KeyframeObservation] = []
-        self._last_keyframe_capture_sec = -999.0
-        self._last_visible_objects: list[_VisibleObject] = []
-        self._last_runtime_observation: _RuntimeObservation | None = None
-        self._previous_frame_bgr: np.ndarray | None = None
-        self._current_timestamp_sec: float | None = None
-        self._runtime_frame_count = 0
-        self._runtime_tracking_ok_frames = 0
-        self._runtime_pose_error_sum = 0.0
-        self._runtime_pose_error_count = 0
-        self._benchmark_valid = bool(
-            str(getattr(config, "input_source", "live")) == "sim"
-            and str(getattr(config, "sim_perception_mode", "runtime")) == "runtime"
-        )
-        self._target_visible_frames_gt = 0
-        self._target_detected_frames_runtime = 0
-        self._target_first_detect_sec_runtime: float | None = None
-        self._detection_fallback_frames = 0
-        self._render_backend = ""
-        self._render_profile = str(getattr(config, "render_profile", "fast"))
-        self._static_asset_placements = tuple(
-            item for item in self._asset_manifest.placements if item.source_kind == "static"
-        )
-        self._dynamic_asset_placements = {
-            item.source_key: item for item in self._asset_manifest.placements if item.source_kind == "dynamic"
-        }
-        self._static_scene_objects = self._build_scene_objects()
-        self._active_scene_objects = list(self._static_scene_objects)
-        self._landmark_points = self._build_landmark_points()
-        self._target_motion_state = "moving" if self._scenario_has_dynamic_actor("moving_target") else "static"
-        self._eval_budget_sec = float(
-            self._mission.eval_budget_sec_override
-            if self._mission.eval_budget_sec_override is not None
-            else config.eval_budget_sec
-        )
-        self._renderer = renderer or AnalyticSceneRenderer(
-            rig=self._camera_rig,
-            rng=self._rng,
-            environment=self._scenario.environment,
-            lighting=self._scenario.lighting,
-            material_variant=self._scenario.material_variant,
-        )
-        self._external_frame_source = external_frame_source
+        self._action_history: list[str] = []
+        self._planner_turn_logs: list[dict[str, object]] = []
+        self._current_schedule: ActionSchedule | None = None
+        self._latest_planner_context = None
+        self._closed = False
+        self._terminal_frame_emitted = False
+        self._write_selfcalibration_artifact()
+        self._write_planner_turns_artifact()
 
     @property
-    def report_path(self) -> Path:
-        return self._report_path
+    def current_phase(self) -> EpisodePhase:
+        return self._state.phase
 
-    def close(self) -> None:
-        if not self._report_emitted:
-            if not self._mission_success and self._failure_reason is None:
-                self._failure_reason = "aborted"
-            self._emit_report()
-        if self._external_frame_source is not None:
-            self._external_frame_source.close()
+    @property
+    def current_schedule(self) -> ActionSchedule | None:
+        return self._current_schedule
 
-    def next_frame(self, *, timeout_sec: float | None = None) -> FramePacket | None:
+    def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
         _ = timeout_sec
-        if self._phase == "REPORT":
-            if self._report_emitted:
-                return None
-            packet = self._render_packet()
-            if packet is None:
-                self._emit_report()
-                return None
-            self._emit_report()
-            return packet
-
-        packet = self._render_packet()
-        if packet is None:
-            if not self._mission_success and self._failure_reason is None:
-                self._failure_reason = "external_stream_end" if self._external_frame_source is not None else "aborted"
-            self._emit_report()
+        if self._closed:
             return None
-        self._post_step(packet)
-        self._frame_index += 1
-        return packet
+        if self._state.phase in {EpisodePhase.SUCCEEDED, EpisodePhase.FAILED}:
+            if self._terminal_frame_emitted:
+                self._finalize_report()
+                return None
+            self._terminal_frame_emitted = True
 
-    def record_runtime_observation(self, *, frame_packet: FramePacket, artifacts: FrameArtifacts) -> None:
-        visible_objects = self._runtime_visible_objects_from_artifacts(artifacts)
-        pose_error_m = None
-        if frame_packet.pose_world_gt is not None:
-            gt_pose = np.asarray(frame_packet.pose_world_gt, dtype=np.float32)
-            est_pose = np.asarray(artifacts.camera_pose_world, dtype=np.float32)
-            pose_error_m = float(np.linalg.norm(est_pose[:3, 3] - gt_pose[:3, 3]))
-            self._runtime_pose_error_sum += pose_error_m
-            self._runtime_pose_error_count += 1
-        tracking_state = str(artifacts.slam_tracking_state)
-        self._runtime_frame_count += 1
-        if tracking_state in TRACKING_OK_STATES:
-            self._runtime_tracking_ok_frames += 1
-        target_visible = next((item for item in visible_objects if item.label == self._mission.target_label), None)
-        if self._first_valid_view_sec is None and target_visible is not None and self._is_valid_view(target_visible):
-            self._first_valid_view_sec = frame_packet.timestamp_sec
-        perception_diagnostics = getattr(artifacts, "perception_diagnostics", None)
-        detection_source = None if perception_diagnostics is None else str(getattr(perception_diagnostics, "detection_source", ""))
-        if perception_diagnostics is not None:
-            self._benchmark_valid = bool(getattr(perception_diagnostics, "benchmark_valid", self._benchmark_valid))
-            if bool(getattr(perception_diagnostics, "gt_target_visible", False)):
-                self._target_visible_frames_gt += 1
-            if detection_source == "runtime+fallback":
-                self._detection_fallback_frames += 1
-        runtime_target_detection = any(
-            str(getattr(item, "label", "")) == str(self._mission.target_label)
-            for item in list(getattr(artifacts, "detections", []) or [])
-        )
-        if ((perception_diagnostics is None and self._benchmark_valid) or detection_source == "runtime") and runtime_target_detection:
-            self._target_detected_frames_runtime += 1
-            if self._target_first_detect_sec_runtime is None:
-                self._target_first_detect_sec_runtime = float(frame_packet.timestamp_sec)
-        self._last_runtime_observation = _RuntimeObservation(
-            timestamp_sec=frame_packet.timestamp_sec,
-            visible_objects=visible_objects,
-            tracking_state=tracking_state,
-            pose_error_m=pose_error_m,
-        )
-
-    def _build_scene_objects(self) -> list[_SceneObject]:
-        return [
-            _scene_object_from_specs(
-                label=item.semantic_class,
-                center_world=item.center_world,
-                size_xyz=item.size_xyz,
-                color_bgr=item.color_bgr,
-                yaw_deg=item.yaw_deg,
-                asset_id=item.asset_id,
-                preview_sprite_path=item.preview_sprite_path,
-                preview_mesh_path=item.preview_mesh_path,
-                asset_metadata_path=item.asset_metadata_path,
-                asset_provenance=item.asset_provenance,
-                target_role=item.target_role,
-            )
-            for item in self._static_asset_placements
-        ]
-
-    def _build_landmark_points(self) -> dict[int, np.ndarray]:
-        points: dict[int, np.ndarray] = {}
-        point_id = 1
-        environment = self._scenario.environment
-        room_points = list(environment.landmark_points) or [
-            (-environment.room_width_m / 2.0, 0.2, max(1.8, environment.room_depth_m * 0.25)),
-            (environment.room_width_m / 2.0, 0.2, max(1.8, environment.room_depth_m * 0.25)),
-            (-environment.room_width_m / 2.0, 1.8, environment.room_depth_m * 0.8),
-            (environment.room_width_m / 2.0, 1.8, environment.room_depth_m * 0.8),
-        ]
-        for point in room_points:
-            points[point_id] = np.asarray(point, dtype=np.float32)
-            point_id += 1
-        for item in self._static_scene_objects:
-            center = np.asarray(item.center_world, dtype=np.float32)
-            half = np.asarray(item.size_xyz, dtype=np.float32) / 2.0
-            for dx in (-half[0], half[0]):
-                for dy in (-half[1], half[1]):
-                    for dz in (-half[2], half[2]):
-                        points[point_id] = center + np.array([dx, dy, dz], dtype=np.float32)
-                        point_id += 1
-        return points
-
-    def _build_true_intrinsics(self) -> CameraIntrinsics:
-        width = float(self._camera_rig.image_width)
-        height = float(self._camera_rig.image_height)
-        fov_rad = math.radians(float(self._camera_rig.horizontal_fov_deg))
-        focal = (width * 0.5) / max(math.tan(fov_rad * 0.5), 1e-6)
-        return CameraIntrinsics(
-            fx=focal,
-            fy=focal,
-            cx=width * 0.5,
-            cy=height * 0.5,
-        )
-
-    def _pose_world(self) -> np.ndarray:
-        return _pose_world_matrix(self._x, self._z, self._yaw_rad)
-
-    def _external_source_accepts_runtime_pose(self) -> bool:
-        if self._external_frame_source is None:
-            return False
-        return callable(getattr(self._external_frame_source, "set_pose_world", None))
-
-    def _render_packet(self) -> FramePacket | None:
-        self._update_dynamic_actors()
-        if self._external_frame_source is not None:
-            return self._render_external_packet()
-        pose_world = self._pose_world()
-        self._current_timestamp_sec = None
-        render_output = self._renderer.render(
-            pose_world=pose_world,
-            intrinsics=self._true_intrinsics,
-            scene_objects=self._active_scene_objects,
-            previous_frame_bgr=self._previous_frame_bgr,
-        )
-        if isinstance(render_output, tuple):
-            frame_bgr, depth_map, visible_objects = render_output
-            render_output = _RenderOutput(
-                frame_bgr=np.asarray(frame_bgr, dtype=np.uint8),
-                depth_map=np.asarray(depth_map, dtype=np.float32),
-                visible_objects=list(visible_objects),
-                backend=getattr(self._renderer, "backend_name", "custom"),
-            )
-        self._render_backend = render_output.backend
-        self._previous_frame_bgr = render_output.frame_bgr.copy()
-        self._last_visible_objects = list(render_output.visible_objects)
-        detections = [
-            Detection(
-                xyxy=item.bbox,
-                class_id=index,
-                label=item.label,
-                confidence=0.99,
-                color=item.color_bgr,
-            )
-            for index, item in enumerate(sorted(render_output.visible_objects, key=lambda value: (value.label, value.depth_m)))
-        ]
-        scenario_state = SimulationScenarioState(
-            scene_id=self._scenario.scene_id,
-            difficulty_level=self._scenario.difficulty_level,
-            phase=self._phase,
-            step_index=self._frame_index,
-            elapsed_sec=self._elapsed_sec,
-            selfcal_converged=self._selfcal_converged,
-            rig_x=float(self._x),
-            rig_y=float(_CAMERA_HEIGHT_METERS),
-            rig_z=float(self._z),
-            yaw_deg=math.degrees(self._yaw_rad),
-            room_width_m=float(self._scenario.environment.room_width_m),
-            room_depth_m=float(self._scenario.environment.room_depth_m),
-            room_height_m=float(self._scenario.environment.room_height_m),
-            visible_labels=tuple(item.label for item in render_output.visible_objects),
-            active_goal=self._active_goal,
-            target_motion_state=self._target_motion_state,
-            render_backend=self._render_backend,
-            render_profile=self._render_profile,
-            semantic_target_class=self._asset_manifest.semantic_target_class,
-            asset_manifest_id=self._asset_manifest.manifest_id,
-            environment_objects=_environment_object_snapshots(
-                self._active_scene_objects,
-                visible_objects=render_output.visible_objects,
-            ),
+        frame_index = int(self._state.frame_index)
+        timestamp_sec = frame_index / max(self._camera_rig.fps, 1e-6)
+        sensor_frame = self._sensor_backend.render_frame(
+            world_state=self._state,
+            frame_index=frame_index,
+            timestamp_sec=timestamp_sec,
         )
         return FramePacket(
-            frame_bgr=np.asarray(render_output.frame_bgr, dtype=np.uint8),
-            timestamp_sec=self._elapsed_sec,
-            depth_map=np.asarray(render_output.depth_map, dtype=np.float32),
-            pose_world_gt=pose_world,
-            intrinsics_gt=self._intrinsics_estimate(),
-            detections=detections,
-            scenario_state=scenario_state,
-            tracking_state="TRACKING",
-            keyframe_inserted=(self._frame_index % max(1, int(round(self._camera_rig.fps // 2))) == 0),
-            keyframe_id=self._frame_index,
-            calibration_source="auto" if self._selfcal_converged else "disabled/approx",
-        )
-
-    @property
-    def _elapsed_sec(self) -> float:
-        if self._current_timestamp_sec is not None:
-            return float(self._current_timestamp_sec)
-        fps = max(float(self._camera_rig.fps), 1.0)
-        return float(self._frame_index) / fps
-
-    def _render_external_packet(self) -> FramePacket | None:
-        assert self._external_frame_source is not None
-        set_pose_world = getattr(self._external_frame_source, "set_pose_world", None)
-        if callable(set_pose_world):
-            set_pose_world(self._pose_world())
-        source_packet = self._external_frame_source.next_frame(timeout_sec=1.0)
-        if source_packet is None:
-            return None
-        self._current_timestamp_sec = (
-            None if source_packet.timestamp_sec is None else float(source_packet.timestamp_sec)
-        )
-        pose_world = None if source_packet.pose_world_gt is None else np.asarray(source_packet.pose_world_gt, dtype=np.float32)
-        if pose_world is not None:
-            self._sync_pose_from_external(pose_world)
-        intrinsics = source_packet.intrinsics_gt or self._intrinsics_estimate()
-        visible_objects = self._visible_objects_from_frame_packet(
-            packet=source_packet,
-            intrinsics=intrinsics,
-        )
-        self._render_backend = str(getattr(self._external_frame_source, "backend_name", "external-manifest"))
-        self._previous_frame_bgr = np.asarray(source_packet.frame_bgr, dtype=np.uint8).copy()
-        self._last_visible_objects = visible_objects
-        scenario_state = SimulationScenarioState(
-            scene_id=self._scenario.scene_id,
-            difficulty_level=self._scenario.difficulty_level,
-            phase=self._phase,
-            step_index=self._frame_index,
-            elapsed_sec=self._elapsed_sec,
-            selfcal_converged=self._selfcal_converged,
-            rig_x=float(self._x),
-            rig_y=float(_CAMERA_HEIGHT_METERS),
-            rig_z=float(self._z),
-            yaw_deg=math.degrees(self._yaw_rad),
-            room_width_m=float(self._scenario.environment.room_width_m),
-            room_depth_m=float(self._scenario.environment.room_depth_m),
-            room_height_m=float(self._scenario.environment.room_height_m),
-            visible_labels=tuple(item.label for item in visible_objects),
-            active_goal=self._active_goal,
-            target_motion_state=self._target_motion_state,
-            render_backend=self._render_backend,
-            render_profile=self._render_profile,
-            semantic_target_class=self._asset_manifest.semantic_target_class,
-            asset_manifest_id=self._asset_manifest.manifest_id,
-            environment_objects=_environment_object_snapshots(
-                self._active_scene_objects,
-                visible_objects=visible_objects,
+            frame_bgr=np.asarray(sensor_frame.frame_bgr, dtype=np.uint8),
+            timestamp_sec=float(sensor_frame.timestamp_sec),
+            depth_map=np.asarray(sensor_frame.depth_map, dtype=np.float32),
+            semantic_mask=np.asarray(sensor_frame.semantic_mask, dtype=np.uint8),
+            instance_mask=np.asarray(sensor_frame.instance_mask, dtype=np.uint8),
+            pose_world_gt=np.asarray(sensor_frame.camera_pose_world, dtype=np.float32),
+            intrinsics_gt=CameraIntrinsics(**sensor_frame.intrinsics),
+            scenario_state=OperatorSceneState(
+                scene_spec=self._scene_spec,
+                robot_pose=self._state.robot_pose,
+                phase=self._state.phase,
             ),
-            semantic_mask_path=getattr(source_packet.scenario_state, "semantic_mask_path", None),
-            instance_mask_path=getattr(source_packet.scenario_state, "instance_mask_path", None),
-            worker_state=getattr(source_packet.scenario_state, "worker_state", None),
-            render_time_ms=getattr(source_packet.scenario_state, "render_time_ms", None),
-        )
-        detections = list(source_packet.detections or [])
-        if not detections:
-            detections = [
-                Detection(
-                    xyxy=item.bbox,
-                    class_id=index,
-                    label=item.label,
-                    confidence=0.99,
-                    color=item.color_bgr,
-                )
-                for index, item in enumerate(visible_objects)
-            ]
-        return replace(
-            source_packet,
-            frame_bgr=np.asarray(source_packet.frame_bgr, dtype=np.uint8).copy(),
-            timestamp_sec=self._elapsed_sec,
-            depth_map=(
-                None
-                if source_packet.depth_map is None
-                else np.asarray(source_packet.depth_map, dtype=np.float32)
-            ),
-            pose_world_gt=pose_world,
-            intrinsics_gt=intrinsics,
-            detections=detections,
-            scenario_state=scenario_state,
-            calibration_source=source_packet.calibration_source or ("auto" if self._selfcal_converged else "disabled/approx"),
+            planner_context=self._latest_planner_context,
+            calibration_source="self_calibration/converged"
+            if self._state.selfcal_step_index >= len(self._selfcal_actions)
+            else "self_calibration/pending",
         )
 
-    def _intrinsics_estimate(self) -> CameraIntrinsics:
-        matrix = np.asarray(self._current_intrinsics.camera_matrix, dtype=np.float32)
-        return CameraIntrinsics(
-            fx=float(matrix[0, 0]),
-            fy=float(matrix[1, 1]),
-            cx=float(matrix[0, 2]),
-            cy=float(matrix[1, 2]),
-        )
-
-    def _sync_pose_from_external(self, pose_world: np.ndarray) -> None:
-        self._x = float(pose_world[0, 3])
-        self._z = float(pose_world[2, 3])
-        self._yaw_rad = math.atan2(float(pose_world[0, 2]), float(pose_world[2, 2]))
-
-    def _visible_objects_from_frame_packet(
-        self,
-        *,
-        packet: FramePacket,
-        intrinsics: CameraIntrinsics,
-    ) -> list[_VisibleObject]:
-        visible_objects: list[_VisibleObject] = []
-        detections = list(packet.detections or [])
-        for detection in detections:
-            x1, y1, x2, y2 = (int(value) for value in detection.xyxy)
-            if x2 <= x1 or y2 <= y1:
-                continue
-            if packet.depth_map is None:
-                depth_m = float(self._camera_rig.far_plane_m)
-            else:
-                crop = np.asarray(packet.depth_map[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)], dtype=np.float32)
-                valid_depth = crop[np.isfinite(crop) & (crop > 0.0)]
-                depth_m = (
-                    float(self._camera_rig.far_plane_m)
-                    if valid_depth.size == 0
-                    else float(np.median(valid_depth))
-                )
-            center_x = (x1 + x2) * 0.5
-            bearing_rad = math.atan2((center_x - float(intrinsics.cx)) / max(float(intrinsics.fx), 1e-6), 1.0)
-            visible_objects.append(
-                _VisibleObject(
-                    label=detection.label,
-                    bbox=(x1, y1, x2, y2),
-                    depth_m=depth_m,
-                    bearing_rad=bearing_rad,
-                    area_pixels=max(0, x2 - x1) * max(0, y2 - y1),
-                    color_bgr=detection.color,
-                    target_role=(str(detection.label) == self._asset_manifest.semantic_target_class),
-                )
-            )
-        visible_objects.sort(key=lambda item: float(item.depth_m), reverse=True)
-        return visible_objects
-
-    def _control_visible_objects(self) -> list[_VisibleObject]:
-        if self._last_runtime_observation is not None:
-            return list(self._last_runtime_observation.visible_objects)
-        return list(self._last_visible_objects)
-
-    def _scenario_has_dynamic_actor(self, actor_type: str) -> bool:
-        return any(item.actor_type == actor_type for item in self._scenario.dynamic_actors)
-
-    def _update_dynamic_actors(self) -> None:
-        active_scene_objects = list(self._static_scene_objects)
-        target_motion_state = "moving" if self._scenario_has_dynamic_actor("moving_target") else "static"
-        for actor in self._scenario.dynamic_actors:
-            if self._elapsed_sec < float(actor.start_time_sec):
-                center_world = actor.base_center_world
-            else:
-                center_world = _resolve_waypoint_loop_position(actor, elapsed_sec=self._elapsed_sec)
-            placement = self._dynamic_asset_placements.get(str(actor.actor_id))
-            active_scene_objects.append(
-                _scene_object_from_specs(
-                    label=(placement.semantic_class if placement is not None else actor.label),
-                    center_world=center_world,
-                    size_xyz=actor.size_xyz,
-                    color_bgr=actor.color_bgr,
-                    yaw_deg=0.0 if placement is None else placement.yaw_deg,
-                    asset_id=None if placement is None else placement.asset_id,
-                    preview_sprite_path=None if placement is None else placement.preview_sprite_path,
-                    preview_mesh_path=None if placement is None else placement.preview_mesh_path,
-                    asset_metadata_path=None if placement is None else placement.asset_metadata_path,
-                    asset_provenance=None if placement is None else placement.asset_provenance,
-                    target_role=bool(placement.target_role) if placement is not None else False,
-                )
-            )
-        self._active_scene_objects = active_scene_objects
-        self._target_motion_state = target_motion_state
-
-    def _post_step(self, packet: FramePacket) -> None:
-        if self._elapsed_sec >= float(self._eval_budget_sec) or self._frame_index >= int(self._config.sim_max_steps) - 1:
-            if not self._mission_success:
-                self._failure_reason = self._failure_reason or self._derive_timeout_reason()
-                self._phase = "REPORT"
+    def record_runtime_observation(self, *, frame_packet: FramePacket, artifacts) -> None:
+        if self._state.phase in {EpisodePhase.SUCCEEDED, EpisodePhase.FAILED}:
+            self._state.frame_index += 1
+            self._state.elapsed_sec += 1.0 / max(self._camera_rig.fps, 1e-6)
+            self._finalize_report()
             return
 
-        if self._phase == "BOOTSTRAP_SELF_CAL":
-            if packet.pose_world_gt is not None:
-                self._record_warmup_observations(np.asarray(packet.pose_world_gt, dtype=np.float32))
-            self._apply_warmup_motion()
-            if self._elapsed_sec >= 8.0:
-                self._finalize_self_calibration()
-                self._phase = "EXPLORE"
-            return
+        if self._state.phase == EpisodePhase.SELF_CALIBRATING:
+            self._advance_self_calibration()
+            if self._state.phase == EpisodePhase.PERCEIVE_AND_PLAN:
+                self._plan_next_schedule(artifacts=artifacts)
+        elif self._state.phase in {EpisodePhase.PERCEIVE_AND_PLAN, EpisodePhase.REASSESS}:
+            self._plan_next_schedule(artifacts=artifacts)
+        elif self._state.phase == EpisodePhase.EXECUTING_SCHEDULE:
+            self._execute_one_step()
 
-        if self._phase == "EXPLORE":
-            target_visible = self._target_visible_object()
-            if target_visible is not None:
-                self._target_seen_once = True
-                self._target_missing_after_acquire_frames = 0
-                self._active_goal = self._request_navigation_goal()
-                if self._active_goal is not None:
-                    self._phase = "NAVIGATE_TO_VIEW"
-                    return
-            self._drive_explore()
-            return
+        if pose_distance_to_goal(self._scene_spec, self._state.robot_pose) <= 0.5:
+            self._state.phase = EpisodePhase.SUCCEEDED
+            self._state.mission_succeeded = True
+        elif self._state.elapsed_sec >= float(self._config.eval_budget_sec):
+            self._state.phase = EpisodePhase.FAILED
 
-        if self._phase == "NAVIGATE_TO_VIEW":
-            target_visible = self._target_visible_object()
-            if target_visible is None:
-                if self._target_seen_once:
-                    self._target_missing_after_acquire_frames += 1
-                self._active_goal = None
-                self._phase = "EXPLORE"
-                return
-            self._target_seen_once = True
-            self._target_missing_after_acquire_frames = 0
-            if self._is_valid_view(target_visible):
-                if self._first_valid_view_sec is None:
-                    self._first_valid_view_sec = self._elapsed_sec
-                self._verify_streak = 1
-                self._phase = "VERIFY_VIEW"
-                return
-            self._drive_toward_goal(target_visible)
-            return
+        self._state.frame_index += 1
+        self._state.elapsed_sec += 1.0 / max(self._camera_rig.fps, 1e-6)
+        self._write_selfcalibration_artifact()
+        self._write_planner_turns_artifact()
+        if self._state.phase in {EpisodePhase.SUCCEEDED, EpisodePhase.FAILED}:
+            self._finalize_report()
 
-        if self._phase == "VERIFY_VIEW":
-            target_visible = self._target_visible_object()
-            if target_visible is None:
-                if self._target_seen_once:
-                    self._target_missing_after_acquire_frames += 1
-                self._verify_streak = 0
-                self._phase = "EXPLORE"
-                return
-            self._target_seen_once = True
-            self._target_missing_after_acquire_frames = 0
-            if self._is_valid_view(target_visible):
-                if self._first_valid_view_sec is None:
-                    self._first_valid_view_sec = self._elapsed_sec
-                self._verify_streak += 1
-                if self._verify_streak >= int(self._mission.verify_required_streak):
-                    self._mission_success = True
-                    self._phase = "REPORT"
-                    return
-            else:
-                self._verify_streak = 0
-                self._phase = "NAVIGATE_TO_VIEW"
-                return
-            self._drive_toward_goal(target_visible)
+    def close(self) -> None:
+        self._closed = True
+        backend_close = getattr(self._sensor_backend, "close", None)
+        if callable(backend_close):
+            backend_close()
+        self._finalize_report()
 
-    def _record_warmup_observations(self, pose_world: np.ndarray) -> None:
-        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
-            return
-        if self._elapsed_sec - self._last_keyframe_capture_sec < 0.75:
-            return
-        keyframe_id = len(self._warmup_keyframe_poses) + 1
-        self._warmup_keyframe_poses[keyframe_id] = pose_world.copy()
-        self._last_keyframe_capture_sec = self._elapsed_sec
-        points_world = np.asarray(list(self._landmark_points.values()), dtype=np.float32)
-        projected, valid = _project_points(
-            points_world,
-            pose_world=pose_world,
-            intrinsics=self._true_intrinsics,
-            near_plane_m=self._camera_rig.near_plane_m,
-        )
-        width = float(self._camera_rig.image_width)
-        height = float(self._camera_rig.image_height)
-        for offset, point_id in enumerate(self._landmark_points):
-            if not bool(valid[offset]):
-                continue
-            u = float(projected[offset, 0])
-            v = float(projected[offset, 1])
-            if not (0.0 <= u < width and 0.0 <= v < height):
-                continue
-            xyz = self._landmark_points[point_id]
-            self._warmup_observations.append(
-                KeyframeObservation(
-                    keyframe_id=keyframe_id,
-                    point_id=int(point_id),
-                    u=u,
-                    v=v,
-                    x=float(xyz[0]),
-                    y=float(xyz[1]),
-                    z=float(xyz[2]),
-                )
-            )
+    def _advance_self_calibration(self) -> None:
+        if self._state.selfcal_step_index < len(self._selfcal_actions):
+            step = self._selfcal_actions[self._state.selfcal_step_index]
+            self._apply_step(step)
+            self._action_history.append(f"{step.primitive.value}:{step.value}")
+            self._state.selfcal_step_index += 1
+        if self._state.selfcal_step_index >= len(self._selfcal_actions):
+            self._state.phase = EpisodePhase.PERCEIVE_AND_PLAN
 
-    def _finalize_self_calibration(self) -> None:
-        approx_matrix = np.asarray(self._current_intrinsics.camera_matrix, dtype=np.float32)
-        refined_fx, refined_fy, _poses, _points = self._refine_intrinsics(
-            initial_fx=float(approx_matrix[0, 0]),
-            initial_fy=float(approx_matrix[1, 1]),
-            cx=float(approx_matrix[0, 2]),
-            cy=float(approx_matrix[1, 2]),
-            keyframe_poses=self._warmup_keyframe_poses,
-            keyframe_observations=self._warmup_observations,
-        )
-        refined = approx_matrix.copy()
-        refined[0, 0] = refined_fx
-        refined[1, 1] = refined_fy
-        self._current_intrinsics = type(self._current_intrinsics)(
-            camera_matrix=refined,
-            distortion_coefficients=np.zeros((1, 5), dtype=np.float32),
-            image_width=self._camera_rig.image_width,
-            image_height=self._camera_rig.image_height,
-            rms_error=0.0,
-        )
-        true_fx = float(self._true_intrinsics.fx)
-        fx_error = abs(refined_fx - true_fx) / max(true_fx, 1e-6)
-        self._selfcal_converged = (
-            len(self._warmup_keyframe_poses) >= 6
-            and len(self._warmup_observations) >= 120
-            and fx_error <= 0.35
-        )
-
-    def _apply_warmup_motion(self) -> None:
-        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
-            return
-        t = self._elapsed_sec
-        if t < 2.0:
-            self._yaw_rad = self._warmup_start_yaw_rad
-            self._x = self._warmup_start_x
-            self._z = self._warmup_start_z
-            return
-        if t < 4.0:
-            progress = (t - 2.0) / 2.0
-            self._yaw_rad = self._warmup_start_yaw_rad + math.radians(50.0 * progress)
-            return
-        if t < 6.0:
-            progress = (t - 4.0) / 2.0
-            self._yaw_rad = self._warmup_start_yaw_rad + math.radians(50.0 - (55.0 * progress))
-            self._z = self._warmup_start_z + (0.65 * progress)
-            return
-        if t < 8.0:
-            progress = (t - 6.0) / 2.0
-            self._yaw_rad = self._warmup_start_yaw_rad + math.radians(-5.0 + (30.0 * progress))
-            self._z = self._warmup_start_z + 0.65 - (0.45 * progress)
-
-    def _target_visible_object(self) -> _VisibleObject | None:
-        for item in self._control_visible_objects():
-            if item.target_role or item.label == self._mission.target_label:
-                return item
-        return None
-
-    def _request_navigation_goal(self) -> NavigationGoal | None:
-        self._goal_request_count += 1
-        candidate = self._goal_selector.select_goal(
-            visible_objects=self._control_visible_objects(),
-            target_label=self._mission.target_label,
-        )
-        if self._is_valid_goal(candidate):
-            if candidate is not None and candidate.source == "llm":
-                self._llm_goal_accept_count += 1
-            return candidate
-        if self._fallback_goal_selector is None:
-            return None
-        self._fallback_count += 1
-        fallback_goal = self._fallback_goal_selector.select_goal(
-            visible_objects=self._control_visible_objects(),
-            target_label=self._mission.target_label,
-        )
-        return fallback_goal if self._is_valid_goal(fallback_goal) else None
-
-    def _is_valid_goal(self, goal: NavigationGoal | None) -> bool:
-        if goal is None:
-            return False
-        if goal.target_label != self._mission.target_label:
-            return False
-        if not math.isfinite(float(goal.desired_bearing)):
-            return False
-        near_m, far_m = goal.desired_distance_band
-        if not (math.isfinite(float(near_m)) and math.isfinite(float(far_m))):
-            return False
-        return 0.0 < float(near_m) < float(far_m)
-
-    def _drive_explore(self) -> None:
-        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
-            return
-        target = next(
-            item for item in self._active_scene_objects if item.target_role or item.label == self._mission.target_label
-        )
-        target_xy = np.array([target.center_world[0], target.center_world[2]], dtype=np.float32)
-        camera_xy = np.array([self._x, self._z], dtype=np.float32)
-        delta = target_xy - camera_xy
-        desired_yaw = math.atan2(float(delta[0]), float(delta[1]))
-        yaw_delta = desired_yaw - self._yaw_rad
-        yaw_delta = math.atan2(math.sin(yaw_delta), math.cos(yaw_delta))
-        max_step = math.radians(float(self._camera_rig.yaw_rate_limit_deg)) / max(float(self._camera_rig.fps), 1.0)
-        self._yaw_rad += float(np.clip(yaw_delta, -max_step, max_step))
-        if abs(yaw_delta) < math.radians(12.0):
-            forward = min(float(self._camera_rig.linear_velocity_limit_mps) * 0.5, float(np.linalg.norm(delta) - 2.6))
-            if forward > 0.0:
-                self._x += math.sin(self._yaw_rad) * forward / max(float(self._camera_rig.fps), 1.0)
-                self._z += math.cos(self._yaw_rad) * forward / max(float(self._camera_rig.fps), 1.0)
-
-    def _drive_toward_goal(self, target_visible: _VisibleObject) -> None:
-        if self._external_frame_source is not None and not self._external_source_accepts_runtime_pose():
-            return
-        goal = self._active_goal
-        if goal is None:
-            self._phase = "EXPLORE"
-            return
-        max_yaw_step = math.radians(float(self._camera_rig.yaw_rate_limit_deg)) / max(float(self._camera_rig.fps), 1.0)
-        bearing_error = float(goal.desired_bearing - target_visible.bearing_rad)
-        bearing_error = math.atan2(math.sin(bearing_error), math.cos(bearing_error))
-        self._yaw_rad -= float(np.clip(bearing_error, -max_yaw_step, max_yaw_step))
-
-        desired_distance = sum(goal.desired_distance_band) * 0.5
-        distance_error = float(target_visible.depth_m - desired_distance)
-        max_step = float(self._camera_rig.linear_velocity_limit_mps) / max(float(self._camera_rig.fps), 1.0)
-        forward_step = float(np.clip(distance_error * 0.4, -max_step, max_step))
-        self._x += math.sin(self._yaw_rad) * forward_step
-        self._z += math.cos(self._yaw_rad) * forward_step
-
-    def _runtime_visible_objects_from_artifacts(self, artifacts: FrameArtifacts) -> list[_VisibleObject]:
-        objects: list[_VisibleObject] = []
-        intrinsics = artifacts.intrinsics
-        for detection in artifacts.detections:
-            x1, y1, x2, y2 = (int(value) for value in detection.xyxy)
-            if x2 <= x1 or y2 <= y1:
-                continue
-            crop = np.asarray(artifacts.depth_map[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)], dtype=np.float32)
-            valid_depth = crop[np.isfinite(crop) & (crop > 0.0)]
-            if valid_depth.size == 0:
-                continue
-            depth_m = float(np.median(valid_depth))
-            center_x = (x1 + x2) * 0.5
-            bearing_rad = math.atan2((center_x - float(intrinsics.cx)) / max(float(intrinsics.fx), 1e-6), 1.0)
-            area_pixels = max(0, x2 - x1) * max(0, y2 - y1)
-            objects.append(
-                _VisibleObject(
-                    label=detection.label,
-                    bbox=(x1, y1, x2, y2),
-                    depth_m=depth_m,
-                    bearing_rad=bearing_rad,
-                    area_pixels=area_pixels,
-                    color_bgr=detection.color,
-                    target_role=(str(detection.label) == self._asset_manifest.semantic_target_class),
-                )
-            )
-        objects.sort(key=lambda item: float(item.depth_m), reverse=True)
-        return objects
-
-    def _is_valid_view(self, item: _VisibleObject) -> bool:
-        width = float(self._camera_rig.image_width)
-        height = float(self._camera_rig.image_height)
-        x1, y1, x2, y2 = item.bbox
-        center_x = (x1 + x2) * 0.5
-        center_y = (y1 + y2) * 0.5
-        centered = (
-            abs(center_x - (width * 0.5)) <= (width * float(self._mission.center_tolerance_x_ratio))
-            and abs(center_y - (height * 0.5)) <= (height * float(self._mission.center_tolerance_y_ratio))
-        )
-        large_enough = item.area_pixels >= int(width * height * float(self._mission.min_area_ratio))
-        close_enough = float(self._mission.depth_band_m[0]) <= float(item.depth_m) <= float(self._mission.depth_band_m[1])
-        return centered and large_enough and close_enough
-
-    def _derive_timeout_reason(self) -> str:
-        if self._target_seen_once:
-            if self._scenario_has_dynamic_actor("moving_target"):
-                return "moving_target_timeout"
-            if self._scenario_has_dynamic_actor("occluder"):
-                return "occluded_timeout"
-            return "lost_after_acquire"
-        return "timeout"
-
-    def _emit_report(self) -> None:
-        total_frames = max(self._frame_index, 1)
-        if self._runtime_frame_count > 0:
-            tracking_uptime = float(self._runtime_tracking_ok_frames) / float(self._runtime_frame_count)
-        else:
-            tracking_uptime = float(total_frames) / float(total_frames)
-        pose_error_vs_gt = (
-            0.0
-            if self._runtime_pose_error_count == 0
-            else float(self._runtime_pose_error_sum) / float(self._runtime_pose_error_count)
-        )
-        report = {
-            "scenario": self._config.scenario,
-            "scenario_family": self._scenario.scenario_family,
-            "difficulty_level": int(self._scenario.difficulty_level),
-            "seed": int(self._config.sim_seed),
-            "sim_profile": self._config.sim_profile,
-            "sim_perception_mode": self._config.sim_perception_mode,
-            "benchmark_valid": bool(self._benchmark_valid),
-            "render_backend": self._render_backend or getattr(self._renderer, "backend_name", "unknown"),
-            "render_profile": self._render_profile,
-            "asset_manifest_id": self._asset_manifest.manifest_id,
-            "photoreal_asset_provenance": {
-                str(asset_id): str(provenance)
-                for asset_id, provenance in sorted(
-                    {
-                        placement.asset_id: placement.asset_provenance
-                        for placement in self._asset_manifest.placements
-                        if str(placement.asset_id)
-                    }.items()
-                )
+    def _plan_next_schedule(self, *, artifacts) -> None:
+        context = build_planner_context(
+            phase=self._state.phase,
+            frame_index=self._state.frame_index,
+            detections=list(getattr(artifacts, "detections", []) or []),
+            scene_graph_snapshot=getattr(artifacts, "scene_graph_snapshot", None),
+            reconstruction_summary={
+                "mesh_vertices": int(np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3)))).shape[0]),
+                "tracked_points": int(np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3)))).shape[0]),
             },
-            "mission_success": bool(self._mission_success),
-            "failure_reason": self._failure_reason,
-            "time_to_first_valid_view": (
-                None if self._first_valid_view_sec is None else round(float(self._first_valid_view_sec), 3)
+            depth_summary={
+                "min_depth_m": float(np.nanmin(np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1)))))),
+                "median_depth_m": float(np.nanmedian(np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1)))))),
+            },
+            recent_actions=tuple(self._action_history[-8:]),
+            calibration_status=(
+                "converged" if self._state.selfcal_step_index >= len(self._selfcal_actions) else "pending"
             ),
-            "target_visible_frames_gt": int(self._target_visible_frames_gt),
-            "target_detected_frames_runtime": int(self._target_detected_frames_runtime),
-            "target_first_detect_sec_runtime": (
-                None
-                if self._target_first_detect_sec_runtime is None
-                else round(float(self._target_first_detect_sec_runtime), 3)
-            ),
-            "tracking_uptime": round(tracking_uptime, 4),
-            "selfcal_converged": bool(self._selfcal_converged),
-            "pose_error_vs_gt": round(float(pose_error_vs_gt), 4),
-            "llm_goal_accept_rate": (
-                0.0 if self._goal_request_count == 0 else float(self._llm_goal_accept_count) / float(self._goal_request_count)
-            ),
-            "fallback_count": int(self._fallback_count),
-            "dynamic_actor_count": int(len(self._scenario.dynamic_actors)),
-            "target_class": self._asset_manifest.semantic_target_class,
-            "steps": int(self._frame_index),
+            tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
+        )
+        schedule = self._planner.plan(context=context)
+        self._latest_planner_context = context
+        if not schedule.steps:
+            schedule = ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                rationale="planner returned no safe actions; pause and reassess",
+                model=getattr(self._planner, "model", "fallback"),
+                issued_at_frame=self._state.frame_index,
+            )
+        self._current_schedule = schedule
+        self._state.schedule_cursor = 0
+        self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
+        self._state.planner_turn_count += 1
+        self._planner_turn_logs.append(
+            {
+                "frame_index": self._state.frame_index,
+                "phase": context.phase.value,
+                "prompt": context,
+                "schedule": {
+                    "rationale": schedule.rationale,
+                    "model": schedule.model,
+                    "steps": [
+                        {"primitive": step.primitive.value, "value": step.value}
+                        for step in schedule.steps
+                    ],
+                },
+            }
+        )
+
+    def _execute_one_step(self) -> None:
+        if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
+            self._state.phase = EpisodePhase.REASSESS
+            return
+        step = self._current_schedule.steps[self._state.schedule_cursor]
+        self._apply_step(step)
+        self._action_history.append(f"{step.primitive.value}:{step.value}")
+        self._state.schedule_cursor += 1
+        if self._state.schedule_cursor >= len(self._current_schedule.steps):
+            self._state.phase = EpisodePhase.REASSESS
+
+    def _apply_step(self, step: ActionStep) -> None:
+        pose = self._state.robot_pose
+        x = float(pose.x)
+        y = float(pose.y)
+        z = float(pose.z)
+        yaw_deg = float(pose.yaw_deg)
+        camera_pan_deg = float(pose.camera_pan_deg)
+
+        if step.primitive == ActionPrimitive.MOVE_FORWARD:
+            z += float(step.value)
+        elif step.primitive == ActionPrimitive.MOVE_BACKWARD:
+            z -= float(step.value)
+        elif step.primitive == ActionPrimitive.STRAFE_LEFT:
+            x -= float(step.value)
+        elif step.primitive == ActionPrimitive.STRAFE_RIGHT:
+            x += float(step.value)
+        elif step.primitive == ActionPrimitive.TURN_LEFT:
+            yaw_deg += float(step.value)
+        elif step.primitive == ActionPrimitive.TURN_RIGHT:
+            yaw_deg -= float(step.value)
+        elif step.primitive == ActionPrimitive.CAMERA_PAN_LEFT:
+            camera_pan_deg += float(step.value)
+        elif step.primitive == ActionPrimitive.CAMERA_PAN_RIGHT:
+            camera_pan_deg -= float(step.value)
+
+        self._state.robot_pose = RobotPose(
+            x=x,
+            y=y,
+            z=z,
+            yaw_deg=yaw_deg,
+            camera_pan_deg=max(-60.0, min(60.0, camera_pan_deg)),
+        )
+
+    def _write_selfcalibration_artifact(self) -> None:
+        payload = {
+            "phase": self._state.phase.value,
+            "completed": self._state.selfcal_step_index >= len(self._selfcal_actions),
+            "completed_steps": int(self._state.selfcal_step_index),
+            "total_steps": len(self._selfcal_actions),
         }
-        if str(self._config.sim_perception_mode) != "runtime":
-            report["detection_fallback_frames"] = int(self._detection_fallback_frames)
-        self._report_path.parent.mkdir(parents=True, exist_ok=True)
-        self._report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-        self._report_emitted = True
+        (self._report_dir / "self_calibration.json").write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+
+    def _write_planner_turns_artifact(self) -> None:
+        turns_path = self._report_dir / "planner_turns.jsonl"
+        lines = []
+        for item in self._planner_turn_logs:
+            prompt = item["prompt"]
+            lines.append(
+                json.dumps(
+                    {
+                        "frame_index": item["frame_index"],
+                        "phase": item["phase"],
+                        "prompt": {
+                            "phase": prompt.phase.value,
+                            "frame_index": prompt.frame_index,
+                            "goal_description": prompt.goal_description,
+                            "visible_detections": list(prompt.perception.visible_detections),
+                            "visible_segments": list(prompt.perception.visible_segments),
+                            "visible_graph_relations": list(prompt.perception.visible_graph_relations),
+                            "reconstruction_summary": dict(prompt.perception.reconstruction_summary),
+                            "depth_summary": dict(prompt.perception.depth_summary),
+                            "calibration_status": prompt.perception.calibration_status,
+                            "tracking_status": prompt.perception.tracking_status,
+                            "recent_actions": list(prompt.recent_actions),
+                        },
+                        "schedule": item["schedule"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        turns_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def _finalize_report(self) -> None:
+        report = EpisodeReport(
+            scenario_id=self._scene_spec.scene_id,
+            success=bool(self._state.mission_succeeded),
+            final_phase=self._state.phase,
+            total_frames=int(self._state.frame_index),
+            planner_turns=int(self._state.planner_turn_count),
+            self_calibration_completed=bool(self._state.selfcal_step_index >= len(self._selfcal_actions)),
+            final_distance_to_goal_m=pose_distance_to_goal(self._scene_spec, self._state.robot_pose),
+            report_dir=str(self._report_dir),
+        )
+        (self._report_dir / "episode_report.json").write_text(
+            json.dumps(
+                {
+                    "scenario_id": report.scenario_id,
+                    "success": report.success,
+                    "final_phase": report.final_phase.value,
+                    "total_frames": report.total_frames,
+                    "planner_turns": report.planner_turns,
+                    "self_calibration_completed": report.self_calibration_completed,
+                    "final_distance_to_goal_m": report.final_distance_to_goal_m,
+                    "report_dir": report.report_dir,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
 
-@dataclass(slots=True)
-class SimulationRuntime:
+SimulationFrameSource = LivingRoomEpisodeRunner
+
+
+@dataclass(frozen=True, slots=True)
+class LivingRoomSimulationRuntime:
     config: AppConfig
     report_path: str | Path
-    goal_selector: GoalSelector | None = None
-    fallback_goal_selector: GoalSelector | None = None
-    refine_intrinsics: object = refine_focal_lengths
-    openai_client: object | None = None
-    cv2_module: object | None = None
-    open3d_module: object | None = None
-    renderer: SceneRenderer | None = None
-    photoreal_frame_source_factory: object | None = None
+    planner: object | None = None
+    sensor_backend_factory: object | None = None
     blender_worker_client_factory: object | None = None
 
-    def create_frame_source(self) -> SimulationFrameSource:
-        scenario = _get_scenario_spec(str(self.config.scenario))
+    def create_frame_source(self) -> LivingRoomEpisodeRunner:
         camera_rig = CameraRigSpec.from_config(self.config)
-        goal_selector = self.goal_selector
-        if goal_selector is None:
-            if self.config.sim_goal_selector == "llm":
-                goal_selector = OpenAINavigationGoalSelector(
-                    model=self.config.sim_goal_model,
-                    timeout_sec=self.config.sim_goal_timeout_sec,
-                    client=self.openai_client,
-                )
-            else:
-                goal_selector = HeuristicGoalSelector()
-
-        external_frame_source = None
-        if self.config.render_profile == "photoreal" or self.config.sim_profile == "external":
-            if not self.config.sim_external_manifest:
-                if self.config.sim_profile == "external":
-                    raise RuntimeError("sim_profile=external requires --sim-external-manifest")
-                asset_manifest = build_scenario_asset_manifest(
-                    scenario,
-                    seed=int(self.config.sim_seed),
-                    cache_dir=self.config.asset_cache_dir,
-                    quality=self.config.asset_quality,
-                )
-                requires_external_assets = bool(self.config.render_profile == "photoreal" and self.config.sim_perception_mode == "runtime")
-                if requires_external_assets:
-                    issues = photoreal_asset_preflight_issues(
-                        asset_manifest,
-                        cache_dir=self.config.asset_cache_dir,
-                    )
-                    if issues:
-                        bootstrap_command = (
-                            "PYTHONPATH=src python -m obj_recog.asset_bootstrap "
-                            f"--scenario {scenario.scene_id} "
-                            f"--asset-cache-dir {self.config.asset_cache_dir} "
-                            f"--asset-quality {self.config.asset_quality} "
-                            f"--blender-exec {self.config.blender_exec or '<path-to-blender>'}"
-                        )
-                        raise RuntimeError(
-                            "photoreal runtime assets are missing or invalid: "
-                            + "; ".join(issues)
-                            + f". Bootstrap them with: {bootstrap_command}"
-                        )
-                if self.photoreal_frame_source_factory is not None:
-                    external_frame_source = self.photoreal_frame_source_factory(
-                        config=self.config,
-                        scenario=scenario,
-                        camera_rig=camera_rig,
-                        asset_manifest=asset_manifest,
-                        report_path=self.report_path,
-                    )
-                else:
-                    if not self.config.blender_exec:
-                        scene_manifest_path = write_blender_scene_manifest(
-                            scenario=scenario,
-                            asset_manifest=asset_manifest,
-                            rig=camera_rig,
-                            output_dir=Path(self.config.asset_cache_dir) / "scene_manifests",
-                            require_external_assets=requires_external_assets,
-                        )
-                        raise RuntimeError(
-                            "render_profile=photoreal requires --blender-exec or --sim-external-manifest; "
-                            f"scene manifest prepared at {scene_manifest_path}"
-                        )
-                    worker_client = (
-                        self.blender_worker_client_factory(
-                            config=self.config,
-                            scenario=scenario,
-                            camera_rig=camera_rig,
-                            asset_manifest=asset_manifest,
-                            report_path=self.report_path,
-                        )
-                        if self.blender_worker_client_factory is not None
-                        else _build_default_blender_worker_client(
-                            config=self.config,
-                            scenario=scenario,
-                            asset_manifest=asset_manifest,
-                            camera_rig=camera_rig,
-                            report_path=self.report_path,
-                        )
-                    )
-                    external_frame_source = BlenderRealtimeFrameSource(
-                        config=self.config,
-                        scenario=scenario,
-                        camera_rig=camera_rig,
-                        asset_manifest=asset_manifest,
-                        report_path=self.report_path,
-                        worker_client=worker_client,
-                        cv2_module=self.cv2_module,
-                    )
-            if external_frame_source is None:
-                external_frame_source = ExternalManifestFrameSource(
-                    manifest_path=self.config.sim_external_manifest,
-                    cv2_module=self.cv2_module,
-                )
-
-        renderer = self.renderer
-        if renderer is None and external_frame_source is None:
-            if self.open3d_module is not None:
-                renderer = Open3DSceneRenderer(
-                    rig=camera_rig,
-                    environment=scenario.environment,
-                    o3d_module=self.open3d_module,
-                )
-            else:
-                try:
-                    renderer = Open3DSceneRenderer(
-                        rig=camera_rig,
-                        environment=scenario.environment,
-                    )
-                except Exception:
-                    renderer = AnalyticSceneRenderer(
-                        rig=camera_rig,
-                        environment=scenario.environment,
-                        lighting=scenario.lighting,
-                        material_variant=scenario.material_variant,
-                        cv2_module=self.cv2_module,
-                    )
-
-        return SimulationFrameSource(
+        planner = self.planner or OpenAILivingRoomPlanner(
+            model=self.config.sim_planner_model,
+            timeout_sec=self.config.sim_planner_timeout_sec,
+        )
+        sensor_backend = (
+            self.sensor_backend_factory(self.config, camera_rig)
+            if self.sensor_backend_factory is not None
+            else _build_blender_sensor_backend(
+                config=self.config,
+                camera_rig=camera_rig,
+                report_path=self.report_path,
+                worker_client_factory=self.blender_worker_client_factory,
+            )
+        )
+        return LivingRoomEpisodeRunner(
             config=self.config,
             report_path=self.report_path,
-            goal_selector=goal_selector,
-            fallback_goal_selector=self.fallback_goal_selector,
+            planner=planner,
+            sensor_backend=sensor_backend,
             camera_rig=camera_rig,
-            refine_intrinsics=self.refine_intrinsics,
-            renderer=renderer,
-            external_frame_source=external_frame_source,
         )
 
 
-def _intrinsics_from_rig(rig: CameraRigSpec) -> CameraIntrinsics:
-    width = float(rig.image_width)
-    height = float(rig.image_height)
-    fov_rad = math.radians(float(rig.horizontal_fov_deg))
-    focal = (width * 0.5) / max(math.tan(fov_rad * 0.5), 1e-6)
-    return CameraIntrinsics(
-        fx=focal,
-        fy=focal,
-        cx=width * 0.5,
-        cy=height * 0.5,
-    )
+SimulationRuntime = LivingRoomSimulationRuntime
 
 
-def _load_array_or_image(
-    relative_or_absolute_path: str | Path,
-    *,
-    root: str | Path | None = None,
-    cv2_module=None,
-) -> np.ndarray:
-    path = Path(relative_or_absolute_path)
-    if not path.is_absolute() and root is not None:
-        path = Path(root) / path
-    if path.suffix == ".npy":
-        return np.load(path)
-    cv2 = load_cv2(cv2_module)
-    frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if frame is None:
-        raise RuntimeError(f"failed to load external sim asset: {path}")
-    if frame.ndim == 3 and frame.shape[2] == 4:
-        frame = frame[:, :, :3]
-    return np.asarray(frame)
-
-
-def _build_default_blender_worker_client(
+def _build_blender_sensor_backend(
     *,
     config: AppConfig,
-    scenario: ScenarioSpec,
-    asset_manifest,
     camera_rig: CameraRigSpec,
     report_path: str | Path,
-) -> BlenderWorkerClient:
-    repo_root = Path(__file__).resolve().parents[2]
-    scene_manifest_path = write_blender_scene_manifest(
-        scenario=scenario,
-        asset_manifest=asset_manifest,
-        rig=camera_rig,
-        output_dir=Path(config.asset_cache_dir) / "scene_manifests",
-        require_external_assets=bool(config.render_profile == "photoreal" and config.sim_perception_mode == "runtime"),
+    worker_client_factory=None,
+) -> BlenderLivingRoomSensorBackend:
+    if not config.blender_exec:
+        raise RuntimeError("sim input requires --blender-exec for the living room renderer")
+    worker_client = (
+        worker_client_factory(config=config, camera_rig=camera_rig)
+        if worker_client_factory is not None
+        else _default_blender_worker_client(config=config, report_path=report_path)
     )
-    render_root = Path(report_path).parent / "blender_renders" / str(asset_manifest.manifest_id)
-    blend_file = repo_root / "scripts" / "blender" / "scene_template" / "base_scene.blend"
+    return BlenderLivingRoomSensorBackend(
+        config=config,
+        camera_rig=camera_rig,
+        worker_client=worker_client,
+    )
+
+
+def _default_blender_worker_client(*, config: AppConfig, report_path: str | Path) -> BlenderWorkerClient:
+    repo_root = Path(__file__).resolve().parents[2]
     command = build_realtime_blender_worker_command(
         blender_exec=str(config.blender_exec),
         repo_root=repo_root,
-        scene_manifest_path=scene_manifest_path,
-        render_root=render_root,
-        asset_cache_dir=Path(config.asset_cache_dir),
-        quality=str(config.asset_quality),
-        blend_file=blend_file if blend_file.is_file() else None,
+        output_root=Path(report_path).parent,
     )
     return BlenderWorkerClient(command=command)
+
+
+def _pose_matrix(pose: RobotPose) -> np.ndarray:
+    yaw_rad = math.radians(float(pose.yaw_deg))
+    cos_yaw = math.cos(yaw_rad)
+    sin_yaw = math.sin(yaw_rad)
+    matrix = np.eye(4, dtype=np.float32)
+    matrix[0, 0] = cos_yaw
+    matrix[0, 2] = sin_yaw
+    matrix[2, 0] = -sin_yaw
+    matrix[2, 2] = cos_yaw
+    matrix[0, 3] = float(pose.x)
+    matrix[1, 3] = float(pose.y)
+    matrix[2, 3] = float(pose.z)
+    return matrix
+
+
+def _load_sensor_array(path: str | Path) -> np.ndarray:
+    array_path = Path(path)
+    if array_path.suffix == ".npy":
+        return np.load(array_path)
+    raise RuntimeError(f"unsupported sensor artifact: {array_path}")

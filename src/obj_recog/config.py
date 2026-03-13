@@ -68,10 +68,9 @@ class AppConfig:
     explanation_max_graph_edges: int = 20
     depth_profile: str = "balanced"
     input_source: str = "live"
-    scenario: str = "studio_open_v1"
+    scenario: str = "living_room_navigation_v1"
     sim_seed: int = 0
     sim_max_steps: int = 600
-    sim_profile: str = "lightweight"
     eval_budget_sec: float = 20.0
     sim_camera_fps: float = 10.0
     sim_camera_fov_deg: float = 72.0
@@ -82,15 +81,24 @@ class AppConfig:
     sim_enable_distortion: bool = False
     sim_yaw_rate_limit_deg: float = 45.0
     sim_linear_velocity_limit: float = 0.5
-    sim_goal_selector: str = "heuristic"
+    sim_planner_model: str = "gpt-5-mini"
+    sim_planner_timeout_sec: float = 8.0
+    sim_replan_interval_sec: float = 4.0
+    sim_selfcal_max_sec: float = 6.0
+    sim_action_batch_size: int = 6
+    sim_headless: bool = False
+    sim_open3d_view: bool = True
+    blender_exec: str | None = None
+    episode_output_dir: str | None = None
+    sim_goal_selector: str = "llm"
     sim_goal_model: str = "gpt-5-mini"
-    sim_goal_timeout_sec: float = 4.0
+    sim_goal_timeout_sec: float = 8.0
     sim_external_manifest: str | None = None
-    sim_perception_mode: str = "assisted"
-    render_profile: str = "fast"
+    sim_perception_mode: str = "runtime"
+    render_profile: str = "photoreal"
     asset_cache_dir: str = str(Path.home() / ".cache" / "obj-recog" / "assets")
     asset_quality: str = "low"
-    blender_exec: str | None = None
+    sim_profile: str = "living_room"
     scenario_preview_shots: bool = False
     validate_all_scenarios: bool = False
     validation_output_dir: str | None = None
@@ -139,18 +147,10 @@ DEFAULT_EXPLANATION_MAX_GRAPH_NODES = 20
 DEFAULT_EXPLANATION_MAX_GRAPH_EDGES = 20
 DEFAULT_DEPTH_PROFILE = "balanced"
 DEFAULT_INPUT_SOURCE = "live"
-SIM_SCENARIO_CHOICES = (
-    "studio_open_v1",
-    "office_clutter_v1",
-    "lab_corridor_v1",
-    "showroom_occlusion_v1",
-    "office_crossflow_v1",
-    "warehouse_moving_target_v1",
-)
-DEFAULT_SCENARIO = "studio_open_v1"
+SIM_SCENARIO_CHOICES = ("living_room_navigation_v1",)
+DEFAULT_SCENARIO = "living_room_navigation_v1"
 DEFAULT_SIM_SEED = 0
 DEFAULT_SIM_MAX_STEPS = 600
-DEFAULT_SIM_PROFILE = "lightweight"
 DEFAULT_EVAL_BUDGET_SEC = 20.0
 DEFAULT_SIM_CAMERA_FPS = 10.0
 DEFAULT_SIM_CAMERA_FOV_DEG = 72.0
@@ -160,13 +160,11 @@ DEFAULT_SIM_DEPTH_NOISE_STD = 0.02
 DEFAULT_SIM_MOTION_BLUR = 0.1
 DEFAULT_SIM_YAW_RATE_LIMIT_DEG = 45.0
 DEFAULT_SIM_LINEAR_VELOCITY_LIMIT = 0.5
-DEFAULT_SIM_GOAL_SELECTOR = "heuristic"
-DEFAULT_SIM_GOAL_MODEL = "gpt-5-mini"
-DEFAULT_SIM_GOAL_TIMEOUT_SEC = 4.0
-DEFAULT_SIM_PERCEPTION_MODE = "assisted"
-DEFAULT_RENDER_PROFILE = "fast"
-DEFAULT_ASSET_CACHE_DIR = str(Path.home() / ".cache" / "obj-recog" / "assets")
-DEFAULT_ASSET_QUALITY = "low"
+DEFAULT_SIM_PLANNER_MODEL = "gpt-5-mini"
+DEFAULT_SIM_PLANNER_TIMEOUT_SEC = 8.0
+DEFAULT_SIM_REPLAN_INTERVAL_SEC = 4.0
+DEFAULT_SIM_SELFCAL_MAX_SEC = 6.0
+DEFAULT_SIM_ACTION_BATCH_SIZE = 6
 
 DEPTH_PROFILE_SETTINGS: dict[str, DepthProfileSettings] = {
     "fast": DepthProfileSettings(
@@ -246,7 +244,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario", choices=SIM_SCENARIO_CHOICES, default=DEFAULT_SCENARIO)
     parser.add_argument("--sim-seed", type=int, default=DEFAULT_SIM_SEED)
     parser.add_argument("--sim-max-steps", type=_positive_int, default=DEFAULT_SIM_MAX_STEPS)
-    parser.add_argument("--sim-profile", choices=("lightweight", "external"), default=DEFAULT_SIM_PROFILE)
     parser.add_argument("--eval-budget-sec", type=_positive_float, default=DEFAULT_EVAL_BUDGET_SEC)
     parser.add_argument("--sim-camera-fps", type=_positive_float, default=DEFAULT_SIM_CAMERA_FPS)
     parser.add_argument("--sim-camera-fov-deg", type=_positive_float, default=DEFAULT_SIM_CAMERA_FOV_DEG)
@@ -257,22 +254,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sim-enable-distortion", action="store_true")
     parser.add_argument("--sim-yaw-rate-limit-deg", type=_positive_float, default=DEFAULT_SIM_YAW_RATE_LIMIT_DEG)
     parser.add_argument("--sim-linear-velocity-limit", type=_positive_float, default=DEFAULT_SIM_LINEAR_VELOCITY_LIMIT)
-    parser.add_argument("--sim-goal-selector", choices=("heuristic", "llm"), default=DEFAULT_SIM_GOAL_SELECTOR)
-    parser.add_argument("--sim-goal-model", type=str, default=DEFAULT_SIM_GOAL_MODEL)
-    parser.add_argument("--sim-goal-timeout-sec", type=_positive_float, default=DEFAULT_SIM_GOAL_TIMEOUT_SEC)
-    parser.add_argument("--sim-external-manifest", type=str, default=None)
-    parser.add_argument(
-        "--sim-perception-mode",
-        choices=("runtime", "ground_truth", "assisted"),
-        default=DEFAULT_SIM_PERCEPTION_MODE,
-    )
-    parser.add_argument("--render-profile", choices=("fast", "photoreal"), default=DEFAULT_RENDER_PROFILE)
-    parser.add_argument("--asset-cache-dir", type=str, default=DEFAULT_ASSET_CACHE_DIR)
-    parser.add_argument("--asset-quality", choices=("low", "high"), default=DEFAULT_ASSET_QUALITY)
+    parser.add_argument("--sim-planner-model", type=str, default=DEFAULT_SIM_PLANNER_MODEL)
+    parser.add_argument("--sim-planner-timeout-sec", type=_positive_float, default=DEFAULT_SIM_PLANNER_TIMEOUT_SEC)
+    parser.add_argument("--sim-replan-interval-sec", type=_positive_float, default=DEFAULT_SIM_REPLAN_INTERVAL_SEC)
+    parser.add_argument("--sim-selfcal-max-sec", type=_positive_float, default=DEFAULT_SIM_SELFCAL_MAX_SEC)
+    parser.add_argument("--sim-action-batch-size", type=_positive_int, default=DEFAULT_SIM_ACTION_BATCH_SIZE)
+    parser.add_argument("--sim-headless", action="store_true")
+    parser.add_argument("--sim-open3d-view", choices=("on", "off"), default="on")
     parser.add_argument("--blender-exec", type=str, default=None)
-    parser.add_argument("--scenario-preview-shots", action="store_true")
-    parser.add_argument("--validate-all-scenarios", action="store_true")
-    parser.add_argument("--validation-output-dir", type=str, default=None)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
     parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
     parser.add_argument("--camera-calibration", type=str, default=os.getenv("CAMERA_CALIBRATION"))
@@ -336,7 +325,6 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         scenario=args.scenario,
         sim_seed=args.sim_seed,
         sim_max_steps=args.sim_max_steps,
-        sim_profile=args.sim_profile,
         eval_budget_sec=args.eval_budget_sec,
         sim_camera_fps=args.sim_camera_fps,
         sim_camera_fov_deg=args.sim_camera_fov_deg,
@@ -347,18 +335,20 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         sim_enable_distortion=bool(args.sim_enable_distortion),
         sim_yaw_rate_limit_deg=args.sim_yaw_rate_limit_deg,
         sim_linear_velocity_limit=args.sim_linear_velocity_limit,
-        sim_goal_selector=args.sim_goal_selector,
-        sim_goal_model=args.sim_goal_model,
-        sim_goal_timeout_sec=args.sim_goal_timeout_sec,
-        sim_external_manifest=args.sim_external_manifest,
-        sim_perception_mode=args.sim_perception_mode,
-        render_profile=args.render_profile,
-        asset_cache_dir=args.asset_cache_dir,
-        asset_quality=args.asset_quality,
+        sim_planner_model=args.sim_planner_model,
+        sim_planner_timeout_sec=args.sim_planner_timeout_sec,
+        sim_replan_interval_sec=args.sim_replan_interval_sec,
+        sim_selfcal_max_sec=args.sim_selfcal_max_sec,
+        sim_action_batch_size=args.sim_action_batch_size,
+        sim_headless=bool(args.sim_headless),
+        sim_open3d_view=(args.sim_open3d_view == "on"),
         blender_exec=args.blender_exec,
-        scenario_preview_shots=bool(args.scenario_preview_shots),
-        validate_all_scenarios=bool(args.validate_all_scenarios),
-        validation_output_dir=args.validation_output_dir,
+        sim_goal_selector="llm",
+        sim_goal_model=args.sim_planner_model,
+        sim_goal_timeout_sec=args.sim_planner_timeout_sec,
+        sim_perception_mode="runtime",
+        render_profile="photoreal",
+        sim_profile="living_room",
     )
 
 

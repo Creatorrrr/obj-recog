@@ -48,190 +48,65 @@ Useful runtime controls:
 - `Situation Explanation` appears in a separate OpenCV window.
 - `Environment Model` is a separate Open3D third-person scene view when simulation data is available.
 
-## Fast Simulation Run
+## Living Room Simulation Run
 
-Run one scenario with the current lightweight renderer:
+The simulation path now supports a single scenario only: `living_room_navigation_v1`.
+It uses:
+
+- a hidden procedural living-room world
+- Blender for robot camera RGB/depth/semantic/instance rendering
+- Open3D for the operator 3D room view
+- a closed loop of self-calibration, perception, LLM planning, action execution, and hidden goal evaluation
+
+Run it like this:
 
 ```bash
-PYTHONPATH=src python -m obj_recog.main \
+OPENAI_API_KEY=... PYTHONPATH=src python -m obj_recog.main \
   --input-source sim \
-  --scenario studio_open_v1 \
-  --sim-seed 7 \
-  --sim-max-steps 240 \
-  --eval-budget-sec 20 \
-  --sim-perception-mode assisted \
-  --render-profile fast \
-  --width 640 \
-  --height 360 \
-  --device cpu \
-  --depth-profile fast \
-  --point-stride 8 \
-  --max-points 5000 \
-  --segmentation-mode panoptic \
-  --segmentation-interval 12 \
-  --explanation-mode off
-```
-
-Notes:
-
-- `--render-profile fast` is the speed-oriented simulator path. Scene objects are rendered as simplified boxes or sprite-like stand-ins rather than high-fidelity asset meshes.
-- `Environment Model` still shows the full room layout and object placements, but the camera view is not photoreal in this mode.
-
-## Bootstrap Photoreal Assets
-
-Photoreal benchmark runs now require normalized external-provenance assets in the local cache. Bootstrap the assets for a scenario before running `render_profile=photoreal` with `sim_perception_mode=runtime`:
-
-```bash
-PYTHONPATH=src python -m obj_recog.asset_bootstrap \
-  --scenario studio_open_v1 \
-  --asset-cache-dir ~/.cache/obj-recog/assets \
-  --asset-quality low \
-  --blender-exec /Applications/Blender.app/Contents/MacOS/Blender
-```
-
-You can prebuild every supported scenario at once:
-
-```bash
-PYTHONPATH=src python -m obj_recog.asset_bootstrap \
-  --all-scenarios \
-  --asset-cache-dir ~/.cache/obj-recog/assets \
-  --asset-quality low \
-  --blender-exec /Applications/Blender.app/Contents/MacOS/Blender
-```
-
-The bootstrap step exports two canonical cache artifacts per asset:
-
-- a normalized Blender library `.blend` used by the camera renderer
-- a preview `.ply` mesh used by the `Environment Model` Open3D scene view
-
-If a catalog entry still points at a provider landing page instead of a direct archive, the bootstrap CLI now fails immediately with a direct-archive error instead of silently producing a procedural fallback. Curating all archive URLs and hashes is still required asset-content work.
-
-## Photoreal Simulation Run
-
-For a benchmark-valid camera-perception run, use `--sim-perception-mode runtime`. This path now fails fast if any required asset is missing, stale, or marked procedural in the cache metadata.
-
-Use this when you want the simulator camera view to come from Blender-backed 3D mesh assets instead of the lightweight `fast` renderer:
-
-```bash
-PYTHONPATH=src python -m obj_recog.main \
-  --input-source sim \
-  --scenario studio_open_v1 \
-  --sim-seed 7 \
-  --sim-max-steps 240 \
-  --eval-budget-sec 20 \
-  --sim-perception-mode runtime \
-  --render-profile photoreal \
+  --scenario living_room_navigation_v1 \
   --blender-exec /Applications/Blender.app/Contents/MacOS/Blender \
   --width 640 \
   --height 360 \
   --device cpu \
   --depth-profile fast \
-  --point-stride 8 \
-  --max-points 5000 \
   --segmentation-mode panoptic \
-  --segmentation-interval 12 \
+  --sim-planner-model gpt-5-mini \
+  --sim-planner-timeout-sec 8 \
+  --sim-replan-interval-sec 4 \
+  --sim-selfcal-max-sec 6 \
+  --sim-action-batch-size 6 \
   --explanation-mode off
 ```
 
-If the required external assets are not present yet, run the bootstrap command above first. Benchmark photoreal runs no longer silently fall back to procedural meshes.
+Useful sim flags:
 
-Supported scenarios:
+- `--sim-headless`: run without the desktop windows.
+- `--sim-open3d-view off`: disable the Open3D operator room view.
+- `--sim-planner-model`: choose the LLM used for navigation planning.
 
-- `studio_open_v1`
-- `office_clutter_v1`
-- `lab_corridor_v1`
-- `showroom_occlusion_v1`
-- `office_crossflow_v1`
-- `warehouse_moving_target_v1`
+Visible sim windows:
 
-`--sim-perception-mode` options:
+- `Object Recognition`
+- `3D Reconstruction`
+- `Environment Model`
 
-- `runtime`: detector/depth/tracker only. This is the only benchmark-valid camera-perception mode.
-- `assisted`: runtime path with simulator GT help. Useful for debugging, not a benchmark.
-- `ground_truth`: simulator GT only. Useful for debugging, not a benchmark.
-
-## Validate All Scenarios
-
-Run the validation harness across all scenarios:
-
-```bash
-PYTHONPATH=src python -m obj_recog.main \
-  --validate-all-scenarios \
-  --validation-output-dir validation/manual-check \
-  --input-source sim \
-  --sim-seed 7 \
-  --sim-camera-fps 4 \
-  --sim-max-steps 80 \
-  --eval-budget-sec 16 \
-  --width 320 \
-  --height 180 \
-  --device auto \
-  --depth-profile fast \
-  --point-stride 12 \
-  --max-points 2000 \
-  --segmentation-mode panoptic \
-  --segmentation-interval 12 \
-  --explanation-mode on \
-  --render-profile fast
-```
-
-This writes per-run reports and a summary under `validation/manual-check/`.
-
-## Photoreal / Blender Notes
-
-For a like-for-like single-scenario comparison with the `fast` example above, first bootstrap the assets, then switch the render path to Blender-backed `photoreal` and use `runtime` perception:
-
-```bash
-PYTHONPATH=src python -m obj_recog.asset_bootstrap \
-  --scenario studio_open_v1 \
-  --asset-cache-dir ~/.cache/obj-recog/assets \
-  --asset-quality low \
-  --blender-exec /Applications/Blender.app/Contents/MacOS/Blender
-
-PYTHONPATH=src python -m obj_recog.main \
-  --input-source sim \
-  --scenario studio_open_v1 \
-  --sim-seed 7 \
-  --sim-max-steps 240 \
-  --eval-budget-sec 20 \
-  --render-profile photoreal \
-  --blender-exec /Applications/Blender.app/Contents/MacOS/Blender \
-  --sim-perception-mode runtime \
-  --width 640 \
-  --height 360 \
-  --device cpu \
-  --depth-profile fast \
-  --point-stride 8 \
-  --max-points 5000 \
-  --segmentation-mode panoptic \
-  --segmentation-interval 12 \
-  --explanation-mode off
-```
-
-Current status:
-
-- `render_profile=photoreal` is routed through the Blender realtime frame-source code path.
-- `Environment Model` uses the same normalized asset family as the camera renderer by loading preview meshes from the asset cache.
-- The Blender worker at `scripts/blender/realtime_worker.py` processes realtime requests and writes RGB, depth, semantic mask, instance mask, and detection metadata bundles.
-- Benchmark photoreal runs require external-provenance cache metadata and fail immediately if the cache is missing or stale.
-- Multi-scenario photoreal routing and validation are covered by tests.
-- The first photoreal frame is currently expensive on this machine. Expect a cold-start render to take several seconds before performance work lands.
-- If you already have an external render bundle manifest, you can use `--sim-external-manifest /absolute/path/to/manifest.json`.
+The old simulation asset bootstrap flow, external manifests, multi-scenario validation suite, and assisted/ground-truth sim perception modes are retired.
 
 ## Outputs
 
-- Scenario run reports: `reports/<scenario>-seed<seed>.json`
-- Validation summary and per-run JSON: `validation/<name>/`
-- Optional validation preview crops: enable `--scenario-preview-shots`
+Each sim run writes episode artifacts under:
+
+- `reports/sim/living_room_navigation_v1/.../episode_report.json`
+- `reports/sim/living_room_navigation_v1/.../planner_turns.jsonl`
+- `reports/sim/living_room_navigation_v1/.../self_calibration.json`
 
 ## Development Checks
 
 Useful regression commands:
 
 ```bash
-pytest -q tests/test_simulation.py tests/test_validation.py -k "photoreal and scenario"
-pytest -q tests/test_config.py tests/test_frame_source.py tests/test_sim_assets.py tests/test_blender_worker.py tests/test_simulation.py tests/test_validation.py tests/test_main_simulation.py
-pytest -q tests/test_main_smoke.py -k 'validation_probe or explanation or scene_graph or segmentation or isometric'
+pytest -q tests/test_config.py tests/test_blender_worker.py tests/test_realtime_worker_script.py tests/test_main_simulation.py
+pytest -q tests/test_sim_scene.py tests/test_sim_planner.py tests/test_living_room_runtime.py
 python -m compileall src/obj_recog
 git diff --check
 ```
