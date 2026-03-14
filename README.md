@@ -57,7 +57,7 @@ The simulation path is now an RGB-only Unity interface:
 - online runtime uses the same monocular perception stack as live input
 - hidden goal, collision truth, and evaluation stay outside the online inference loop
 
-The Unity project lives in `unity`. Open `Assets/Scenes/LivingRoomMain.unity` in Unity 6 LTS, then:
+The Unity project lives in `unity`. `Assets/Scenes/LivingRoomMain.unity` is based on ApartmentKit `Scene_02` with obj-recog runtime wiring layered on top. Open it in Unity 6 LTS, then:
 
 - run Play mode with no special arguments for `manual` keyboard/mouse control
 - build a Windows standalone player and let Python launch it in `agent` mode
@@ -66,8 +66,9 @@ Manual mode controls:
 
 - `W/S`: forward and backward
 - `A/D`: strafe left and right
-- `Q/E`: turn body left and right
-- mouse X: pan camera
+- `Q`: turn body right
+- `E`: turn body left
+- mouse X/Y: pan camera and look up/down
 - `R`: reset
 - `F1`: HUD toggle
 - `Esc`: release cursor, then press again to quit

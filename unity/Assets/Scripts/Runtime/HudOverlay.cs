@@ -51,7 +51,8 @@ namespace ObjRecog.UnitySim
 
             if (mode == SimulatorBootMode.Manual)
             {
-                GUILayout.Label("Controls: W/S move, A/D strafe, Q/E turn, mouse pan");
+                GUILayout.Label("Controls: W/S move, A/D strafe, Q/E turn, mouse look");
+                GUILayout.Label("Q = turn right, E = turn left, mouse Y = look up/down");
                 GUILayout.Label("R reset, F1 HUD toggle, Esc release cursor, Esc again quit");
                 if (manualInput != null && !manualInput.CursorCaptured)
                 {

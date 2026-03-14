@@ -1,5 +1,6 @@
-using System.Collections.Generic;
+using System;
 using UnityEngine;
+using UnityEngine.Rendering;
 #if UNITY_EDITOR
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -11,25 +12,47 @@ namespace ObjRecog.UnitySim
     [DisallowMultipleComponent]
     public sealed class LivingRoomAppBootstrap : MonoBehaviour
     {
-        private const float RoomWidth = 7.2f;
-        private const float RoomHeight = 2.5f;
-        private const float RoomDepth = 5.4f;
-        private const float WallThickness = 0.12f;
-        private const string GeneratedRootPrefix = "__GeneratedLivingRoom";
+        private const string RuntimeRootName = "ObjRecogRuntime";
+        private const string RobotRigGroupName = "RobotRig";
+        private const string RobotRootName = "RobotRoot";
+        private const string CameraPanPivotName = "CameraPanPivot";
+        private const string RobotCameraName = "RobotCamera";
+        private const string RobotSpawnName = "RobotSpawn";
+        private const string GoalAnchorName = "GoalAnchor";
+        private const string GoalTriggerName = "HiddenGoalTrigger";
+        private const string LightingRootName = "ObjRecogLighting";
+        private const string KeyLightName = "ObjRecogKeyLight";
+        private const string FillLightName = "ObjRecogFillLight";
 
-        [SerializeField] private int layoutRevision = 1;
+        [SerializeField] private int layoutRevision = 2;
         [SerializeField] private int captureWidth = 640;
         [SerializeField] private int captureHeight = 360;
         [SerializeField] private float cameraHeightM = 1.25f;
         [SerializeField] private float cameraVerticalFieldOfViewDeg = 34.782f;
         [SerializeField] private float cameraNearClipM = 0.2f;
-        [SerializeField] private float cameraFarClipM = 8.0f;
+        [SerializeField] private float cameraFarClipM = 120.0f;
+        [SerializeField] private float goalStandOffM = 1.25f;
+        [SerializeField] private float runtimeGroundHeightM = 0.05f;
+        [SerializeField] private float characterRadiusM = 0.28f;
+        [SerializeField] private float characterHeightM = 1.55f;
         [SerializeField] private bool autoRebuildInEditor = true;
+        [SerializeField] private bool disableVendorInteractions = true;
+        [SerializeField] private Vector3 fallbackSpawnPosition = new Vector3(-2.5f, 0.05f, -0.85f);
+        [SerializeField] private Vector3 fallbackSpawnEulerAngles = new Vector3(0.0f, 55.0f, 0.0f);
+        [SerializeField] private Vector3 fallbackGoalPosition = new Vector3(-6.2f, 0.05f, 0.35f);
+        [SerializeField] private bool brightenSceneLighting = true;
+        [SerializeField] private float ambientIntensity = 1.6f;
+        [SerializeField] private Color ambientSkyColor = new Color(0.54f, 0.58f, 0.64f, 1.0f);
+        [SerializeField] private Color ambientEquatorColor = new Color(0.34f, 0.36f, 0.39f, 1.0f);
+        [SerializeField] private Color ambientGroundColor = new Color(0.18f, 0.17f, 0.16f, 1.0f);
+        [SerializeField] private Color keyLightColor = new Color(1.0f, 0.96f, 0.9f, 1.0f);
+        [SerializeField] private float keyLightIntensity = 1.45f;
+        [SerializeField] private Vector3 keyLightEulerAngles = new Vector3(48.0f, -28.0f, 0.0f);
+        [SerializeField] private Color fillLightColor = new Color(0.74f, 0.82f, 0.98f, 1.0f);
+        [SerializeField] private float fillLightIntensity = 0.55f;
+        [SerializeField] private Vector3 fillLightEulerAngles = new Vector3(28.0f, 145.0f, 0.0f);
 
-        private readonly Dictionary<string, Material> _materialCache = new Dictionary<string, Material>();
-        private bool _editorRebuildQueued;
-
-        private string ExpectedGeneratedRootName => $"{GeneratedRootPrefix}_{layoutRevision}";
+        private bool _editorEnsureQueued;
 
         private void Reset()
         {
@@ -43,7 +66,7 @@ namespace ObjRecog.UnitySim
 
         private void Awake()
         {
-            EnsureSceneGraph();
+            EnsureRuntimeSetup(force: false);
             ApplyBootMode();
         }
 
@@ -64,10 +87,10 @@ namespace ObjRecog.UnitySim
         }
 #endif
 
-        [ContextMenu("Rebuild Living Room")]
+        [ContextMenu("Rebuild Living Room Runtime")]
         public void RebuildLivingRoom()
         {
-            RebuildSceneGraph(force: true);
+            EnsureRuntimeSetup(force: true);
         }
 
         private void QueueOrEnsureScene()
@@ -75,115 +98,61 @@ namespace ObjRecog.UnitySim
 #if UNITY_EDITOR
             if (!Application.isPlaying && autoRebuildInEditor)
             {
-                if (_editorRebuildQueued)
+                if (_editorEnsureQueued)
                 {
                     return;
                 }
 
-                _editorRebuildQueued = true;
+                _editorEnsureQueued = true;
                 EditorApplication.delayCall += EditorEnsureSceneGraph;
                 return;
             }
 #endif
-            EnsureSceneGraph();
+            EnsureRuntimeSetup(force: false);
         }
 
 #if UNITY_EDITOR
         private void EditorEnsureSceneGraph()
         {
-            _editorRebuildQueued = false;
+            _editorEnsureQueued = false;
             if (this == null)
             {
                 return;
             }
 
-            EnsureSceneGraph();
+            EnsureRuntimeSetup(force: false);
         }
 #endif
 
-        private void EnsureSceneGraph()
+        private void EnsureRuntimeSetup(bool force)
         {
-            RebuildSceneGraph(force: false);
-            WireRuntimeComponents();
-        }
-
-        private void RebuildSceneGraph(bool force)
-        {
-            Transform generatedRoot = FindGeneratedRoot();
-            bool needsBuild = force || generatedRoot == null || generatedRoot.childCount == 0;
-            if (!needsBuild)
+            Transform runtimeRoot = EnsureRuntimeRoot(force);
+            if (runtimeRoot == null)
             {
                 return;
             }
 
-            if (generatedRoot != null)
-            {
-                DestroySafe(generatedRoot.gameObject);
-            }
-
-            generatedRoot = new GameObject(ExpectedGeneratedRootName).transform;
-            generatedRoot.SetParent(transform, false);
-
-            Transform architectureRoot = CreateGroup(generatedRoot, "Architecture");
-            Transform decorRoot = CreateGroup(generatedRoot, "Decor");
-            Transform rigRoot = CreateGroup(generatedRoot, "RobotRig");
-
-            BuildArchitecture(architectureRoot);
-            BuildDecor(decorRoot);
-            BuildRobotRig(rigRoot);
-            BuildGoalTrigger(rigRoot);
-            BuildLighting(generatedRoot);
-
-#if UNITY_EDITOR
-            if (!Application.isPlaying)
-            {
-                EditorSceneManager.MarkSceneDirty(gameObject.scene);
-            }
-#endif
-        }
-
-        private void WireRuntimeComponents()
-        {
-            Transform generatedRoot = FindGeneratedRoot();
-            if (generatedRoot == null)
-            {
-                return;
-            }
-
-            Transform robotRoot = generatedRoot.Find("RobotRig/RobotRoot");
-            Transform cameraPanPivot = generatedRoot.Find("RobotRig/RobotRoot/CameraPanPivot");
-            Transform goalTrigger = generatedRoot.Find("RobotRig/HiddenGoalTrigger");
+            Transform spawnAnchor = FindRequiredChild(runtimeRoot, RobotSpawnName);
+            Transform goalAnchor = FindRequiredChild(runtimeRoot, GoalAnchorName);
+            Transform robotRoot = FindRequiredChild(runtimeRoot, $"{RobotRigGroupName}/{RobotRootName}");
+            Transform cameraPanPivot = FindRequiredChild(runtimeRoot, $"{RobotRigGroupName}/{RobotRootName}/{CameraPanPivotName}");
+            Transform goalTrigger = FindRequiredChild(runtimeRoot, GoalTriggerName);
             CharacterController controller = robotRoot == null ? null : robotRoot.GetComponent<CharacterController>();
             Camera robotCamera = cameraPanPivot == null ? null : cameraPanPivot.GetComponentInChildren<Camera>(true);
 
-            RobotRigController rigController = GetOrAddComponent<RobotRigController>(gameObject);
-            rigController.Configure(
-                controller,
-                robotRoot,
-                cameraPanPivot,
-                robotCamera,
-                captureWidth,
-                captureHeight,
-                cameraHeightM,
-                cameraVerticalFieldOfViewDeg
-            );
-
-            SessionState sessionState = GetOrAddComponent<SessionState>(gameObject);
-            sessionState.Configure(rigController, robotRoot);
-
-            GoalTrigger trigger = goalTrigger == null ? null : goalTrigger.GetComponent<GoalTrigger>();
-            if (trigger != null)
+            if (disableVendorInteractions)
             {
-                trigger.Configure(sessionState);
+                DisableConflictingSceneComponents(robotCamera);
             }
 
-            ManualInputController manualInput = GetOrAddComponent<ManualInputController>(gameObject);
-            HudOverlay hudOverlay = GetOrAddComponent<HudOverlay>(gameObject);
-            AgentTcpServer agentServer = GetOrAddComponent<AgentTcpServer>(gameObject);
+            if (brightenSceneLighting)
+            {
+                EnsureLightingSetup(runtimeRoot, force);
+            }
 
-            manualInput.Configure(rigController, sessionState, hudOverlay);
-            agentServer.Configure("127.0.0.1", 8765, rigController, sessionState);
-            hudOverlay.Configure(sessionState, manualInput, agentServer, SimulatorBootMode.Manual);
+            AutoPlaceAnchors(spawnAnchor, goalAnchor);
+            SyncRuntimeObjects(spawnAnchor, goalAnchor, robotRoot, cameraPanPivot, goalTrigger, controller, robotCamera);
+            WireRuntimeComponents(runtimeRoot, robotRoot, cameraPanPivot, goalTrigger, controller, robotCamera);
         }
 
         private void ApplyBootMode()
@@ -193,17 +162,24 @@ namespace ObjRecog.UnitySim
                 return;
             }
 
-            SessionState sessionState = GetComponent<SessionState>();
-            ManualInputController manualInput = GetComponent<ManualInputController>();
-            HudOverlay hudOverlay = GetComponent<HudOverlay>();
-            AgentTcpServer agentServer = GetComponent<AgentTcpServer>();
-            if (sessionState == null || manualInput == null || hudOverlay == null || agentServer == null)
+            Transform runtimeRoot = transform.Find(RuntimeRootName);
+            if (runtimeRoot == null)
             {
                 return;
             }
 
-            BootModeConfig bootMode = BootModeResolver.Resolve(System.Environment.GetCommandLineArgs());
-            agentServer.Configure(bootMode.Host, bootMode.Port, GetComponent<RobotRigController>(), sessionState);
+            SessionState sessionState = runtimeRoot.GetComponent<SessionState>();
+            ManualInputController manualInput = runtimeRoot.GetComponent<ManualInputController>();
+            HudOverlay hudOverlay = runtimeRoot.GetComponent<HudOverlay>();
+            AgentTcpServer agentServer = runtimeRoot.GetComponent<AgentTcpServer>();
+            RobotRigController robotRig = runtimeRoot.GetComponent<RobotRigController>();
+            if (sessionState == null || manualInput == null || hudOverlay == null || agentServer == null || robotRig == null)
+            {
+                return;
+            }
+
+            BootModeConfig bootMode = BootModeResolver.Resolve(Environment.GetCommandLineArgs());
+            agentServer.Configure(bootMode.Host, bootMode.Port, robotRig, sessionState);
             agentServer.EnableAgentMode(bootMode.Mode == SimulatorBootMode.Agent);
             hudOverlay.Configure(sessionState, manualInput, agentServer, bootMode.Mode);
 
@@ -224,442 +200,447 @@ namespace ObjRecog.UnitySim
             sessionState.ShowTransientStatus("Manual mode ready", 3.0f);
         }
 
-        private void BuildArchitecture(Transform parent)
+        private Transform EnsureRuntimeRoot(bool force)
         {
-            float halfWidth = RoomWidth * 0.5f;
-            float halfDepth = RoomDepth * 0.5f;
-            float frontGlassWidth = RoomWidth - 0.30f;
+            Transform runtimeRoot = transform.Find(RuntimeRootName);
+            if (runtimeRoot == null)
+            {
+                runtimeRoot = new GameObject(RuntimeRootName).transform;
+                runtimeRoot.SetParent(transform, false);
+            }
 
-            CreateBox(
-                name: "Floor",
-                parent: parent,
-                localPosition: new Vector3(0.0f, -0.03f, 0.0f),
-                localScale: new Vector3(RoomWidth, 0.06f, RoomDepth),
-                color: new Color(0.58f, 0.42f, 0.28f)
-            );
-            CreateBox(
-                name: "Ceiling",
-                parent: parent,
-                localPosition: new Vector3(0.0f, RoomHeight + 0.03f, 0.0f),
-                localScale: new Vector3(RoomWidth, 0.06f, RoomDepth),
-                color: new Color(0.95f, 0.95f, 0.94f)
-            );
-            CreateBox(
-                name: "WallLeft",
-                parent: parent,
-                localPosition: new Vector3(-halfWidth + (WallThickness * 0.5f), RoomHeight * 0.5f, 0.0f),
-                localScale: new Vector3(WallThickness, RoomHeight, RoomDepth),
-                color: new Color(0.93f, 0.93f, 0.91f)
-            );
-            CreateBox(
-                name: "WallRight",
-                parent: parent,
-                localPosition: new Vector3(halfWidth - (WallThickness * 0.5f), RoomHeight * 0.5f, 0.0f),
-                localScale: new Vector3(WallThickness, RoomHeight, RoomDepth),
-                color: new Color(0.93f, 0.93f, 0.91f)
-            );
-            CreateBox(
-                name: "WallBack",
-                parent: parent,
-                localPosition: new Vector3(0.0f, RoomHeight * 0.5f, -halfDepth + (WallThickness * 0.5f)),
-                localScale: new Vector3(RoomWidth, RoomHeight, WallThickness),
-                color: new Color(0.94f, 0.94f, 0.92f)
-            );
-            CreateBox(
-                name: "FrontGlass",
-                parent: parent,
-                localPosition: new Vector3(0.0f, 1.30f, halfDepth - 0.02f),
-                localScale: new Vector3(frontGlassWidth, 2.15f, 0.04f),
-                color: new Color(0.78f, 0.86f, 0.92f, 0.38f),
-                colliderEnabled: false,
-                transparent: true
-            );
-            CreateBox(
-                name: "FrontFrameTop",
-                parent: parent,
-                localPosition: new Vector3(0.0f, 2.30f, halfDepth - 0.02f),
-                localScale: new Vector3(frontGlassWidth, 0.18f, 0.08f),
-                color: new Color(0.95f, 0.95f, 0.94f)
-            );
-            CreateBox(
-                name: "FrontFrameBottom",
-                parent: parent,
-                localPosition: new Vector3(0.0f, 0.18f, halfDepth - 0.02f),
-                localScale: new Vector3(frontGlassWidth, 0.16f, 0.08f),
-                color: new Color(0.93f, 0.93f, 0.92f)
-            );
-            CreateBox(
-                name: "FrontFrameLeft",
-                parent: parent,
-                localPosition: new Vector3(-(frontGlassWidth * 0.5f) + 0.07f, 1.30f, halfDepth - 0.02f),
-                localScale: new Vector3(0.08f, 2.15f, 0.08f),
-                color: new Color(0.94f, 0.94f, 0.92f)
-            );
-            CreateBox(
-                name: "FrontFrameRight",
-                parent: parent,
-                localPosition: new Vector3((frontGlassWidth * 0.5f) - 0.07f, 1.30f, halfDepth - 0.02f),
-                localScale: new Vector3(0.08f, 2.15f, 0.08f),
-                color: new Color(0.94f, 0.94f, 0.92f)
-            );
-            CreateBox(
-                name: "CurtainLeft",
-                parent: parent,
-                localPosition: new Vector3(-(frontGlassWidth * 0.5f) + 0.30f, 1.45f, halfDepth - 0.09f),
-                localScale: new Vector3(0.45f, 2.05f, 0.06f),
-                color: new Color(0.82f, 0.78f, 0.72f),
-                colliderEnabled: false
-            );
-            CreateBox(
-                name: "CurtainRight",
-                parent: parent,
-                localPosition: new Vector3((frontGlassWidth * 0.5f) - 0.30f, 1.45f, halfDepth - 0.09f),
-                localScale: new Vector3(0.45f, 2.05f, 0.06f),
-                color: new Color(0.82f, 0.78f, 0.72f),
-                colliderEnabled: false
-            );
-            CreateBox(
-                name: "Rug",
-                parent: parent,
-                localPosition: new Vector3(-1.35f, 0.01f, 0.50f),
-                localScale: new Vector3(2.40f, 0.02f, 1.85f),
-                color: new Color(0.84f, 0.78f, 0.68f),
-                colliderEnabled: false
-            );
-        }
+            Transform spawnAnchor = FindOrCreateChild(runtimeRoot, RobotSpawnName);
+            Transform goalAnchor = FindOrCreateChild(runtimeRoot, GoalAnchorName);
+            spawnAnchor.gameObject.SetActive(true);
+            goalAnchor.gameObject.SetActive(true);
 
-        private void BuildDecor(Transform parent)
-        {
-            BuildSofa(parent);
-            BuildCoffeeTable(parent);
-            BuildTvConsole(parent);
-            BuildDiningTable(parent);
-            BuildDiningChair(parent, "DiningChairFront", new Vector3(1.75f, 0.0f, 0.72f), 180.0f);
-            BuildDiningChair(parent, "DiningChairBack", new Vector3(1.75f, 0.0f, 2.58f), 0.0f);
-            BuildDiningChair(parent, "DiningChairLeft", new Vector3(0.72f, 0.0f, 1.65f), 90.0f);
-            BuildDiningChair(parent, "DiningChairRight", new Vector3(2.78f, 0.0f, 1.65f), -90.0f);
-            BuildLamp(parent);
-        }
-
-        private void BuildSofa(Transform parent)
-        {
-            Transform group = CreateGroup(parent, "Sofa");
-            group.localPosition = new Vector3(-1.85f, 0.0f, -0.15f);
-            CreateBox("Base", group, new Vector3(0.0f, 0.22f, 0.0f), new Vector3(2.20f, 0.44f, 0.95f), new Color(0.57f, 0.60f, 0.63f));
-            CreateBox("Back", group, new Vector3(0.0f, 0.68f, -0.33f), new Vector3(2.20f, 0.76f, 0.28f), new Color(0.53f, 0.56f, 0.60f));
-            CreateBox("ArmLeft", group, new Vector3(-0.98f, 0.52f, 0.0f), new Vector3(0.24f, 0.58f, 0.95f), new Color(0.53f, 0.56f, 0.60f));
-            CreateBox("ArmRight", group, new Vector3(0.98f, 0.52f, 0.0f), new Vector3(0.24f, 0.58f, 0.95f), new Color(0.53f, 0.56f, 0.60f));
-        }
-
-        private void BuildCoffeeTable(Transform parent)
-        {
-            Transform group = CreateGroup(parent, "CoffeeTable");
-            group.localPosition = new Vector3(-1.45f, 0.0f, 0.95f);
-            CreateBox("Top", group, new Vector3(0.0f, 0.40f, 0.0f), new Vector3(1.00f, 0.06f, 0.60f), new Color(0.54f, 0.37f, 0.20f));
-            CreateTableLegs(group, 0.42f, 0.18f, 0.42f, 0.30f, 0.05f, new Color(0.33f, 0.23f, 0.13f));
-        }
-
-        private void BuildTvConsole(Transform parent)
-        {
-            Transform group = CreateGroup(parent, "TvConsole");
-            group.localPosition = new Vector3(2.15f, 0.0f, -1.80f);
-            CreateBox("ConsoleBody", group, new Vector3(0.0f, 0.27f, 0.0f), new Vector3(1.80f, 0.54f, 0.45f), new Color(0.43f, 0.29f, 0.17f));
-            CreateBox("TvPanel", group, new Vector3(0.0f, 1.15f, 0.22f), new Vector3(1.40f, 0.80f, 0.06f), new Color(0.08f, 0.08f, 0.09f), colliderEnabled: false);
-        }
-
-        private void BuildDiningTable(Transform parent)
-        {
-            Transform group = CreateGroup(parent, "DiningTable");
-            group.localPosition = new Vector3(1.75f, 0.0f, 1.65f);
-            CreateBox("Top", group, new Vector3(0.0f, 0.75f, 0.0f), new Vector3(1.60f, 0.07f, 0.90f), new Color(0.66f, 0.49f, 0.28f));
-            CreateTableLegs(group, 0.68f, 0.68f, 0.33f, 0.33f, 0.08f, new Color(0.42f, 0.28f, 0.16f));
-        }
-
-        private void BuildDiningChair(Transform parent, string name, Vector3 center, float yawDeg)
-        {
-            Transform group = CreateGroup(parent, name);
-            group.localPosition = center;
-            group.localRotation = Quaternion.Euler(0.0f, yawDeg, 0.0f);
-            CreateBox("Seat", group, new Vector3(0.0f, 0.45f, 0.0f), new Vector3(0.50f, 0.07f, 0.50f), new Color(0.67f, 0.51f, 0.31f));
-            CreateBox("Back", group, new Vector3(0.0f, 0.82f, -0.20f), new Vector3(0.50f, 0.62f, 0.08f), new Color(0.59f, 0.44f, 0.26f));
-            CreateTableLegs(group, 0.40f, 0.40f, 0.18f, 0.18f, 0.05f, new Color(0.38f, 0.26f, 0.15f));
-        }
-
-        private void BuildLamp(Transform parent)
-        {
-            Transform group = CreateGroup(parent, "FloorLamp");
-            group.localPosition = new Vector3(-2.75f, 0.0f, 1.75f);
-            CreateCylinder("Base", group, new Vector3(0.0f, 0.03f, 0.0f), new Vector3(0.34f, 0.03f, 0.34f), new Color(0.18f, 0.18f, 0.18f));
-            CreateCylinder("Pole", group, new Vector3(0.0f, 0.82f, 0.0f), new Vector3(0.04f, 0.82f, 0.04f), new Color(0.21f, 0.21f, 0.22f));
-            CreateCylinder("Shade", group, new Vector3(0.0f, 1.62f, 0.0f), new Vector3(0.26f, 0.18f, 0.26f), new Color(0.90f, 0.84f, 0.72f), colliderEnabled: false);
-        }
-
-        private void BuildRobotRig(Transform parent)
-        {
-            Transform robotRoot = CreateGroup(parent, "RobotRoot");
-            robotRoot.localPosition = new Vector3(-2.4f, 0.0f, -1.85f);
-
+            Transform rigGroup = FindOrCreateChild(runtimeRoot, RobotRigGroupName);
+            Transform robotRoot = FindOrCreateChild(rigGroup, RobotRootName);
             CharacterController controller = GetOrAddComponent<CharacterController>(robotRoot.gameObject);
-            controller.height = 1.68f;
-            controller.radius = 0.28f;
-            controller.center = new Vector3(0.0f, 0.84f, 0.0f);
+
+            Transform cameraPanPivot = FindOrCreateChild(robotRoot, CameraPanPivotName);
+            Transform robotCameraTransform = FindOrCreateChild(cameraPanPivot, RobotCameraName);
+            Camera robotCamera = GetOrAddComponent<Camera>(robotCameraTransform.gameObject);
+            AudioListener _ = GetOrAddComponent<AudioListener>(robotCameraTransform.gameObject);
+
+            Transform goalTrigger = FindOrCreateChild(runtimeRoot, GoalTriggerName);
+            BoxCollider triggerCollider = GetOrAddComponent<BoxCollider>(goalTrigger.gameObject);
+            triggerCollider.isTrigger = true;
+
+            if (force || !Application.isPlaying)
+            {
+                robotRoot.SetParent(rigGroup, false);
+                cameraPanPivot.SetParent(robotRoot, false);
+                robotCameraTransform.SetParent(cameraPanPivot, false);
+                goalTrigger.SetParent(runtimeRoot, false);
+            }
+
+            controller.radius = characterRadiusM;
+            controller.height = characterHeightM;
+            controller.center = new Vector3(0.0f, characterHeightM * 0.5f, 0.0f);
+            controller.minMoveDistance = 0.0f;
+            controller.stepOffset = 0.3f;
+            controller.skinWidth = 0.03f;
             controller.slopeLimit = 45.0f;
-            controller.stepOffset = 0.25f;
 
-            GameObject body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-            body.name = "RobotBody";
-            body.transform.SetParent(robotRoot, false);
-            body.transform.localPosition = new Vector3(0.0f, 0.78f, 0.0f);
-            body.transform.localScale = new Vector3(0.42f, 0.70f, 0.42f);
-            body.GetComponent<Renderer>().sharedMaterial = GetOrCreateMaterial("robot", new Color(0.24f, 0.30f, 0.38f));
-            RemoveColliders(body);
-
-            Transform cameraPanPivot = CreateGroup(robotRoot, "CameraPanPivot");
-            cameraPanPivot.localPosition = new Vector3(0.0f, cameraHeightM, 0.0f);
-
-            GameObject cameraObject = new GameObject("RobotCamera");
-            cameraObject.transform.SetParent(cameraPanPivot, false);
-            cameraObject.transform.localPosition = Vector3.zero;
-            cameraObject.transform.localRotation = Quaternion.identity;
-            Camera robotCamera = cameraObject.AddComponent<Camera>();
             robotCamera.nearClipPlane = cameraNearClipM;
-            robotCamera.farClipPlane = cameraFarClipM;
+            robotCamera.farClipPlane = Mathf.Max(cameraFarClipM, 120.0f);
             robotCamera.fieldOfView = cameraVerticalFieldOfViewDeg;
-            robotCamera.clearFlags = CameraClearFlags.Skybox;
-            robotCamera.allowHDR = true;
-            robotCamera.allowMSAA = true;
-            cameraObject.tag = "MainCamera";
-        }
-
-        private void BuildGoalTrigger(Transform parent)
-        {
-            Transform triggerRoot = CreateGroup(parent, "HiddenGoalTrigger");
-            triggerRoot.localPosition = new Vector3(1.75f, 0.40f, 0.45f);
-            BoxCollider collider = GetOrAddComponent<BoxCollider>(triggerRoot.gameObject);
-            collider.size = new Vector3(0.85f, 1.40f, 0.70f);
-            collider.isTrigger = true;
-            GoalTrigger trigger = GetOrAddComponent<GoalTrigger>(triggerRoot.gameObject);
-            Renderer renderer = triggerRoot.GetComponent<Renderer>();
-            if (renderer != null)
-            {
-                renderer.enabled = false;
-            }
-        }
-
-        private void BuildLighting(Transform parent)
-        {
-            GameObject sun = new GameObject("SunMain");
-            sun.transform.SetParent(parent, false);
-            sun.transform.position = new Vector3(0.0f, 4.5f, 4.8f);
-            sun.transform.rotation = Quaternion.Euler(55.0f, 0.0f, 180.0f);
-            Light sunLight = sun.AddComponent<Light>();
-            sunLight.type = LightType.Directional;
-            sunLight.color = new Color(1.0f, 0.96f, 0.90f);
-            sunLight.intensity = 1.15f;
-            sunLight.shadows = LightShadows.Soft;
-
-            CreatePointLight(parent, "LivingCeiling", new Vector3(-1.2f, 2.2f, 0.3f), new Color(1.0f, 0.97f, 0.93f), 5.0f, 6.0f);
-            CreatePointLight(parent, "DiningCeiling", new Vector3(1.8f, 2.15f, 1.65f), new Color(1.0f, 0.90f, 0.82f), 4.4f, 5.0f);
-        }
-
-        private void CreateTableLegs(
-            Transform parent,
-            float offsetX,
-            float offsetZ,
-            float legHeight,
-            float legCenterY,
-            float legWidth,
-            Color color
-        )
-        {
-            CreateBox("LegFrontLeft", parent, new Vector3(-offsetX, legCenterY, offsetZ), new Vector3(legWidth, legHeight, legWidth), color);
-            CreateBox("LegFrontRight", parent, new Vector3(offsetX, legCenterY, offsetZ), new Vector3(legWidth, legHeight, legWidth), color);
-            CreateBox("LegBackLeft", parent, new Vector3(-offsetX, legCenterY, -offsetZ), new Vector3(legWidth, legHeight, legWidth), color);
-            CreateBox("LegBackRight", parent, new Vector3(offsetX, legCenterY, -offsetZ), new Vector3(legWidth, legHeight, legWidth), color);
-        }
-
-        private void CreatePointLight(Transform parent, string name, Vector3 position, Color color, float intensity, float range)
-        {
-            GameObject lightObject = new GameObject(name);
-            lightObject.transform.SetParent(parent, false);
-            lightObject.transform.position = position;
-            Light lightComponent = lightObject.AddComponent<Light>();
-            lightComponent.type = LightType.Point;
-            lightComponent.color = color;
-            lightComponent.intensity = intensity;
-            lightComponent.range = range;
-            lightComponent.shadows = LightShadows.Soft;
-        }
-
-        private Transform FindGeneratedRoot()
-        {
-            for (int index = transform.childCount - 1; index >= 0; index--)
-            {
-                Transform child = transform.GetChild(index);
-                if (child.name == ExpectedGeneratedRootName)
-                {
-                    return child;
-                }
-
-                if (child.name.StartsWith(GeneratedRootPrefix, System.StringComparison.Ordinal))
-                {
-                    DestroySafe(child.gameObject);
-                }
-            }
-
-            return null;
-        }
-
-        private Transform CreateGroup(Transform parent, string name)
-        {
-            Transform existing = parent.Find(name);
-            if (existing != null)
-            {
-                return existing;
-            }
-
-            GameObject group = new GameObject(name);
-            group.transform.SetParent(parent, false);
-            return group.transform;
-        }
-
-        private GameObject CreateBox(
-            string name,
-            Transform parent,
-            Vector3 localPosition,
-            Vector3 localScale,
-            Color color,
-            bool colliderEnabled = true,
-            bool transparent = false
-        )
-        {
-            GameObject box = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            box.name = name;
-            box.transform.SetParent(parent, false);
-            box.transform.localPosition = localPosition;
-            box.transform.localRotation = Quaternion.identity;
-            box.transform.localScale = localScale;
-            box.GetComponent<Renderer>().sharedMaterial = GetOrCreateMaterial(name + "_mat", color, transparent);
-            if (!colliderEnabled)
-            {
-                RemoveColliders(box);
-            }
-
-            return box;
-        }
-
-        private GameObject CreateCylinder(
-            string name,
-            Transform parent,
-            Vector3 localPosition,
-            Vector3 localScale,
-            Color color,
-            bool colliderEnabled = true
-        )
-        {
-            GameObject cylinder = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            cylinder.name = name;
-            cylinder.transform.SetParent(parent, false);
-            cylinder.transform.localPosition = localPosition;
-            cylinder.transform.localRotation = Quaternion.identity;
-            cylinder.transform.localScale = localScale;
-            cylinder.GetComponent<Renderer>().sharedMaterial = GetOrCreateMaterial(name + "_mat", color);
-            if (!colliderEnabled)
-            {
-                RemoveColliders(cylinder);
-            }
-
-            return cylinder;
-        }
-
-        private void RemoveColliders(GameObject gameObject)
-        {
-            Collider[] colliders = gameObject.GetComponents<Collider>();
-            for (int index = 0; index < colliders.Length; index++)
-            {
-                DestroySafe(colliders[index]);
-            }
-        }
-
-        private Material GetOrCreateMaterial(string key, Color color, bool transparent = false)
-        {
-            Material cached;
-            if (_materialCache.TryGetValue(key, out cached) && cached != null)
-            {
-                return cached;
-            }
-
-            Shader shader = Shader.Find("Universal Render Pipeline/Lit");
-            if (shader == null)
-            {
-                shader = Shader.Find("Standard");
-            }
-
-            if (shader == null)
-            {
-                shader = Shader.Find("Diffuse");
-            }
-
-            Material material = new Material(shader);
-            material.name = key;
-            ConfigureMaterial(material, color, transparent);
-            _materialCache[key] = material;
-            return material;
-        }
-
-        private void ConfigureMaterial(Material material, Color color, bool transparent)
-        {
-            material.color = color;
-            if (!transparent)
-            {
-                return;
-            }
-
-            if (material.HasProperty("_Surface"))
-            {
-                material.SetFloat("_Surface", 1.0f);
-            }
-
-            if (material.HasProperty("_Mode"))
-            {
-                material.SetFloat("_Mode", 3.0f);
-            }
-
-            material.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-            material.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-            material.SetInt("_ZWrite", 0);
-            material.DisableKeyword("_ALPHATEST_ON");
-            material.EnableKeyword("_ALPHABLEND_ON");
-            material.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
-        }
-
-        private static T GetOrAddComponent<T>(GameObject owner)
-            where T : Component
-        {
-            T existing = owner.GetComponent<T>();
-            if (existing != null)
-            {
-                return existing;
-            }
-
-            return owner.AddComponent<T>();
-        }
-
-        private static void DestroySafe(Object target)
-        {
-            if (target == null)
-            {
-                return;
-            }
 
 #if UNITY_EDITOR
             if (!Application.isPlaying)
             {
-                DestroyImmediate(target);
-                return;
+                EditorSceneManager.MarkSceneDirty(gameObject.scene);
             }
 #endif
-            Destroy(target);
+
+            return runtimeRoot;
+        }
+
+        private void EnsureLightingSetup(Transform runtimeRoot, bool force)
+        {
+            if (runtimeRoot == null)
+            {
+                return;
+            }
+
+            Transform lightingRoot = FindOrCreateChild(runtimeRoot, LightingRootName);
+            Transform keyLightTransform = FindOrCreateChild(lightingRoot, KeyLightName);
+            Transform fillLightTransform = FindOrCreateChild(lightingRoot, FillLightName);
+
+            Light keyLight = GetOrAddComponent<Light>(keyLightTransform.gameObject);
+            Light fillLight = GetOrAddComponent<Light>(fillLightTransform.gameObject);
+
+            ConfigureDirectionalLight(
+                keyLight,
+                KeyLightName,
+                keyLightColor,
+                keyLightIntensity,
+                keyLightEulerAngles,
+                shadows: LightShadows.Soft
+            );
+            ConfigureDirectionalLight(
+                fillLight,
+                FillLightName,
+                fillLightColor,
+                fillLightIntensity,
+                fillLightEulerAngles,
+                shadows: LightShadows.None
+            );
+
+            RenderSettings.ambientMode = AmbientMode.Trilight;
+            RenderSettings.ambientSkyColor = ambientSkyColor;
+            RenderSettings.ambientEquatorColor = ambientEquatorColor;
+            RenderSettings.ambientGroundColor = ambientGroundColor;
+            RenderSettings.ambientIntensity = ambientIntensity;
+            RenderSettings.reflectionIntensity = Mathf.Max(RenderSettings.reflectionIntensity, 1.15f);
+            RenderSettings.sun = keyLight;
+
+#if UNITY_EDITOR
+            if ((force || !Application.isPlaying) && !Application.isPlaying)
+            {
+                EditorSceneManager.MarkSceneDirty(gameObject.scene);
+            }
+#endif
+        }
+
+        private void AutoPlaceAnchors(Transform spawnAnchor, Transform goalAnchor)
+        {
+            if (spawnAnchor == null || goalAnchor == null)
+            {
+                return;
+            }
+
+            Transform sceneCamera = FindPreferredSceneCamera();
+            Vector3 spawnPosition = fallbackSpawnPosition;
+            Quaternion spawnRotation = Quaternion.Euler(fallbackSpawnEulerAngles);
+            if (sceneCamera != null)
+            {
+                spawnPosition = sceneCamera.position;
+                spawnPosition.y = runtimeGroundHeightM;
+                spawnRotation = Quaternion.Euler(0.0f, sceneCamera.rotation.eulerAngles.y, 0.0f);
+            }
+
+            spawnAnchor.position = spawnPosition;
+            spawnAnchor.rotation = spawnRotation;
+
+            Transform diningTable = FindNearestNamedTransform("Table_Dining", spawnPosition);
+            if (diningTable != null)
+            {
+                Vector3 tablePosition = diningTable.position;
+                Vector3 toSpawn = new Vector3(spawnPosition.x - tablePosition.x, 0.0f, spawnPosition.z - tablePosition.z);
+                if (toSpawn.sqrMagnitude < 0.01f)
+                {
+                    Vector3 forward = diningTable.forward;
+                    toSpawn = new Vector3(forward.x, 0.0f, forward.z);
+                }
+
+                Vector3 goalDirection = toSpawn.normalized;
+                Vector3 goalPosition = tablePosition + (goalDirection * goalStandOffM);
+                goalPosition.y = runtimeGroundHeightM;
+                goalAnchor.position = goalPosition;
+                if (goalDirection.sqrMagnitude > 0.001f)
+                {
+                    Vector3 facing = tablePosition - goalPosition;
+                    facing.y = 0.0f;
+                    goalAnchor.rotation = facing.sqrMagnitude > 0.001f
+                        ? Quaternion.LookRotation(facing.normalized, Vector3.up)
+                        : Quaternion.identity;
+                }
+            }
+            else
+            {
+                goalAnchor.position = fallbackGoalPosition;
+                Vector3 facing = spawnPosition - fallbackGoalPosition;
+                facing.y = 0.0f;
+                goalAnchor.rotation = facing.sqrMagnitude > 0.001f
+                    ? Quaternion.LookRotation(facing.normalized, Vector3.up)
+                    : Quaternion.identity;
+            }
+        }
+
+        private void SyncRuntimeObjects(
+            Transform spawnAnchor,
+            Transform goalAnchor,
+            Transform robotRoot,
+            Transform cameraPanPivot,
+            Transform goalTrigger,
+            CharacterController controller,
+            Camera robotCamera
+        )
+        {
+            if (spawnAnchor == null || goalAnchor == null || robotRoot == null || cameraPanPivot == null || goalTrigger == null)
+            {
+                return;
+            }
+
+            if (controller != null)
+            {
+                bool wasEnabled = controller.enabled;
+                controller.enabled = false;
+                robotRoot.position = spawnAnchor.position;
+                robotRoot.rotation = spawnAnchor.rotation;
+                controller.enabled = wasEnabled;
+            }
+            else
+            {
+                robotRoot.position = spawnAnchor.position;
+                robotRoot.rotation = spawnAnchor.rotation;
+            }
+
+            cameraPanPivot.localPosition = new Vector3(0.0f, cameraHeightM, 0.0f);
+            cameraPanPivot.localRotation = Quaternion.identity;
+
+            if (robotCamera != null)
+            {
+                robotCamera.transform.localPosition = Vector3.zero;
+                robotCamera.fieldOfView = cameraVerticalFieldOfViewDeg;
+                robotCamera.nearClipPlane = cameraNearClipM;
+                robotCamera.farClipPlane = Mathf.Max(cameraFarClipM, 120.0f);
+            }
+
+            goalTrigger.position = goalAnchor.position;
+            goalTrigger.rotation = goalAnchor.rotation;
+
+            BoxCollider triggerCollider = goalTrigger.GetComponent<BoxCollider>();
+            if (triggerCollider != null)
+            {
+                triggerCollider.isTrigger = true;
+                triggerCollider.center = new Vector3(0.0f, 0.6f, 0.0f);
+                triggerCollider.size = new Vector3(0.7f, 1.2f, 0.7f);
+            }
+        }
+
+        private void WireRuntimeComponents(
+            Transform runtimeRoot,
+            Transform robotRoot,
+            Transform cameraPanPivot,
+            Transform goalTrigger,
+            CharacterController controller,
+            Camera robotCamera
+        )
+        {
+            RobotRigController rigController = GetOrAddComponent<RobotRigController>(runtimeRoot.gameObject);
+            rigController.Configure(
+                controller,
+                robotRoot,
+                cameraPanPivot,
+                robotCamera,
+                captureWidth,
+                captureHeight,
+                cameraHeightM,
+                cameraVerticalFieldOfViewDeg,
+                cameraNearClipM,
+                cameraFarClipM
+            );
+
+            SessionState sessionState = GetOrAddComponent<SessionState>(runtimeRoot.gameObject);
+            sessionState.Configure(rigController, robotRoot);
+
+            GoalTrigger trigger = GetOrAddComponent<GoalTrigger>(goalTrigger.gameObject);
+            trigger.Configure(sessionState);
+
+            ManualInputController manualInput = GetOrAddComponent<ManualInputController>(runtimeRoot.gameObject);
+            HudOverlay hudOverlay = GetOrAddComponent<HudOverlay>(runtimeRoot.gameObject);
+            AgentTcpServer agentServer = GetOrAddComponent<AgentTcpServer>(runtimeRoot.gameObject);
+
+            manualInput.Configure(rigController, sessionState, hudOverlay);
+            agentServer.Configure("127.0.0.1", 8765, rigController, sessionState);
+            hudOverlay.Configure(sessionState, manualInput, agentServer, SimulatorBootMode.Manual);
+        }
+
+        private void DisableConflictingSceneComponents(Camera robotCamera)
+        {
+            GameObject[] roots = gameObject.scene.GetRootGameObjects();
+            for (int rootIndex = 0; rootIndex < roots.Length; rootIndex++)
+            {
+                GameObject root = roots[rootIndex];
+                if (root == null)
+                {
+                    continue;
+                }
+
+                MonoBehaviour[] behaviours = root.GetComponentsInChildren<MonoBehaviour>(true);
+                for (int index = 0; index < behaviours.Length; index++)
+                {
+                    MonoBehaviour behaviour = behaviours[index];
+                    if (behaviour == null || behaviour == this)
+                    {
+                        continue;
+                    }
+
+                    Type type = behaviour.GetType();
+                    string namespaceName = type.Namespace ?? string.Empty;
+                    bool keepBehaviour =
+                        namespaceName.StartsWith("ObjRecog.UnitySim", StringComparison.Ordinal) ||
+                        namespaceName.StartsWith("Unity", StringComparison.Ordinal) ||
+                        namespaceName.StartsWith("TMPro", StringComparison.Ordinal);
+                    if (!keepBehaviour && behaviour.enabled)
+                    {
+                        behaviour.enabled = false;
+                    }
+                }
+
+                Camera[] cameras = root.GetComponentsInChildren<Camera>(true);
+                for (int cameraIndex = 0; cameraIndex < cameras.Length; cameraIndex++)
+                {
+                    Camera camera = cameras[cameraIndex];
+                    if (camera == null || camera == robotCamera)
+                    {
+                        continue;
+                    }
+
+                    camera.enabled = false;
+                }
+
+                AudioListener[] listeners = root.GetComponentsInChildren<AudioListener>(true);
+                for (int listenerIndex = 0; listenerIndex < listeners.Length; listenerIndex++)
+                {
+                    AudioListener listener = listeners[listenerIndex];
+                    if (listener == null)
+                    {
+                        continue;
+                    }
+
+                    bool keepListener = robotCamera != null && listener.gameObject == robotCamera.gameObject;
+                    listener.enabled = keepListener;
+                }
+            }
+        }
+
+        private Transform FindPreferredSceneCamera()
+        {
+            Camera[] cameras = gameObject.scene.GetRootGameObjects().Length == 0
+                ? Array.Empty<Camera>()
+                : FindSceneComponents<Camera>();
+
+            Transform fallbackCamera = null;
+            for (int index = 0; index < cameras.Length; index++)
+            {
+                Camera camera = cameras[index];
+                if (camera == null || camera.transform.IsChildOf(transform))
+                {
+                    continue;
+                }
+
+                if (string.Equals(camera.gameObject.name, RobotCameraName, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (string.Equals(camera.gameObject.name, "Camera", StringComparison.OrdinalIgnoreCase))
+                {
+                    return camera.transform;
+                }
+
+                if (fallbackCamera == null)
+                {
+                    fallbackCamera = camera.transform;
+                }
+            }
+
+            return fallbackCamera;
+        }
+
+        private Transform FindNearestNamedTransform(string prefix, Vector3 origin)
+        {
+            Transform nearest = null;
+            float nearestDistanceSq = float.MaxValue;
+            Transform[] transforms = FindSceneComponents<Transform>();
+            for (int index = 0; index < transforms.Length; index++)
+            {
+                Transform candidate = transforms[index];
+                if (candidate == null || candidate.IsChildOf(transform))
+                {
+                    continue;
+                }
+
+                if (!candidate.name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Vector3 delta = candidate.position - origin;
+                delta.y = 0.0f;
+                float distanceSq = delta.sqrMagnitude;
+                if (distanceSq < nearestDistanceSq)
+                {
+                    nearestDistanceSq = distanceSq;
+                    nearest = candidate;
+                }
+            }
+
+            return nearest;
+        }
+
+        private T[] FindSceneComponents<T>() where T : Component
+        {
+            GameObject[] roots = gameObject.scene.GetRootGameObjects();
+            int componentCount = 0;
+            for (int index = 0; index < roots.Length; index++)
+            {
+                componentCount += roots[index].GetComponentsInChildren<T>(true).Length;
+            }
+
+            T[] allComponents = new T[componentCount];
+            int offset = 0;
+            for (int index = 0; index < roots.Length; index++)
+            {
+                T[] components = roots[index].GetComponentsInChildren<T>(true);
+                Array.Copy(components, 0, allComponents, offset, components.Length);
+                offset += components.Length;
+            }
+
+            return allComponents;
+        }
+
+        private Transform FindRequiredChild(Transform parent, string path)
+        {
+            return parent == null ? null : parent.Find(path);
+        }
+
+        private static Transform FindOrCreateChild(Transform parent, string childName)
+        {
+            Transform child = parent.Find(childName);
+            if (child != null)
+            {
+                return child;
+            }
+
+            child = new GameObject(childName).transform;
+            child.SetParent(parent, false);
+            return child;
+        }
+
+        private static void ConfigureDirectionalLight(
+            Light lightComponent,
+            string lightName,
+            Color color,
+            float intensity,
+            Vector3 eulerAngles,
+            LightShadows shadows
+        )
+        {
+            if (lightComponent == null)
+            {
+                return;
+            }
+
+            lightComponent.gameObject.name = lightName;
+            lightComponent.type = LightType.Directional;
+            lightComponent.color = color;
+            lightComponent.intensity = intensity;
+            lightComponent.shadows = shadows;
+            lightComponent.renderMode = LightRenderMode.Auto;
+            lightComponent.bounceIntensity = 1.0f;
+            lightComponent.transform.localPosition = Vector3.zero;
+            lightComponent.transform.localRotation = Quaternion.Euler(eulerAngles);
+        }
+
+        private static T GetOrAddComponent<T>(GameObject target) where T : Component
+        {
+            T existing = target.GetComponent<T>();
+            return existing != null ? existing : target.AddComponent<T>();
         }
     }
 }

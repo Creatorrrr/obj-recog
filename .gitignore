@@ -45,6 +45,7 @@ models/*.onnx
 models/*.engine
 
 # Runtime reports and diagnostic runs
+reports/sim/
 reports/sim/diag-*/
 reports/sim/diagnostic*/
 reports/sim/*/20*/
@@ -71,5 +72,31 @@ unity/Obj/
 unity/Build/
 unity/Builds/
 unity/MemoryCaptures/
+unity/Recordings/
+unity/.vs/
+unity/.idea/
+unity/.vscode/
+unity/*.csproj
+unity/*.sln
+unity/*.suo
+unity/*.tmp
+unity/*.user
+unity/*.userprefs
+unity/*.pidb
+unity/*.booproj
+unity/*.svd
+unity/*.pdb
+unity/*.mdb
+unity/sysinfo.txt
 unity/UserSettings/Layouts/
 unity/UserSettings/*.asset
+unity/UserSettings/Search.index
+unity/UserSettings/Search.settings
+
+# Unity generated scene lighting data
+unity/Assets/Scenes/**/LightingData.asset
+unity/Assets/Scenes/**/LightingData.asset.meta
+unity/Assets/Scenes/**/ReflectionProbe-*.exr
+unity/Assets/Scenes/**/ReflectionProbe-*.exr.meta
+unity/Assets/Brick Project Studio/
+unity/Assets/Brick Project Studio.meta

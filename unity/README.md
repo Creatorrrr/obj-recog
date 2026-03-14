@@ -2,7 +2,7 @@
 
 This folder is now the Unity project root for the RGB-only living-room simulator.
 
-The runtime scripts are render-pipeline neutral. If URP is installed, the scene builder prefers `Universal Render Pipeline/Lit`; otherwise it falls back to built-in `Standard`.
+`Assets/Scenes/LivingRoomMain.unity` is based on ApartmentKit `Scene_02` and the runtime bootstrap only adds the robot rig, hidden goal, HUD, and TCP/manual control wiring.
 
 ## Modes
 
@@ -19,8 +19,9 @@ The player chooses `manual` by default. It switches to `agent` when launched wit
 
 - `W/S`: move forward and backward
 - `A/D`: strafe left and right
-- `Q/E`: body turn left and right
-- mouse X: camera pan
+- `Q`: body turn right
+- `E`: body turn left
+- mouse X/Y: camera pan and look up/down
 - `R`: reset
 - `F1`: toggle HUD
 - `Esc`: release cursor, then press again to quit
@@ -39,4 +40,4 @@ No depth, semantic mask, instance mask, pose, intrinsics, or hidden-goal state a
 3. Press Play to test `manual` mode in the editor.
 4. Build a Windows standalone player from the same scene.
 
-The bootstrap scene creates the room, robot rig, hidden goal trigger, HUD, and TCP server wiring automatically.
+The bootstrap keeps the ApartmentKit environment intact and wires the robot rig, hidden goal trigger, HUD, and TCP server automatically.

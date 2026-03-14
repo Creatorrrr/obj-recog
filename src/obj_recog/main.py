@@ -1685,6 +1685,7 @@ def run(
 def main() -> None:
     _load_app_dotenv()
     config = parse_config()
+    slam_bridge_factory = _resolve_main_slam_bridge_factory(config)
     if config.validate_all_scenarios:
         from obj_recog.validation import run_validation_suite
 
@@ -1692,7 +1693,7 @@ def main() -> None:
             replace(config, validate_all_scenarios=False),
             output_dir=config.validation_output_dir,
             run_fn=run,
-            slam_bridge_factory=OrbSlam3Bridge,
+            slam_bridge_factory=slam_bridge_factory,
             map_builder_factory=TsdfMeshMapBuilder,
             situation_explainer_factory=OpenAISituationExplainer,
             explanation_worker_factory=SituationExplanationWorker,
@@ -1705,12 +1706,28 @@ def main() -> None:
         return
     run(
         config,
-        slam_bridge_factory=OrbSlam3Bridge,
+        slam_bridge_factory=slam_bridge_factory,
         map_builder_factory=TsdfMeshMapBuilder,
         situation_explainer_factory=OpenAISituationExplainer,
         explanation_worker_factory=SituationExplanationWorker,
         environment_viewer_factory=Open3DEnvironmentViewer,
     )
+
+
+def _resolve_main_slam_bridge_factory(config: AppConfig):
+    if (
+        str(getattr(config, "input_source", "live")) == "sim"
+        and str(getattr(config, "sim_interface_mode", "rgb_only")) == "rgb_only"
+    ):
+        binary_path = Path(__file__).resolve().parents[2] / "native" / "orbslam3_bridge" / "build" / "orbslam3_bridge"
+        if not binary_path.is_file():
+            print(
+                "[obj-recog] ORB-SLAM3 bridge binary missing; falling back to PoseTracker for RGB-only sim",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+    return OrbSlam3Bridge
 
 
 if __name__ == "__main__":

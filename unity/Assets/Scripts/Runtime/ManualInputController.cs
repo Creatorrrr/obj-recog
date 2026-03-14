@@ -131,15 +131,16 @@ namespace ObjRecog.UnitySim
 
             if (Input.GetKey(KeyCode.Q))
             {
-                turn += 1.0f;
+                turn -= 1.0f;
             }
 
             if (Input.GetKey(KeyCode.E))
             {
-                turn -= 1.0f;
+                turn += 1.0f;
             }
 
             float mousePan = Input.GetAxis("Mouse X");
+            float mousePitch = Input.GetAxis("Mouse Y");
             if (robotRig != null)
             {
                 robotRig.ApplyManualInput(
@@ -147,6 +148,7 @@ namespace ObjRecog.UnitySim
                     strafeAxis: Mathf.Clamp(strafe, -1.0f, 1.0f),
                     turnAxis: Mathf.Clamp(turn, -1.0f, 1.0f),
                     mousePanAxis: mousePan,
+                    mousePitchAxis: mousePitch,
                     deltaTime: Time.deltaTime
                 );
             }

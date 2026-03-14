@@ -11,7 +11,7 @@ from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
-from obj_recog.main import _load_app_dotenv, main, process_frame, run
+from obj_recog.main import _load_app_dotenv, _resolve_main_slam_bridge_factory, main, process_frame, run
 from obj_recog.types import Detection, PanopticSegment, SegmentationResult
 
 
@@ -3339,3 +3339,32 @@ def test_main_loads_dotenv_before_parse_config(
     main()
 
     assert captured["config"].camera_calibration == str(calibration_path)
+
+
+def test_resolve_main_slam_bridge_factory_falls_back_for_rgb_only_sim_without_binary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        input_source="sim",
+        sim_interface_mode="rgb_only",
+    )
+    real_is_file = Path.is_file
+
+    def fake_is_file(path: Path) -> bool:
+        if str(path).replace("\\", "/").endswith("/native/orbslam3_bridge/build/orbslam3_bridge"):
+            return False
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+
+    assert _resolve_main_slam_bridge_factory(config) is None
+    captured = capsys.readouterr()
+    assert "falling back to PoseTracker" in captured.err
