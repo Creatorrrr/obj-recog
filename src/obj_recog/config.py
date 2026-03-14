@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import tarfile
 
 from obj_recog.runtime_accel import detect_runtime_capabilities
 
@@ -130,10 +131,49 @@ class DepthProfileSettings:
 
 
 def _default_slam_vocabulary() -> str | None:
-    bundled_vocabulary = Path(__file__).resolve().parents[2] / "third_party" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
-    if bundled_vocabulary.is_file():
+    bundled_vocabulary = _bundled_slam_vocabulary_path()
+    if bundled_vocabulary.is_file() or _bundled_slam_vocabulary_archive().is_file():
         return str(bundled_vocabulary)
     return None
+
+
+def prepare_slam_vocabulary(vocabulary_path: str | None) -> str | None:
+    if vocabulary_path is None:
+        return None
+
+    candidate_path = Path(vocabulary_path)
+    if candidate_path.is_file():
+        return str(candidate_path)
+
+    archive_path = (
+        candidate_path
+        if candidate_path.name.endswith(".tar.gz")
+        else candidate_path.with_name(f"{candidate_path.name}.tar.gz")
+    )
+    if not archive_path.is_file():
+        return str(candidate_path)
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        member = next(
+            (
+                item
+                for item in archive.getmembers()
+                if item.isfile() and Path(item.name).name == candidate_path.name
+            ),
+            None,
+        )
+        if member is None:
+            raise RuntimeError(
+                f"SLAM vocabulary archive does not contain {candidate_path.name}: {archive_path}"
+            )
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            raise RuntimeError(f"failed to read SLAM vocabulary archive member: {archive_path}")
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        with extracted, candidate_path.open("wb") as destination:
+            destination.write(extracted.read())
+
+    return str(candidate_path)
 
 
 DEFAULT_DETECTION_INTERVAL = 2
@@ -416,6 +456,15 @@ def _default_sim_camera_calibration() -> str | None:
     if bundled_calibration.is_file():
         return str(bundled_calibration)
     return None
+
+
+def _bundled_slam_vocabulary_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "third_party" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
+
+
+def _bundled_slam_vocabulary_archive() -> Path:
+    bundled_vocabulary = _bundled_slam_vocabulary_path()
+    return bundled_vocabulary.with_name(f"{bundled_vocabulary.name}.tar.gz")
 
 
 def resolve_depth_profile(profile_name: str) -> DepthProfileSettings:

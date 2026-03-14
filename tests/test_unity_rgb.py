@@ -5,9 +5,11 @@ import json
 import socket
 import struct
 import threading
+from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from obj_recog.sim_protocol import ActionPrimitive
 from obj_recog.unity_rgb import UnityRgbClient, command_from_step
@@ -74,3 +76,44 @@ def test_unity_rgb_client_resets_and_applies_actions() -> None:
     assert reset_frame.frame_bgr.shape == (6, 8, 3)
     assert action_frame.timestamp_sec == 1.25
 
+
+def test_unity_rgb_client_launches_player_in_agent_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    player_path = tmp_path / "obj-recog-unity.exe"
+    player_path.write_bytes(b"stub")
+    launched: dict[str, object] = {}
+
+    class _FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> None:
+            _ = timeout
+            return None
+
+    def _fake_popen(command):
+        launched["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr("obj_recog.unity_rgb.subprocess.Popen", _fake_popen)
+
+    client = UnityRgbClient(
+        host="127.0.0.1",
+        port=8765,
+        unity_player_path=str(player_path),
+        player_args=("--quality-level=2",),
+    )
+    client._launch_player()
+
+    assert launched["command"] == [
+        str(player_path),
+        "--obj-recog-mode=agent",
+        "--quality-level=2",
+        "--obj-recog-host=127.0.0.1",
+        "--obj-recog-port=8765",
+    ]

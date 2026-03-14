@@ -119,11 +119,14 @@ class UnityRgbClient:
         player_path = Path(self._unity_player_path or "")
         if not player_path.is_file():
             raise RuntimeError(f"Unity player not found: {player_path}")
+        launch_args = list(self._player_args)
+        if not any(str(item).startswith("--obj-recog-mode=") for item in launch_args):
+            launch_args.insert(0, "--obj-recog-mode=agent")
         command = [
             str(player_path),
+            *launch_args,
             f"--obj-recog-host={self._host}",
             f"--obj-recog-port={self._port}",
-            *self._player_args,
         ]
         self._process = subprocess.Popen(command)
 

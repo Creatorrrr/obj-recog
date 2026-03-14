@@ -13,7 +13,13 @@ import numpy as np
 from obj_recog.auto_calibration import close_calibration_window, ensure_runtime_calibration
 from obj_recog.calibration import CalibrationResult, intrinsics_from_calibration, load_orbslam3_settings
 from obj_recog.camera import CameraSession, list_available_cameras, open_camera, read_camera_frame
-from obj_recog.config import AppConfig, parse_config, resolve_depth_profile, resolve_device
+from obj_recog.config import (
+    AppConfig,
+    parse_config,
+    prepare_slam_vocabulary,
+    resolve_depth_profile,
+    resolve_device,
+)
 from obj_recog.depth import DepthEstimator
 from obj_recog.detector import ObjectDetector
 from obj_recog.frame_source import FramePacket, LiveCameraFrameSource
@@ -987,6 +993,7 @@ def run(
     )
     runtime_calibration = None
     if use_slam_bridge:
+        config = replace(config, slam_vocabulary=prepare_slam_vocabulary(config.slam_vocabulary))
         if not config.slam_vocabulary:
             raise RuntimeError("ORB-SLAM3 requires --slam-vocabulary")
         if not Path(config.slam_vocabulary).is_file():

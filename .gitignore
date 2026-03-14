@@ -62,3 +62,14 @@ third_party/ORB_SLAM3/Thirdparty/g2o/build/
 # Nested vendor git metadata and archives
 third_party/ORB_SLAM3/.git/
 third_party/ORB_SLAM3/Vocabulary/ORBvoc.txt
+
+# Unity project caches and local editor state
+unity/Library/
+unity/Logs/
+unity/Temp/
+unity/Obj/
+unity/Build/
+unity/Builds/
+unity/MemoryCaptures/
+unity/UserSettings/Layouts/
+unity/UserSettings/*.asset

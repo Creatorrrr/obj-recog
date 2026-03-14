@@ -7,7 +7,7 @@ Real-time object recognition, monocular 3D reconstruction, and simulation testbe
 - Python 3.11+
 - `pip` or another Python package manager
 - Optional: `OPENAI_API_KEY` if you want the explanation window to call the LLM
-- Optional for simulation: a Unity player build that runs the RGB-only TCP server in `unity/Assets/Scripts`
+- Optional for simulation: Unity 6 LTS to open and build the project in `unity`
 
 ## Install
 
@@ -57,6 +57,21 @@ The simulation path is now an RGB-only Unity interface:
 - online runtime uses the same monocular perception stack as live input
 - hidden goal, collision truth, and evaluation stay outside the online inference loop
 
+The Unity project lives in `unity`. Open `Assets/Scenes/LivingRoomMain.unity` in Unity 6 LTS, then:
+
+- run Play mode with no special arguments for `manual` keyboard/mouse control
+- build a Windows standalone player and let Python launch it in `agent` mode
+
+Manual mode controls:
+
+- `W/S`: forward and backward
+- `A/D`: strafe left and right
+- `Q/E`: turn body left and right
+- mouse X: pan camera
+- `R`: reset
+- `F1`: HUD toggle
+- `Esc`: release cursor, then press again to quit
+
 Run it like this:
 
 ```bash
@@ -67,6 +82,7 @@ PYTHONPATH=src python -m obj_recog.main \
   --width 640 \
   --height 360 \
   --device auto \
+  --detector-backend torch \
   --depth-profile fast \
   --segmentation-mode panoptic \
   --camera-calibration calibration/calibration.yaml \
@@ -84,6 +100,7 @@ Useful sim flags:
 - `--unity-host` / `--unity-port`: connect to an already-running Unity player.
 - `--sim-planner-model`: choose the LLM used for navigation planning.
 - `--sim-interface-mode rgb_only`: enforce the RGB-only contract.
+- `--unity-player-path`: launch the same player build in `agent` mode with `--obj-recog-mode=agent`.
 
 Visible sim windows:
 

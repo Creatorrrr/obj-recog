@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tarfile
 
 import pytest
 
-from obj_recog.config import AppConfig, build_parser, parse_config, resolve_device
+from obj_recog.config import AppConfig, build_parser, parse_config, prepare_slam_vocabulary, resolve_device
 
 
 def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -13,7 +14,12 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     bundled_vocabulary = (
         Path(__file__).resolve().parents[1] / "third_party" / "ORB_SLAM3" / "Vocabulary" / "ORBvoc.txt"
     )
-    expected_vocabulary = str(bundled_vocabulary) if bundled_vocabulary.is_file() else None
+    bundled_vocabulary_archive = bundled_vocabulary.with_name(f"{bundled_vocabulary.name}.tar.gz")
+    expected_vocabulary = (
+        str(bundled_vocabulary)
+        if bundled_vocabulary.is_file() or bundled_vocabulary_archive.is_file()
+        else None
+    )
 
     assert config.input_source == "live"
     assert config.scenario == "living_room_navigation_v1"
@@ -97,6 +103,23 @@ def test_parse_config_defaults_sim_calibration_from_repo(monkeypatch: pytest.Mon
     assert config.scenario == "living_room_navigation_v1"
     assert config.camera_calibration is not None
     assert Path(config.camera_calibration).is_file()
+
+
+def test_prepare_slam_vocabulary_extracts_bundled_archive(tmp_path: Path) -> None:
+    target_path = tmp_path / "ORBvoc.txt"
+    archive_path = target_path.with_name(f"{target_path.name}.tar.gz")
+    source_payload = b"vocabulary-stub"
+
+    source_file = tmp_path / "source.txt"
+    source_file.write_bytes(source_payload)
+    with tarfile.open(archive_path, "w:gz") as archive:
+        archive.add(source_file, arcname="ORBvoc.txt")
+    source_file.unlink()
+
+    resolved_path = prepare_slam_vocabulary(str(target_path))
+
+    assert resolved_path == str(target_path)
+    assert target_path.read_bytes() == source_payload
 
 
 def test_parse_config_allows_disabling_open3d_view() -> None:
