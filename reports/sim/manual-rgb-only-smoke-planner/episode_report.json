@@ -1,0 +1,12 @@
+{
+  "scenario_id": "living_room_navigation_v1",
+  "success": null,
+  "final_phase": "FAILED",
+  "total_frames": 12,
+  "planner_turns": 4,
+  "self_calibration_completed": true,
+  "final_distance_to_goal_m": null,
+  "report_dir": "C:\\Users\\ckthd\\Dev\\Projects\\obj-recog\\reports\\sim\\manual-rgb-only-smoke-planner",
+  "offline_evaluation_required": true,
+  "sim_interface_mode": "rgb_only"
+}

@@ -23,9 +23,13 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     assert config.sim_selfcal_max_sec == pytest.approx(6.0)
     assert config.sim_action_batch_size == 6
     assert config.sim_headless is False
-    assert config.sim_open3d_view is True
+    assert config.sim_open3d_view is False
+    assert config.sim_interface_mode == "rgb_only"
     assert config.sim_render_backend == "software"
     assert config.blender_exec is None
+    assert config.unity_player_path is None
+    assert config.unity_host == "127.0.0.1"
+    assert config.unity_port == 8765
     assert config.camera_calibration is None
     assert config.slam_vocabulary == expected_vocabulary
     assert config.explanation_enabled is True
@@ -51,8 +55,12 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
             "--sim-action-batch-size",
             "4",
             "--sim-headless",
-            "--blender-exec",
-            "/Applications/Blender.app/Contents/MacOS/Blender",
+            "--unity-player-path",
+            "C:/UnityBuild/obj-recog.exe",
+            "--unity-host",
+            "127.0.0.2",
+            "--unity-port",
+            "9001",
             "--camera-calibration",
             "/tmp/camera.yaml",
         ]
@@ -66,26 +74,29 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
     assert config.sim_selfcal_max_sec == pytest.approx(9.0)
     assert config.sim_action_batch_size == 4
     assert config.sim_headless is True
-    assert config.sim_open3d_view is True
+    assert config.sim_open3d_view is False
+    assert config.sim_interface_mode == "rgb_only"
     assert config.sim_render_backend == "software"
-    assert config.blender_exec == "/Applications/Blender.app/Contents/MacOS/Blender"
+    assert config.unity_player_path == "C:/UnityBuild/obj-recog.exe"
+    assert config.unity_host == "127.0.0.2"
+    assert config.unity_port == 9001
     assert config.camera_calibration == "/tmp/camera.yaml"
 
 
-def test_parse_config_accepts_interior_test_tv_scenario(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parse_config_defaults_sim_calibration_from_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAMERA_CALIBRATION", raising=False)
 
     config = parse_config(
         [
             "--input-source",
             "sim",
-            "--scenario",
-            "interior_test_tv_navigation_v1",
         ]
     )
 
     assert config.input_source == "sim"
-    assert config.scenario == "interior_test_tv_navigation_v1"
+    assert config.scenario == "living_room_navigation_v1"
+    assert config.camera_calibration is not None
+    assert Path(config.camera_calibration).is_file()
 
 
 def test_parse_config_allows_disabling_open3d_view() -> None:
@@ -214,4 +225,4 @@ def test_app_config_direct_defaults_keep_sim_open3d_enabled() -> None:
     )
 
     assert config.scenario == "living_room_navigation_v1"
-    assert config.sim_open3d_view is True
+    assert config.sim_open3d_view is False

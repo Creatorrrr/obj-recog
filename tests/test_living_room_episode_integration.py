@@ -13,31 +13,32 @@ from obj_recog.simulation import LivingRoomEpisodeRunner
 
 
 class _StaticSensorBackend:
-    def build_scene(self, scene_spec) -> None:
-        self.scene_spec = scene_spec
+    def __init__(self) -> None:
+        self._frame_index = 0
 
-    def render_frame(self, *, world_state, frame_index: int, timestamp_sec: float) -> SensorFrame:
-        pose = np.eye(4, dtype=np.float32)
-        pose[0, 3] = world_state.robot_pose.x
-        pose[1, 3] = world_state.robot_pose.y
-        pose[2, 3] = world_state.robot_pose.z
-        return SensorFrame(
-            frame_index=frame_index,
-            timestamp_sec=timestamp_sec,
-            frame_bgr=np.full((12, 16, 3), 90, dtype=np.uint8),
-            depth_map=np.full((12, 16), 1.7, dtype=np.float32),
-            semantic_mask=np.zeros((12, 16), dtype=np.uint8),
-            instance_mask=np.zeros((12, 16), dtype=np.uint8),
-            camera_pose_world=pose,
-            intrinsics={"fx": 10.0, "fy": 10.0, "cx": 8.0, "cy": 6.0},
-            render_time_ms=1.0,
-        )
+    def reset_episode(self, *, scene_spec) -> SensorFrame:
+        _ = scene_spec
+        self._frame_index = 0
+        return self._frame()
+
+    def apply_action(self, command) -> SensorFrame:
+        _ = command
+        self._frame_index += 1
+        return self._frame()
 
     def close(self) -> None:
         return None
 
+    def _frame(self) -> SensorFrame:
+        return SensorFrame(
+            frame_index=self._frame_index,
+            timestamp_sec=float(self._frame_index) * 0.5,
+            frame_bgr=np.full((12, 16, 3), 90, dtype=np.uint8),
+            render_time_ms=1.0,
+        )
 
-def _artifacts(packet: FramePacket):
+
+def _artifacts(_packet: FramePacket):
     return type(
         "Artifacts",
         (),
@@ -54,7 +55,7 @@ def _artifacts(packet: FramePacket):
             "segments": [],
             "scene_graph_snapshot": None,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
-            "depth_map": np.asarray(packet.depth_map, dtype=np.float32),
+            "depth_map": np.full((12, 16), 1.7, dtype=np.float32),
             "slam_tracking_state": "TRACKING",
         },
     )()

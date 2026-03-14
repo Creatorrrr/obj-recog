@@ -1231,7 +1231,7 @@ def test_run_exits_when_opencv_window_is_closed_and_cleans_up_resources() -> Non
     assert fake_cv2.imshow_windows == ["Object Recognition", "Situation Explanation"]
 
 
-def test_run_shows_isometric_environment_window_for_sim_input() -> None:
+def test_run_rgb_only_sim_skips_environment_view_for_sim_input() -> None:
     config = AppConfig(
         camera_index=0,
         width=16,
@@ -1241,7 +1241,6 @@ def test_run_shows_isometric_environment_window_for_sim_input() -> None:
         point_stride=1,
         max_points=64,
         input_source="sim",
-        sim_perception_mode="runtime",
         segmentation_mode="off",
         graph_enabled=False,
         explanation_enabled=False,
@@ -1312,6 +1311,7 @@ def test_run_shows_isometric_environment_window_for_sim_input() -> None:
         cv2_module=fake_cv2,
         detector_factory=lambda **_: FakeDetector(),
         depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        slam_bridge_factory=None,
         tracker_factory=lambda **_: tracker,
         map_builder_factory=lambda **_: map_builder,
         viewer_factory=lambda: viewer,
@@ -1322,12 +1322,12 @@ def test_run_shows_isometric_environment_window_for_sim_input() -> None:
     )
 
     assert source.closed is True
-    assert environment_viewer.states == [scenario_state]
-    assert environment_viewer.closed is True
+    assert environment_viewer.states == []
+    assert environment_viewer.closed is False
     assert "Environment Model" not in fake_cv2.imshow_windows
 
 
-def test_run_positions_runtime_windows_on_first_show_for_sim_input() -> None:
+def test_run_positions_runtime_windows_on_first_show_for_rgb_only_sim_input() -> None:
     config = AppConfig(
         camera_index=0,
         width=640,
@@ -1337,7 +1337,6 @@ def test_run_positions_runtime_windows_on_first_show_for_sim_input() -> None:
         point_stride=1,
         max_points=64,
         input_source="sim",
-        sim_perception_mode="runtime",
         segmentation_mode="off",
         graph_enabled=False,
     )
@@ -1407,6 +1406,7 @@ def test_run_positions_runtime_windows_on_first_show_for_sim_input() -> None:
         cv2_module=fake_cv2,
         detector_factory=lambda **_: FakeDetector(),
         depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        slam_bridge_factory=None,
         tracker_factory=lambda **_: tracker,
         map_builder_factory=lambda **_: map_builder,
         viewer_factory=lambda: viewer,
@@ -1417,7 +1417,7 @@ def test_run_positions_runtime_windows_on_first_show_for_sim_input() -> None:
     )
 
     assert source.closed is True
-    assert len(environment_viewer.states) == 2
+    assert len(environment_viewer.states) == 0
     assert fake_cv2.move_window_calls == [("Object Recognition", 32, 48)]
 
 

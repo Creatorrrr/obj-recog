@@ -828,7 +828,7 @@ def run(
     sim_perception_mode = "runtime" if config.input_source == "sim" else getattr(config, "sim_perception_mode", "runtime")
     use_frame_packet_ground_truth = False
     assist_frame_packet_ground_truth = False
-    prefer_frame_packet_depth_sensor = bool(config.input_source == "sim")
+    prefer_frame_packet_depth_sensor = False
 
     def _default_sim_frame_source(current_config: AppConfig):
         run_stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -981,12 +981,22 @@ def run(
             print(f"{device.index}: {device.name}")
         return
 
-    use_slam_bridge = slam_bridge_factory is not None and config.input_source != "sim"
+    use_slam_bridge = bool(
+        slam_bridge_factory is not None
+        and (config.input_source != "sim" or str(getattr(config, "sim_interface_mode", "rgb_only")) == "rgb_only")
+    )
+    runtime_calibration = None
     if use_slam_bridge:
         if not config.slam_vocabulary:
             raise RuntimeError("ORB-SLAM3 requires --slam-vocabulary")
         if not Path(config.slam_vocabulary).is_file():
             raise RuntimeError(f"SLAM vocabulary file not found: {config.slam_vocabulary}")
+        if config.input_source == "sim":
+            if not config.camera_calibration or not Path(config.camera_calibration).is_file():
+                raise RuntimeError("RGB-only sim requires a local --camera-calibration file for monocular SLAM")
+            calibration = load_orbslam3_settings(config.camera_calibration)
+            runtime_settings_path = str(config.camera_calibration)
+            calibration_source = "config"
         if config.camera_calibration and Path(config.camera_calibration).is_file():
             calibration = load_orbslam3_settings(config.camera_calibration)
 
@@ -1134,7 +1144,11 @@ def run(
             )
         tracker = None
         if use_slam_bridge:
-            slam_bridge = getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
+            slam_bridge = (
+                None
+                if runtime_calibration is None
+                else getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
+            )
             if slam_bridge is None:
                 debug_log("creating runtime SLAM bridge")
                 slam_bridge = slam_bridge_factory(
@@ -1205,6 +1219,7 @@ def run(
         if (
             config.input_source == "sim"
             and bool(getattr(config, "sim_open3d_view", True))
+            and str(getattr(config, "sim_interface_mode", "rgb_only")) != "rgb_only"
             and environment_viewer_factory is not None
         ):
             environment_viewer = _build_viewer(
@@ -1238,21 +1253,28 @@ def run(
                     if tracker is not None:
                         tracker.reset()
                     if slam_bridge is not None:
-                        runtime_calibration = runtime_calibration_resolver(
-                            config,
-                            camera_session,
-                            cv2_module=cv2,
-                            frame_reader=read_camera_frame,
-                            slam_bridge_factory=slam_bridge_factory,
-                            time_source=time_source,
-                        )
-                        calibration = runtime_calibration.calibration
-                        runtime_settings_path = runtime_calibration.settings_path
-                        calibration_source = _normalize_calibration_source(
-                            getattr(runtime_calibration, "source", None)
-                        )
                         slam_bridge.close()
-                        slam_bridge = getattr(runtime_calibration, "promoted_bridge", getattr(runtime_calibration, "bridge", None))
+                        if config.input_source != "sim":
+                            runtime_calibration = runtime_calibration_resolver(
+                                config,
+                                camera_session,
+                                cv2_module=cv2,
+                                frame_reader=read_camera_frame,
+                                slam_bridge_factory=slam_bridge_factory,
+                                time_source=time_source,
+                            )
+                            calibration = runtime_calibration.calibration
+                            runtime_settings_path = runtime_calibration.settings_path
+                            calibration_source = _normalize_calibration_source(
+                                getattr(runtime_calibration, "source", None)
+                            )
+                            slam_bridge = getattr(
+                                runtime_calibration,
+                                "promoted_bridge",
+                                getattr(runtime_calibration, "bridge", None),
+                            )
+                        else:
+                            slam_bridge = None
                         if slam_bridge is None:
                             slam_bridge = slam_bridge_factory(
                                 vocabulary_path=config.slam_vocabulary,
@@ -1261,7 +1283,15 @@ def run(
                                 frame_height=config.slam_height,
                             )
                         slam_time_origin = time_source()
-                    frame_source = _build_live_frame_source(camera_session)
+                    frame_source = (
+                        _build_live_frame_source(camera_session)
+                        if config.input_source != "sim"
+                        else (
+                            frame_source_factory(config, cv2_module=cv2, time_source=time_source)
+                            if frame_source_factory is not None
+                            else _default_sim_frame_source(config)
+                        )
+                    )
                     map_builder.reset()
                     restarted_stream = True
                 cached_detections = []

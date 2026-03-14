@@ -94,9 +94,13 @@ class AppConfig:
     sim_selfcal_max_sec: float = 6.0
     sim_action_batch_size: int = 6
     sim_headless: bool = False
-    sim_open3d_view: bool = True
+    sim_open3d_view: bool = False
+    sim_interface_mode: str = "rgb_only"
     sim_render_backend: str = "software"
     blender_exec: str | None = None
+    unity_player_path: str | None = None
+    unity_host: str = "127.0.0.1"
+    unity_port: int = 8765
     episode_output_dir: str | None = None
     sim_goal_selector: str = "llm"
     sim_goal_model: str = "gpt-5-mini"
@@ -155,7 +159,7 @@ DEFAULT_EXPLANATION_MAX_GRAPH_NODES = 20
 DEFAULT_EXPLANATION_MAX_GRAPH_EDGES = 20
 DEFAULT_DEPTH_PROFILE = "balanced"
 DEFAULT_INPUT_SOURCE = "live"
-SIM_SCENARIO_CHOICES = ("living_room_navigation_v1", "interior_test_tv_navigation_v1")
+SIM_SCENARIO_CHOICES = ("living_room_navigation_v1",)
 DEFAULT_SCENARIO = "living_room_navigation_v1"
 DEFAULT_SIM_SEED = 0
 DEFAULT_SIM_MAX_STEPS = 600
@@ -173,6 +177,10 @@ DEFAULT_SIM_PLANNER_TIMEOUT_SEC = 8.0
 DEFAULT_SIM_REPLAN_INTERVAL_SEC = 4.0
 DEFAULT_SIM_SELFCAL_MAX_SEC = 6.0
 DEFAULT_SIM_ACTION_BATCH_SIZE = 6
+DEFAULT_SIM_OPEN3D_VIEW = "off"
+DEFAULT_SIM_INTERFACE_MODE = "rgb_only"
+DEFAULT_UNITY_HOST = "127.0.0.1"
+DEFAULT_UNITY_PORT = 8765
 DEFAULT_PRECISION = "auto"
 DEFAULT_DETECTOR_BACKEND = "tensorrt" if os.name == "nt" else "torch"
 DEFAULT_DEPTH_BACKEND = "torch"
@@ -287,13 +295,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sim-selfcal-max-sec", type=_positive_float, default=DEFAULT_SIM_SELFCAL_MAX_SEC)
     parser.add_argument("--sim-action-batch-size", type=_positive_int, default=DEFAULT_SIM_ACTION_BATCH_SIZE)
     parser.add_argument("--sim-headless", action="store_true")
-    parser.add_argument("--sim-open3d-view", choices=("on", "off"), default="on")
+    parser.add_argument("--sim-open3d-view", choices=("on", "off"), default=DEFAULT_SIM_OPEN3D_VIEW)
+    parser.add_argument("--sim-interface-mode", choices=("rgb_only",), default=DEFAULT_SIM_INTERFACE_MODE)
     parser.add_argument(
         "--sim-render-backend",
         choices=("software", "blender-gpu"),
         default=DEFAULT_SIM_RENDER_BACKEND,
     )
     parser.add_argument("--blender-exec", type=str, default=None)
+    parser.add_argument("--unity-player-path", type=str, default=None)
+    parser.add_argument("--unity-host", type=str, default=DEFAULT_UNITY_HOST)
+    parser.add_argument("--unity-port", type=_positive_int, default=DEFAULT_UNITY_PORT)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
     parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
     parser.add_argument("--camera-calibration", type=str, default=os.getenv("CAMERA_CALIBRATION"))
@@ -315,6 +327,11 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         if explanation_refresh_interval_raw is None
         else _positive_float(explanation_refresh_interval_raw)
     )
+    camera_calibration = args.camera_calibration
+    if camera_calibration is None and args.input_source == "sim":
+        bundled_calibration = _default_sim_camera_calibration()
+        if bundled_calibration is not None:
+            camera_calibration = bundled_calibration
     return AppConfig(
         camera_index=args.camera_index,
         width=args.width,
@@ -333,7 +350,7 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         segmentation_interval=args.segmentation_interval,
         segmentation_input_size=DEFAULT_SEGMENTATION_INPUT_SIZE,
         camera_name=args.camera_name,
-        camera_calibration=args.camera_calibration,
+        camera_calibration=camera_calibration,
         recalibrate=args.recalibrate,
         disable_slam_calibration=args.disable_slam_calibration,
         calibration_cache_dir=args.calibration_cache_dir,
@@ -379,8 +396,12 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         sim_action_batch_size=args.sim_action_batch_size,
         sim_headless=bool(args.sim_headless),
         sim_open3d_view=(args.sim_open3d_view == "on"),
+        sim_interface_mode=args.sim_interface_mode,
         sim_render_backend=args.sim_render_backend,
         blender_exec=args.blender_exec,
+        unity_player_path=args.unity_player_path,
+        unity_host=args.unity_host,
+        unity_port=args.unity_port,
         sim_goal_selector="llm",
         sim_goal_model=args.sim_planner_model,
         sim_goal_timeout_sec=args.sim_planner_timeout_sec,
@@ -388,6 +409,13 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         render_profile="photoreal",
         sim_profile="living_room",
     )
+
+
+def _default_sim_camera_calibration() -> str | None:
+    bundled_calibration = Path(__file__).resolve().parents[2] / "calibration" / "calibration.yaml"
+    if bundled_calibration.is_file():
+        return str(bundled_calibration)
+    return None
 
 
 def resolve_depth_profile(profile_name: str) -> DepthProfileSettings:

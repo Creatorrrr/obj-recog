@@ -92,11 +92,6 @@ class SensorFrame:
     frame_index: int
     timestamp_sec: float
     frame_bgr: np.ndarray
-    depth_map: np.ndarray
-    semantic_mask: np.ndarray
-    instance_mask: np.ndarray
-    camera_pose_world: np.ndarray
-    intrinsics: dict[str, float]
     render_time_ms: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -128,6 +123,12 @@ class ActionStep:
 
 
 @dataclass(frozen=True, slots=True)
+class UnityActionCommand:
+    primitive: ActionPrimitive
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
 class ActionSchedule:
     steps: tuple[ActionStep, ...]
     rationale: str
@@ -146,10 +147,10 @@ class OperatorSceneState:
 @dataclass(frozen=True, slots=True)
 class EpisodeReport:
     scenario_id: str
-    success: bool
+    success: bool | None
     final_phase: EpisodePhase
     total_frames: int
     planner_turns: int
     self_calibration_completed: bool
-    final_distance_to_goal_m: float
+    final_distance_to_goal_m: float | None
     report_dir: str
