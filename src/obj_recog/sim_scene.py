@@ -28,7 +28,8 @@ def build_living_room_scene_spec() -> LivingRoomSceneSpec:
     wall_thickness = 0.12
     dining_table_center = (1.75, 0.40, 1.65)
     dining_table_size = (1.60, 0.75, 0.90)
-    near_edge_z = dining_table_center[2] - (dining_table_size[2] * 0.5)
+    tv_panel_center = (2.15, 1.15, -1.58)
+    tv_front_goal_offset_m = 1.25
 
     objects = (
         LivingRoomObjectSpec(
@@ -136,12 +137,12 @@ def build_living_room_scene_spec() -> LivingRoomSceneSpec:
         room_size_xyz=(room_width, room_height, room_depth),
         wall_thickness_m=wall_thickness,
         window_wall="front",
-        start_pose=RobotPose(x=-2.4, y=1.25, z=-1.85, yaw_deg=0.0, camera_pan_deg=0.0),
-        hidden_goal_pose_xyz=(dining_table_center[0], 1.25, near_edge_z - 0.75),
+        start_pose=RobotPose(x=0.35, y=1.25, z=-0.15, yaw_deg=0.0, camera_pan_deg=0.0),
+        hidden_goal_pose_xyz=(tv_panel_center[0], 1.25, tv_panel_center[2] + tv_front_goal_offset_m),
         objects=objects,
         lights=lights,
-        goal_description="Reach the front position of the dining table using only current visible evidence.",
-        semantic_target_class="dining_table",
+        goal_description="Reach the front position of the TV using only current visible evidence.",
+        semantic_target_class="tv",
     )
 
 

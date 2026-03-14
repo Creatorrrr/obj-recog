@@ -32,14 +32,16 @@ namespace ObjRecog.UnitySim
         [SerializeField] private float cameraNearClipM = 0.2f;
         [SerializeField] private float cameraFarClipM = 120.0f;
         [SerializeField] private float goalStandOffM = 1.25f;
+        [SerializeField] private float spawnStandOffM = 3.1f;
         [SerializeField] private float runtimeGroundHeightM = 0.05f;
         [SerializeField] private float characterRadiusM = 0.28f;
         [SerializeField] private float characterHeightM = 1.55f;
         [SerializeField] private bool autoRebuildInEditor = true;
         [SerializeField] private bool disableVendorInteractions = true;
-        [SerializeField] private Vector3 fallbackSpawnPosition = new Vector3(-2.5f, 0.05f, -0.85f);
-        [SerializeField] private Vector3 fallbackSpawnEulerAngles = new Vector3(0.0f, 55.0f, 0.0f);
-        [SerializeField] private Vector3 fallbackGoalPosition = new Vector3(-6.2f, 0.05f, 0.35f);
+        [SerializeField] private string preferredTelevisionPrefix = "TV_Apt_01";
+        [SerializeField] private Vector3 fallbackSpawnPosition = new Vector3(27.084f, 12.1f, 1.72f);
+        [SerializeField] private Vector3 fallbackSpawnEulerAngles = new Vector3(0.0f, 180.0f, 0.0f);
+        [SerializeField] private Vector3 fallbackGoalPosition = new Vector3(27.084f, 12.1f, -2.40f);
         [SerializeField] private bool brightenSceneLighting = true;
         [SerializeField] private float ambientIntensity = 1.6f;
         [SerializeField] private Color ambientSkyColor = new Color(0.54f, 0.58f, 0.64f, 1.0f);
@@ -313,52 +315,55 @@ namespace ObjRecog.UnitySim
                 return;
             }
 
+            if (TryPlaceAnchorsAroundPreferredTelevision(spawnAnchor, goalAnchor))
+            {
+                return;
+            }
+
             Transform sceneCamera = FindPreferredSceneCamera();
             Vector3 spawnPosition = fallbackSpawnPosition;
             Quaternion spawnRotation = Quaternion.Euler(fallbackSpawnEulerAngles);
             if (sceneCamera != null)
             {
                 spawnPosition = sceneCamera.position;
-                spawnPosition.y = runtimeGroundHeightM;
+                spawnPosition.y = Mathf.Max(sceneCamera.position.y - cameraHeightM, runtimeGroundHeightM);
                 spawnRotation = Quaternion.Euler(0.0f, sceneCamera.rotation.eulerAngles.y, 0.0f);
             }
 
             spawnAnchor.position = spawnPosition;
             spawnAnchor.rotation = spawnRotation;
+            goalAnchor.position = fallbackGoalPosition;
+            Vector3 facing = spawnPosition - fallbackGoalPosition;
+            facing.y = 0.0f;
+            goalAnchor.rotation = facing.sqrMagnitude > 0.001f
+                ? Quaternion.LookRotation(facing.normalized, Vector3.up)
+                : Quaternion.identity;
+        }
 
-            Transform diningTable = FindNearestNamedTransform("Table_Dining", spawnPosition);
-            if (diningTable != null)
+        private bool TryPlaceAnchorsAroundPreferredTelevision(Transform spawnAnchor, Transform goalAnchor)
+        {
+            Transform television = FindPreferredTelevision();
+            if (television == null)
             {
-                Vector3 tablePosition = diningTable.position;
-                Vector3 toSpawn = new Vector3(spawnPosition.x - tablePosition.x, 0.0f, spawnPosition.z - tablePosition.z);
-                if (toSpawn.sqrMagnitude < 0.01f)
-                {
-                    Vector3 forward = diningTable.forward;
-                    toSpawn = new Vector3(forward.x, 0.0f, forward.z);
-                }
+                return false;
+            }
 
-                Vector3 goalDirection = toSpawn.normalized;
-                Vector3 goalPosition = tablePosition + (goalDirection * goalStandOffM);
-                goalPosition.y = runtimeGroundHeightM;
-                goalAnchor.position = goalPosition;
-                if (goalDirection.sqrMagnitude > 0.001f)
-                {
-                    Vector3 facing = tablePosition - goalPosition;
-                    facing.y = 0.0f;
-                    goalAnchor.rotation = facing.sqrMagnitude > 0.001f
-                        ? Quaternion.LookRotation(facing.normalized, Vector3.up)
-                        : Quaternion.identity;
-                }
-            }
-            else
+            Transform livingRoomRoot = FindContainingAncestorNamed(television, "Living Room");
+            float groundHeight = ResolveRoomGroundHeight(livingRoomRoot);
+            Vector3 televisionPosition = television.position;
+            Vector3 roomFacingDirection = ResolveTelevisionRoomFacingDirection(television, livingRoomRoot);
+            if (roomFacingDirection.sqrMagnitude < 0.001f)
             {
-                goalAnchor.position = fallbackGoalPosition;
-                Vector3 facing = spawnPosition - fallbackGoalPosition;
-                facing.y = 0.0f;
-                goalAnchor.rotation = facing.sqrMagnitude > 0.001f
-                    ? Quaternion.LookRotation(facing.normalized, Vector3.up)
-                    : Quaternion.identity;
+                return false;
             }
+
+            Vector3 goalPosition = FlattenToGround(televisionPosition + (roomFacingDirection * goalStandOffM), groundHeight);
+            Vector3 spawnPosition = ResolveTelevisionSpawnPosition(television, livingRoomRoot, roomFacingDirection, groundHeight);
+            spawnAnchor.position = spawnPosition;
+            spawnAnchor.rotation = LookToward(spawnPosition, televisionPosition);
+            goalAnchor.position = goalPosition;
+            goalAnchor.rotation = LookToward(goalPosition, televisionPosition);
+            return true;
         }
 
         private void SyncRuntimeObjects(
@@ -544,6 +549,38 @@ namespace ObjRecog.UnitySim
             return fallbackCamera;
         }
 
+        private Transform FindPreferredTelevision()
+        {
+            Transform[] transforms = FindSceneComponents<Transform>();
+            Transform preferredTelevision = null;
+            float nearestDistanceSq = float.MaxValue;
+            Vector3 sceneCenter = EstimateSceneCenter();
+            for (int index = 0; index < transforms.Length; index++)
+            {
+                Transform candidate = transforms[index];
+                if (candidate == null || candidate.IsChildOf(transform))
+                {
+                    continue;
+                }
+
+                if (!candidate.name.StartsWith(preferredTelevisionPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Vector3 delta = candidate.position - sceneCenter;
+                delta.y = 0.0f;
+                float distanceSq = delta.sqrMagnitude;
+                if (distanceSq < nearestDistanceSq)
+                {
+                    nearestDistanceSq = distanceSq;
+                    preferredTelevision = candidate;
+                }
+            }
+
+            return preferredTelevision;
+        }
+
         private Transform FindNearestNamedTransform(string prefix, Vector3 origin)
         {
             Transform nearest = null;
@@ -573,6 +610,245 @@ namespace ObjRecog.UnitySim
             }
 
             return nearest;
+        }
+
+        private Vector3 ResolveTelevisionRoomFacingDirection(Transform television, Transform livingRoomRoot)
+        {
+            Transform mediaTable = FindNamedTransformInSubtree(livingRoomRoot, "MediaTable_01");
+            if (TryGetDirectionBetween(television.position, mediaTable, out Vector3 mediaTableDirection))
+            {
+                return mediaTableDirection;
+            }
+
+            Transform rug = FindNamedTransformInSubtree(livingRoomRoot, "Rug_Apt_01");
+            if (TryGetDirectionBetween(television.position, rug, out Vector3 rugDirection))
+            {
+                return rugDirection;
+            }
+
+            Transform sofa = FindNamedTransformInSubtree(livingRoomRoot, "Sofa_Apt_01");
+            if (TryGetDirectionBetween(television.position, sofa, out Vector3 sofaDirection))
+            {
+                return sofaDirection;
+            }
+
+            Vector3 forward = FlattenDirection(television.forward);
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                return Vector3.back;
+            }
+
+            return Mathf.Abs(forward.z) >= Mathf.Abs(forward.x)
+                ? new Vector3(0.0f, 0.0f, Mathf.Sign(forward.z))
+                : Vector3.back;
+        }
+
+        private Vector3 ResolveTelevisionSpawnPosition(
+            Transform television,
+            Transform livingRoomRoot,
+            Vector3 roomFacingDirection,
+            float groundHeight
+        )
+        {
+            Transform sofa = FindNamedTransformInSubtree(livingRoomRoot, "Sofa_Apt_01");
+            Transform coffeeTable = FindNamedTransformInSubtree(livingRoomRoot, "Coffee_Table_Apt_01");
+            Transform rug = FindNamedTransformInSubtree(livingRoomRoot, "Rug_Apt_01");
+
+            Vector3[] candidates =
+            {
+                MidpointPosition(sofa, coffeeTable, groundHeight),
+                MidpointPosition(sofa, rug, groundHeight),
+                FlattenToGround(rug == null ? television.position + (roomFacingDirection * spawnStandOffM) : rug.position, groundHeight),
+                FlattenToGround(television.position + (roomFacingDirection * spawnStandOffM), groundHeight),
+            };
+
+            for (int index = 0; index < candidates.Length; index++)
+            {
+                Vector3 candidate = candidates[index];
+                if (!IsFiniteVector3(candidate))
+                {
+                    continue;
+                }
+
+                if (!IsPlacementBlocked(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return FlattenToGround(television.position + (roomFacingDirection * spawnStandOffM), groundHeight);
+        }
+
+        private static bool TryGetDirectionBetween(Vector3 origin, Transform target, out Vector3 direction)
+        {
+            if (target == null)
+            {
+                direction = Vector3.zero;
+                return false;
+            }
+
+            direction = FlattenDirection(target.position - origin);
+            return direction.sqrMagnitude > 0.001f;
+        }
+
+        private bool IsPlacementBlocked(Vector3 anchorPosition)
+        {
+            float probeRadius = Mathf.Max(characterRadiusM * 0.92f, 0.18f);
+            Vector3 bottom = anchorPosition + (Vector3.up * (probeRadius + 0.02f));
+            Vector3 top = anchorPosition + (Vector3.up * Mathf.Max(characterHeightM - probeRadius, probeRadius + 0.25f));
+            Collider[] hits = Physics.OverlapCapsule(
+                bottom,
+                top,
+                probeRadius,
+                Physics.DefaultRaycastLayers,
+                QueryTriggerInteraction.Ignore
+            );
+            for (int index = 0; index < hits.Length; index++)
+            {
+                Collider hit = hits[index];
+                if (hit == null || hit.transform.IsChildOf(transform))
+                {
+                    continue;
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private Transform FindContainingAncestorNamed(Transform start, string expectedName)
+        {
+            Transform current = start;
+            while (current != null)
+            {
+                if (string.Equals(current.name, expectedName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return current;
+                }
+
+                current = current.parent;
+            }
+
+            return null;
+        }
+
+        private Transform FindNamedTransformInSubtree(Transform root, string prefix)
+        {
+            if (root == null)
+            {
+                return null;
+            }
+
+            Transform[] transforms = root.GetComponentsInChildren<Transform>(true);
+            for (int index = 0; index < transforms.Length; index++)
+            {
+                Transform candidate = transforms[index];
+                if (candidate == null)
+                {
+                    continue;
+                }
+
+                if (candidate.name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private float ResolveRoomGroundHeight(Transform livingRoomRoot)
+        {
+            string[] preferredFloorReferences =
+            {
+                "Rug_Apt_01",
+                "Coffee_Table_Apt_01",
+                "Sofa_Apt_01",
+                "MediaTable_01",
+            };
+
+            for (int index = 0; index < preferredFloorReferences.Length; index++)
+            {
+                Transform reference = FindNamedTransformInSubtree(livingRoomRoot, preferredFloorReferences[index]);
+                if (reference != null)
+                {
+                    return reference.position.y;
+                }
+            }
+
+            Transform sceneCamera = FindPreferredSceneCamera();
+            if (sceneCamera != null)
+            {
+                return Mathf.Max(sceneCamera.position.y - cameraHeightM, runtimeGroundHeightM);
+            }
+
+            return runtimeGroundHeightM;
+        }
+
+        private Vector3 EstimateSceneCenter()
+        {
+            Renderer[] renderers = FindSceneComponents<Renderer>();
+            Bounds bounds = default;
+            bool hasBounds = false;
+            for (int index = 0; index < renderers.Length; index++)
+            {
+                Renderer renderer = renderers[index];
+                if (renderer == null || renderer.transform.IsChildOf(transform))
+                {
+                    continue;
+                }
+
+                if (!hasBounds)
+                {
+                    bounds = renderer.bounds;
+                    hasBounds = true;
+                    continue;
+                }
+
+                bounds.Encapsulate(renderer.bounds);
+            }
+
+            return hasBounds ? bounds.center : Vector3.zero;
+        }
+
+        private static Vector3 FlattenToGround(Vector3 position, float groundHeight)
+        {
+            position.y = groundHeight;
+            return position;
+        }
+
+        private static Vector3 MidpointPosition(Transform first, Transform second, float groundHeight)
+        {
+            if (first == null || second == null)
+            {
+                return Vector3.positiveInfinity;
+            }
+
+            return FlattenToGround((first.position + second.position) * 0.5f, groundHeight);
+        }
+
+        private static bool IsFiniteVector3(Vector3 value)
+        {
+            return
+                !float.IsNaN(value.x) && !float.IsInfinity(value.x) &&
+                !float.IsNaN(value.y) && !float.IsInfinity(value.y) &&
+                !float.IsNaN(value.z) && !float.IsInfinity(value.z);
+        }
+
+        private static Vector3 FlattenDirection(Vector3 direction)
+        {
+            direction.y = 0.0f;
+            return direction.sqrMagnitude > 0.001f ? direction.normalized : Vector3.zero;
+        }
+
+        private static Quaternion LookToward(Vector3 origin, Vector3 target)
+        {
+            Vector3 facing = target - origin;
+            facing.y = 0.0f;
+            return facing.sqrMagnitude > 0.001f
+                ? Quaternion.LookRotation(facing.normalized, Vector3.up)
+                : Quaternion.identity;
         }
 
         private T[] FindSceneComponents<T>() where T : Component

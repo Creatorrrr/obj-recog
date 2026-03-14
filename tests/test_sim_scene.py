@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -26,14 +27,22 @@ def test_living_room_scene_has_expected_room_dimensions() -> None:
     assert scene.window_wall == "front"
 
 
-def test_living_room_scene_places_hidden_goal_in_front_of_dining_table() -> None:
+def test_living_room_scene_places_hidden_goal_in_front_of_tv() -> None:
     scene = build_living_room_scene_spec()
-    dining_table = next(item for item in scene.objects if item.object_id == "dining_table")
+    tv_panel = next(item for item in scene.objects if item.object_id == "tv_panel")
     goal = np.asarray(scene.hidden_goal_pose_xyz, dtype=np.float32)
-    near_edge_z = float(dining_table.center_xyz[2] - (dining_table.size_xyz[2] * 0.5))
 
-    assert goal[0] == dining_table.center_xyz[0]
-    assert math.isclose(near_edge_z - float(goal[2]), 0.75, rel_tol=0.0, abs_tol=1e-6)
+    assert goal[0] == tv_panel.center_xyz[0]
+    assert math.isclose(float(goal[2]) - tv_panel.center_xyz[2], 1.25, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_living_room_scene_targets_tv_from_central_start_area() -> None:
+    scene = build_living_room_scene_spec()
+
+    assert scene.semantic_target_class == "tv"
+    assert "TV" in scene.goal_description
+    assert abs(scene.start_pose.x) <= 0.6
+    assert abs(scene.start_pose.z) <= 0.6
 
 
 def test_living_room_scene_builds_multi_component_furniture() -> None:
@@ -231,7 +240,7 @@ def test_interior_test_tv_scene_has_expected_spec_metadata() -> None:
     scene = build_interior_test_tv_scene_spec()
 
     assert scene.scene_id == "interior_test_tv_navigation_v1"
-    assert scene.blend_file_path == "/Users/chasoik/Downloads/InteriorTest.blend"
+    assert Path(scene.blend_file_path).as_posix() == "/Users/chasoik/Downloads/InteriorTest.blend"
     assert scene.semantic_target_class == "tv"
     assert "TV" in scene.goal_description
     assert scene.start_pose == scene.start_pose.__class__(x=0.0, y=1.25, z=-2.8, yaw_deg=0.0, camera_pan_deg=0.0)
