@@ -75,6 +75,8 @@ class _DenseKeyframe:
 
 
 class DenseKeyframeMapBuilder:
+    requires_slam_keyframes = False
+
     def __init__(
         self,
         *,
@@ -191,6 +193,7 @@ class DenseKeyframeMapBuilder:
 
 class TsdfMeshMapBuilder:
     requires_point_cloud = False
+    requires_slam_keyframes = True
 
     def __init__(
         self,
@@ -483,6 +486,8 @@ class MapUpdate:
 
 
 class LocalMapBuilder:
+    requires_slam_keyframes = False
+
     def __init__(
         self,
         *,

@@ -7,6 +7,7 @@ import numpy as np
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
+from obj_recog.scene_graph import GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, EpisodePhase, SensorFrame
 from obj_recog.simulation import LivingRoomEpisodeRunner, LivingRoomSimulationRuntime
 
@@ -74,17 +75,24 @@ def _config(**overrides: object) -> AppConfig:
     return AppConfig(**values)
 
 
-def _artifacts(_packet: FramePacket):
+def _artifacts(
+    packet: FramePacket,
+    *,
+    detections: list[object] | None = None,
+    scene_graph_snapshot: SceneGraphSnapshot | None = None,
+    slam_tracking_state: str = "TRACKING",
+):
     return type(
         "Artifacts",
         (),
         {
-            "detections": [],
+            "frame_bgr": np.asarray(packet.frame_bgr, dtype=np.uint8),
+            "detections": list(detections or []),
             "segments": [],
-            "scene_graph_snapshot": None,
+            "scene_graph_snapshot": scene_graph_snapshot,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
             "depth_map": np.full((12, 16), 1.5, dtype=np.float32),
-            "slam_tracking_state": "TRACKING",
+            "slam_tracking_state": slam_tracking_state,
         },
     )()
 
@@ -115,6 +123,48 @@ def _goal_artifacts(_packet: FramePacket):
     )()
 
 
+def _memory_snapshot_for_target(
+    *,
+    target_label: str,
+    frame_index: int,
+    state: str = "occluded",
+    last_seen_frame: int | None = None,
+    last_seen_direction: str = "front-right",
+) -> SceneGraphSnapshot:
+    resolved_last_seen_frame = frame_index - 1 if last_seen_frame is None else last_seen_frame
+    return SceneGraphSnapshot(
+        frame_index=frame_index,
+        camera_pose_world=np.eye(4, dtype=np.float32),
+        nodes=(
+            GraphNode(
+                id="ego",
+                type="ego",
+                label="camera",
+                state="visible",
+                confidence=1.0,
+                world_centroid=np.zeros(3, dtype=np.float32),
+                last_seen_frame=frame_index,
+                last_seen_direction="front",
+                source_track_id=None,
+            ),
+            GraphNode(
+                id="target-1",
+                type="object",
+                label=target_label,
+                state=state,
+                confidence=0.92,
+                world_centroid=np.array([0.5, 0.0, 1.5], dtype=np.float32),
+                last_seen_frame=resolved_last_seen_frame,
+                last_seen_direction=last_seen_direction,
+                source_track_id=1,
+            ),
+        ),
+        edges=(),
+        visible_node_ids=("ego",),
+        visible_edge_keys=(),
+    )
+
+
 def test_living_room_runtime_self_calibrates_before_first_planner_turn(tmp_path: Path) -> None:
     planner = _FakePlanner(
         [
@@ -141,6 +191,7 @@ def test_living_room_runtime_self_calibrates_before_first_planner_turn(tmp_path:
 
     assert planner.calls
     assert all(context.phase != EpisodePhase.SELF_CALIBRATING for context in planner.calls)
+    assert planner.calls[0].memory.recent_searches == ()
     assert [primitive for primitive, _value in backend.apply_calls[:5]] == [
         "camera_pan_left",
         "camera_pan_right",
@@ -283,6 +334,195 @@ def test_living_room_runtime_forwards_planner_actions_to_backend(tmp_path: Path)
 
     assert ("move_forward", 0.12) in backend.apply_calls
     assert any(primitive == "turn_right" for primitive, _value in backend.apply_calls)
+
+
+def test_living_room_runtime_exposes_target_memory_on_first_planner_turn(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            )
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    target_label = runner._scene_spec.semantic_target_class
+
+    for _ in range(6):
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(
+            frame_packet=packet,
+            artifacts=_artifacts(
+                packet,
+                scene_graph_snapshot=_memory_snapshot_for_target(
+                    target_label=target_label,
+                    frame_index=runner._state.frame_index,
+                ),
+            ),
+        )
+
+    assert planner.calls[0].memory.target_memory is not None
+    assert planner.calls[0].memory.target_memory.label == target_label
+    assert planner.calls[0].memory.recent_searches == ()
+
+
+def test_living_room_runtime_includes_completed_search_in_next_planner_turn(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.TURN_RIGHT, 6.0),),
+                rationale="scan",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+
+    for _ in range(7):
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert len(planner.calls) >= 2
+    first_search = planner.calls[1].memory.recent_searches[0]
+    assert planner.calls[0].memory.recent_searches == ()
+    assert first_search.start_frame == planner.calls[0].frame_index
+    assert first_search.end_frame == planner.calls[1].frame_index
+    assert first_search.executed_actions == ("move_forward:0.12",)
+    assert first_search.target_visible_after_search is False
+    assert first_search.tracking_status == "TRACKING"
+
+
+def test_living_room_runtime_records_chunked_actions_in_search_history(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 18.0),),
+                rationale="wide scan",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                rationale="pause",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(sim_action_batch_size=3),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+
+    for _ in range(9):
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert len(planner.calls) >= 2
+    assert planner.calls[1].memory.recent_searches[0].executed_actions == (
+        "camera_pan_left:6.0",
+        "camera_pan_left:6.0",
+        "camera_pan_left:6.0",
+    )
+
+
+def test_living_room_runtime_limits_search_history_to_four_items(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),),
+                rationale=f"step-{index}",
+                model="fake-planner",
+                issued_at_frame=0,
+            )
+            for index in range(6)
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(sim_action_batch_size=1),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+
+    iterations = 0
+    while len(planner.calls) < 6 and iterations < 20:
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+        iterations += 1
+
+    assert len(planner.calls) >= 6
+    recent_searches = planner.calls[-1].memory.recent_searches
+    assert len(recent_searches) == 4
+    assert [item.start_frame for item in recent_searches] == [
+        planner.calls[index].frame_index for index in range(1, 5)
+    ]
+
+
+def test_living_room_runtime_writes_planner_memory_to_turn_log(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            )
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    target_label = runner._scene_spec.semantic_target_class
+
+    for _ in range(6):
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(
+            frame_packet=packet,
+            artifacts=_artifacts(
+                packet,
+                scene_graph_snapshot=_memory_snapshot_for_target(
+                    target_label=target_label,
+                    frame_index=runner._state.frame_index,
+                ),
+            ),
+        )
+
+    turns = (tmp_path / "planner_turns.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert turns
+    payload = json.loads(turns[0])
+    assert "memory" in payload["prompt"]
+    assert payload["prompt"]["memory"]["target_memory"]["label"] == target_label
+    assert payload["prompt"]["memory"]["recent_searches"] == []
 
 
 def test_simulation_runtime_uses_living_room_scene_and_resets_backend(tmp_path: Path) -> None:

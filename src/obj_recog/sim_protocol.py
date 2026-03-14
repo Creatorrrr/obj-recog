@@ -108,11 +108,37 @@ class PerceptionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerMemoryObservation:
+    label: str
+    kind: str
+    state: str
+    last_seen_direction: str | None
+    age_frames: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerSearchOutcome:
+    start_frame: int
+    end_frame: int
+    executed_actions: tuple[str, ...]
+    target_visible_after_search: bool
+    tracking_status: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerMemorySnapshot:
+    target_memory: PlannerMemoryObservation | None
+    nonvisible_observations: tuple[PlannerMemoryObservation, ...]
+    recent_searches: tuple[PlannerSearchOutcome, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerContext:
     phase: EpisodePhase
     frame_index: int
     goal_description: str
     perception: PerceptionSnapshot
+    memory: PlannerMemorySnapshot
     recent_actions: tuple[str, ...]
 
 

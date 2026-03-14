@@ -11,3 +11,9 @@ Then build the bridge with:
 ```bash
 ./scripts/build_orbslam3_bridge.sh
 ```
+
+On Windows PowerShell, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_orbslam3_bridge_windows.ps1
+```

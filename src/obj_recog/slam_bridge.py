@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 from json import JSONDecodeError
@@ -11,6 +12,15 @@ import numpy as np
 
 
 TRACKING_OK_STATES = {"TRACKING", "RELOCALIZED"}
+ORBSLAM3_BRIDGE_BUILD_HINT_PATH = Path("native") / "orbslam3_bridge" / "build" / "orbslam3_bridge"
+_ORBSLAM3_BRIDGE_RELATIVE_CANDIDATES = (
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH,
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH.with_suffix(".exe"),
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH.parent / "Release" / ORBSLAM3_BRIDGE_BUILD_HINT_PATH.with_suffix(".exe").name,
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH.parent / "Debug" / ORBSLAM3_BRIDGE_BUILD_HINT_PATH.with_suffix(".exe").name,
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH.parent / "RelWithDebInfo" / ORBSLAM3_BRIDGE_BUILD_HINT_PATH.with_suffix(".exe").name,
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH.parent / "MinSizeRel" / ORBSLAM3_BRIDGE_BUILD_HINT_PATH.with_suffix(".exe").name,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +51,48 @@ class SlamFrameResult:
     @property
     def tracking_ok(self) -> bool:
         return self.tracking_state in TRACKING_OK_STATES
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def orbslam3_bridge_binary_candidates(*, repo_root: Path | None = None) -> tuple[Path, ...]:
+    root = _repo_root() if repo_root is None else Path(repo_root)
+    return tuple(root / relative_path for relative_path in _ORBSLAM3_BRIDGE_RELATIVE_CANDIDATES)
+
+
+def resolve_orbslam3_bridge_binary_path(binary_path: str | Path | None = None) -> Path | None:
+    if binary_path is not None:
+        candidate = Path(binary_path)
+        return candidate if candidate.is_file() else None
+
+    for candidate in orbslam3_bridge_binary_candidates():
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def orbslam3_bridge_runtime_library_dirs(*, repo_root: Path | None = None) -> tuple[Path, ...]:
+    root = _repo_root() if repo_root is None else Path(repo_root)
+    candidates = (
+        root / "native" / "orbslam3_bridge" / "build",
+        root / "native" / "orbslam3_bridge" / "build" / "Release",
+        root / "native" / "orbslam3_bridge" / "build" / "Debug",
+        root / "native" / "orbslam3_bridge" / "build" / "RelWithDebInfo",
+        root / "native" / "orbslam3_bridge" / "build" / "MinSizeRel",
+        root / "third_party" / "ORB_SLAM3" / "lib",
+        root / "third_party" / "ORB_SLAM3" / "Thirdparty" / "DBoW2" / "lib",
+        root / "third_party" / "ORB_SLAM3" / "Thirdparty" / "g2o" / "lib",
+    )
+    ordered_existing_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen or not candidate.is_dir():
+            continue
+        seen.add(candidate)
+        ordered_existing_dirs.append(candidate)
+    return tuple(ordered_existing_dirs)
 
 
 def encode_frame_packet(frame_gray: np.ndarray, timestamp: float) -> bytes:
@@ -135,13 +187,16 @@ class OrbSlam3Bridge:
 
         self._frame_width = int(frame_width)
         self._frame_height = int(frame_height)
-        self._binary_path = binary_path or str(
-            Path(__file__).resolve().parents[2] / "native" / "orbslam3_bridge" / "build" / "orbslam3_bridge"
-        )
-        if not Path(self._binary_path).is_file():
+        resolved_binary_path = resolve_orbslam3_bridge_binary_path(binary_path)
+        if resolved_binary_path is None:
+            searched_locations = [Path(binary_path)] if binary_path is not None else list(orbslam3_bridge_binary_candidates())
+            searched = ", ".join(str(path) for path in searched_locations)
             raise RuntimeError(
-                f"ORB-SLAM3 bridge binary not found at {self._binary_path}. Build native/orbslam3_bridge first."
+                "ORB-SLAM3 bridge binary not found. "
+                f"Searched: {searched}. "
+                f"Build {ORBSLAM3_BRIDGE_BUILD_HINT_PATH.as_posix()} first."
             )
+        self._binary_path = str(resolved_binary_path)
 
         self._command = [
             self._binary_path,
@@ -154,11 +209,22 @@ class OrbSlam3Bridge:
             "--height",
             str(self._frame_height),
         ]
+        process_env = None
+        if os.name == "nt":
+            process_env = os.environ.copy()
+            runtime_dirs = [str(path) for path in orbslam3_bridge_runtime_library_dirs()]
+            if runtime_dirs:
+                path_entries = runtime_dirs
+                existing_path = process_env.get("PATH")
+                if existing_path:
+                    path_entries.append(existing_path)
+                process_env["PATH"] = os.pathsep.join(path_entries)
         self._process = subprocess.Popen(
             self._command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=process_env,
         )
 
     def track(self, frame_gray: np.ndarray, timestamp: float) -> SlamFrameResult:

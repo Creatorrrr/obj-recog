@@ -28,6 +28,64 @@ You can verify the resolved runtime like this:
 python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 ```
 
+## Windows CUDA OpenCV
+
+The default `opencv-python` wheel is CPU-only. If you want `--opencv-cuda on` to
+work, build OpenCV from source with CUDA and install the resulting Python
+binding into the current `.venv`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_opencv_cuda_windows.ps1
+```
+
+This script expects:
+
+- NVIDIA CUDA Toolkit 12.8
+- Visual Studio 2022 Build Tools with C++ workload
+- CMake
+- Ninja
+
+The installer fetches the official `opencv` and `opencv_contrib` `4.13.0`
+sources. `opencv_contrib` is required because OpenCV's CUDA image-processing
+modules depend on `cudev`.
+
+After the build, verify the runtime explicitly:
+
+```powershell
+.\.venv\Scripts\python .\scripts\verify_opencv_cuda.py
+```
+
+If you later rerun `python -m pip install -e .[dev]`, a CPU OpenCV wheel may be
+installed again. In that case, rerun `.\scripts\install_opencv_cuda_windows.ps1`
+to restore the CUDA build inside `.venv`.
+
+## Windows ORB-SLAM3 Bridge
+
+`3D Reconstruction` in `sim + rgb_only` now requires the native ORB-SLAM3 bridge.
+On Windows, build it before launching `obj_recog.main`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_orbslam3_bridge_windows.ps1
+```
+
+This script looks for:
+
+- CMake
+- Visual Studio 2022 Build Tools with the C++ workload
+- a local `third_party\ORB_SLAM3` checkout
+- CMake package metadata for OpenCV, Eigen3, Boost, and OpenSSL
+
+If your dependencies live outside the default search paths, pass them explicitly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_orbslam3_bridge_windows.ps1 `
+  -OpenCvDir C:\path\to\OpenCVConfig\dir `
+  -Eigen3Dir C:\path\to\Eigen3Config\dir `
+  -CMakePrefixPath C:\path\to\prefix1;C:\path\to\prefix2
+```
+
+The expected output binary is `native\orbslam3_bridge\build\orbslam3_bridge.exe`.
+
 Check the CLI:
 
 ```bash
@@ -44,6 +102,7 @@ PYTHONPATH=src python -m obj_recog.main \
   --width 640 \
   --height 360 \
   --device auto \
+  --opencv-cuda on \
   --depth-profile fast \
   --segmentation-mode panoptic \
   --explanation-mode on
@@ -100,6 +159,7 @@ PYTHONPATH=src python -m obj_recog.main \
   --width 640 \
   --height 360 \
   --device auto \
+  --opencv-cuda on \
   --detector-backend torch \
   --depth-profile fast \
   --segmentation-mode panoptic \
@@ -140,6 +200,7 @@ Useful regression commands:
 
 ```bash
 pytest -q tests/test_config.py tests/test_main_simulation.py tests/test_living_room_runtime.py tests/test_unity_rgb.py tests/test_offline_benchmark.py
+.venv/Scripts/python scripts/verify_opencv_cuda.py
 python -m compileall src/obj_recog
 git diff --check
 ```

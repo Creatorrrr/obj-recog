@@ -18,6 +18,7 @@ from obj_recog.sim_protocol import (
     EpisodePhase,
     EpisodeReport,
     HiddenWorldState,
+    PlannerSearchOutcome,
     RobotPose,
     SensorFrame,
     UnityActionCommand,
@@ -128,7 +129,10 @@ class LivingRoomEpisodeRunner:
         )
         self._action_history: list[str] = []
         self._planner_turn_logs: list[dict[str, object]] = []
+        self._completed_search_history: list[PlannerSearchOutcome] = []
         self._current_schedule: ActionSchedule | None = None
+        self._active_schedule_start_frame: int | None = None
+        self._active_schedule_executed_steps: list[str] = []
         self._latest_planner_context = None
         self._closed = False
         self._executed_schedule_steps = 0
@@ -179,6 +183,10 @@ class LivingRoomEpisodeRunner:
         )
 
     @staticmethod
+    def _format_action_step(step: ActionStep) -> str:
+        return f"{step.primitive.value}:{step.value}"
+
+    @staticmethod
     def _bbox_depth_m(depth_map: np.ndarray, xyxy: tuple[int, int, int, int]) -> float | None:
         depth = np.asarray(depth_map, dtype=np.float32)
         if depth.ndim != 2 or depth.size == 0:
@@ -226,6 +234,32 @@ class LivingRoomEpisodeRunner:
             if area_ratio >= 0.22 and center_offset_ratio <= 0.25:
                 return True
         return False
+
+    def _target_visible_in_artifacts(self, *, artifacts) -> bool:
+        target_label = getattr(self._scene_spec, "semantic_target_class", "")
+        for detection in list(getattr(artifacts, "detections", []) or []):
+            if self._label_matches_target(
+                detection_label=getattr(detection, "label", ""),
+                target_label=target_label,
+            ):
+                return True
+        return False
+
+    def _finalize_completed_search(self, *, artifacts) -> None:
+        if self._active_schedule_start_frame is None:
+            return
+        self._completed_search_history.append(
+            PlannerSearchOutcome(
+                start_frame=int(self._active_schedule_start_frame),
+                end_frame=int(self._state.frame_index),
+                executed_actions=tuple(self._active_schedule_executed_steps),
+                target_visible_after_search=self._target_visible_in_artifacts(artifacts=artifacts),
+                tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
+            )
+        )
+        self._completed_search_history = self._completed_search_history[-4:]
+        self._active_schedule_start_frame = None
+        self._active_schedule_executed_steps = []
 
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
         _ = timeout_sec
@@ -280,7 +314,7 @@ class LivingRoomEpisodeRunner:
             step = self._consume_schedule_step()
         else:
             step = ActionStep(ActionPrimitive.PAUSE, 0.5)
-        self._action_history.append(f"{step.primitive.value}:{step.value}")
+        self._action_history.append(self._format_action_step(step))
         return command_from_step(step.primitive, step.value)
 
     def _advance_self_calibration(self) -> ActionStep:
@@ -294,6 +328,7 @@ class LivingRoomEpisodeRunner:
         return step
 
     def _plan_next_schedule(self, *, artifacts) -> None:
+        self._finalize_completed_search(artifacts=artifacts)
         context = build_planner_context(
             phase=self._state.phase,
             frame_index=self._state.frame_index,
@@ -309,6 +344,8 @@ class LivingRoomEpisodeRunner:
                 "median_depth_m": float(np.nanmedian(np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1)))))),
             },
             recent_actions=tuple(self._action_history[-8:]),
+            recent_searches=tuple(self._completed_search_history),
+            target_label=str(self._scene_spec.semantic_target_class),
             calibration_status=(
                 "converged" if self._state.selfcal_step_index >= len(self._selfcal_actions) else "pending"
             ),
@@ -341,6 +378,8 @@ class LivingRoomEpisodeRunner:
                 issued_at_frame=self._state.frame_index,
             )
         self._current_schedule = schedule
+        self._active_schedule_start_frame = int(self._state.frame_index)
+        self._active_schedule_executed_steps = []
         self._state.schedule_cursor = 0
         self._executed_schedule_steps = 0
         self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
@@ -368,6 +407,7 @@ class LivingRoomEpisodeRunner:
             self._executed_schedule_steps = 0
             self._state.phase = EpisodePhase.REASSESS
             return ActionStep(ActionPrimitive.PAUSE, 0.5)
+        self._active_schedule_executed_steps.append(self._format_action_step(step))
         self._executed_schedule_steps += 1
         max_schedule_steps = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
         if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
@@ -438,6 +478,39 @@ class LivingRoomEpisodeRunner:
                             "depth_summary": dict(prompt.perception.depth_summary),
                             "calibration_status": prompt.perception.calibration_status,
                             "tracking_status": prompt.perception.tracking_status,
+                            "memory": {
+                                "target_memory": (
+                                    None
+                                    if prompt.memory.target_memory is None
+                                    else {
+                                        "label": prompt.memory.target_memory.label,
+                                        "kind": prompt.memory.target_memory.kind,
+                                        "state": prompt.memory.target_memory.state,
+                                        "last_seen_direction": prompt.memory.target_memory.last_seen_direction,
+                                        "age_frames": int(prompt.memory.target_memory.age_frames),
+                                    }
+                                ),
+                                "nonvisible_observations": [
+                                    {
+                                        "label": observation.label,
+                                        "kind": observation.kind,
+                                        "state": observation.state,
+                                        "last_seen_direction": observation.last_seen_direction,
+                                        "age_frames": int(observation.age_frames),
+                                    }
+                                    for observation in prompt.memory.nonvisible_observations
+                                ],
+                                "recent_searches": [
+                                    {
+                                        "start_frame": int(search.start_frame),
+                                        "end_frame": int(search.end_frame),
+                                        "executed_actions": list(search.executed_actions),
+                                        "target_visible_after_search": bool(search.target_visible_after_search),
+                                        "tracking_status": search.tracking_status,
+                                    }
+                                    for search in prompt.memory.recent_searches
+                                ],
+                            },
                             "recent_actions": list(prompt.recent_actions),
                         },
                         "schedule": item["schedule"],

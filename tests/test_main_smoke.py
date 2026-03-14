@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,17 +9,21 @@ import pytest
 from obj_recog.camera import CameraDevice, CameraSession, open_camera
 from obj_recog.config import AppConfig, parse_config
 from obj_recog.frame_source import FramePacket
+from obj_recog.mapping import LocalMapBuilder
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
 from obj_recog.main import (
+    _format_opencv_runtime_message,
     _format_runtime_accel_message,
     _load_app_dotenv,
+    _resolve_main_runtime_factories,
     _resolve_main_slam_bridge_factory,
     main,
     process_frame,
     run,
 )
+from obj_recog.opencv_runtime import OpenCvRuntimeStatus
 from obj_recog.types import Detection, PanopticSegment, SegmentationResult
 from obj_recog.runtime_accel import RuntimeCapabilities
 
@@ -217,6 +222,10 @@ class FakeMapBuilder:
             self._mesh_triangles.copy(),
             self._mesh_vertex_colors.copy(),
         )
+
+
+class FakeSlamKeyframeMapBuilder(FakeMapBuilder):
+    requires_slam_keyframes = True
 
 
 class FakeCapture:
@@ -616,6 +625,50 @@ def test_format_runtime_accel_message_includes_requested_and_resolved_device() -
     assert "requested_device=auto" in message
     assert "resolved_device=cpu" in message
     assert "precision=fp32" in message
+
+
+def test_format_opencv_runtime_message_includes_strict_probe_fields() -> None:
+    message = _format_opencv_runtime_message(
+        OpenCvRuntimeStatus(
+            cuda_mode="on",
+            cv2_path="C:/fake/site-packages/cv2/__init__.py",
+            cuda_api_present=True,
+            cuda_device_count=1,
+            build_has_cuda=True,
+            gpu_mat_ok=True,
+            resize_ok=True,
+            cvt_color_ok=True,
+            errors=(),
+        )
+    )
+
+    assert "mode=on" in message
+    assert "cv2_path=C:/fake/site-packages/cv2/__init__.py" in message
+    assert "opencv_cuda=True" in message
+    assert "gpu_mat_ok=True" in message
+    assert "cvt_color_ok=True" in message
+
+
+def test_run_fails_fast_when_opencv_cuda_on_strict_check_fails() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="auto",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        opencv_cuda="on",
+        explanation_enabled=False,
+    )
+    fake_cv2 = SimpleNamespace(
+        __file__="C:/fake/site-packages/cv2/__init__.py",
+        cuda=SimpleNamespace(getCudaEnabledDeviceCount=lambda: 0),
+        getBuildInformation=lambda: "General configuration for OpenCV 4.13.0\nNVIDIA CUDA: NO\n",
+    )
+
+    with pytest.raises(RuntimeError, match="--opencv-cuda on requested"):
+        run(config, cv2_module=fake_cv2)
 
 
 def test_process_frame_creates_frame_artifacts() -> None:
@@ -1612,6 +1665,101 @@ def test_run_resets_tracker_and_map_when_r_is_pressed() -> None:
 
     assert tracker.reset_calls == 1
     assert map_builder.reset_calls == 1
+
+
+def test_run_fails_fast_when_tracker_only_execution_uses_slam_keyframe_builder() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+    )
+    fake_cv2 = FakeCV2()
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
+    tracker = FakeTracker(results=[FakeTrackingResult(did_reset=True)])
+    map_builder = FakeSlamKeyframeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "3D reconstruction/TSDF mesh requires ORB-SLAM3 keyframes.*"
+            "native/orbslam3_bridge/build/orbslam3_bridge.*"
+            "LocalMapBuilder"
+        ),
+    ):
+        run(
+            config,
+            cv2_module=fake_cv2,
+            detector_factory=lambda **_: FakeDetector(),
+            depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+            tracker_factory=lambda **_: tracker,
+            map_builder_factory=lambda **_: map_builder,
+            viewer_factory=lambda: (_ for _ in ()).throw(AssertionError("viewer should not start")),
+            open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+            overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        )
+
+    assert capture.released is True
+    assert tracker.calls == 0
+
+
+def test_run_allows_tracker_only_execution_with_local_map_builder() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+    )
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
+    tracker = FakeTracker(results=[FakeTrackingResult(did_reset=True)])
+    viewer = FakeViewer()
+    created_builder: dict[str, LocalMapBuilder] = {}
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+
+    def _map_builder_factory(**kwargs) -> LocalMapBuilder:
+        builder = LocalMapBuilder(**kwargs)
+        created_builder["builder"] = builder
+        return builder
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=_map_builder_factory,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+    )
+
+    assert tracker.calls == 1
+    assert len(viewer.updates) == 1
+    assert created_builder["builder"].keyframe_count == 1
 
 
 def test_run_resets_slam_bridge_and_map_when_r_is_pressed(tmp_path: Path) -> None:
@@ -3381,9 +3529,8 @@ def test_main_loads_dotenv_before_parse_config(
     assert captured["config"].camera_calibration == str(calibration_path)
 
 
-def test_resolve_main_slam_bridge_factory_falls_back_for_rgb_only_sim_without_binary(
+def test_resolve_main_runtime_factories_require_bridge_for_rgb_only_sim(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     config = AppConfig(
         camera_index=0,
@@ -3396,15 +3543,25 @@ def test_resolve_main_slam_bridge_factory_falls_back_for_rgb_only_sim_without_bi
         input_source="sim",
         sim_interface_mode="rgb_only",
     )
-    real_is_file = Path.is_file
 
-    def fake_is_file(path: Path) -> bool:
-        if str(path).replace("\\", "/").endswith("/native/orbslam3_bridge/build/orbslam3_bridge"):
-            return False
-        return real_is_file(path)
+    monkeypatch.setattr("obj_recog.main.resolve_orbslam3_bridge_binary_path", lambda: None)
 
-    monkeypatch.setattr(Path, "is_file", fake_is_file)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "3D reconstruction/TSDF mesh requires ORB-SLAM3 keyframes.*"
+            "native/orbslam3_bridge/build/orbslam3_bridge.*"
+            "LocalMapBuilder"
+        ),
+    ):
+        _resolve_main_runtime_factories(config)
 
-    assert _resolve_main_slam_bridge_factory(config) is None
-    captured = capsys.readouterr()
-    assert "falling back to PoseTracker" in captured.err
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "3D reconstruction/TSDF mesh requires ORB-SLAM3 keyframes.*"
+            "native/orbslam3_bridge/build/orbslam3_bridge.*"
+            "LocalMapBuilder"
+        ),
+    ):
+        _resolve_main_slam_bridge_factory(config)

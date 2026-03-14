@@ -159,26 +159,31 @@ These collision checks are runtime-only truth. They prevent the robot from movin
 
 ## Planner Boundary
 
-The planner-visible rule does not change.
+The planner-visible rule now allows episode-local memory, but it remains bounded to planner-visible information only.
 
 The planner receives only:
 
 - current RGB-derived perception outputs
 - depth summaries
 - reconstruction summaries
-- graph relations
-- object and segment observations
+- currently visible graph relations
+- object and segment observations that were previously visible to the planner and are now `occluded` or `lost`
+- recent search batch outcomes derived from executed low-level actions
 - recent action history
 - calibration/tracking health
+
+The planner must treat current visible evidence as higher priority than memory. It should avoid repeating a recent unsuccessful search pattern when alternatives exist, but it may revisit an area if new clues appear or no better option is available.
 
 The planner does not receive:
 
 - exact goal coordinates
 - object list from the extracted scene manifest
 - hidden collision geometry
+- hidden scene-graph state that was never visible to the planner
 - unseen authored objects
+- raw prior planner rationale or full prior planner responses
 
-If the TV is not visible from the camera, the planner should not be allowed to know its exact position.
+If the TV is not visible from the camera, the planner may remember only prior planner-visible observations such as the last seen direction or a recent failed search, but it must not know the TV's exact position.
 
 ## Testing Strategy
 

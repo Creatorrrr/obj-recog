@@ -24,12 +24,23 @@ from obj_recog.depth import DepthEstimator
 from obj_recog.detector import ObjectDetector
 from obj_recog.frame_source import FramePacket, LiveCameraFrameSource
 from obj_recog.mapping import LocalMapBuilder, TsdfMeshMapBuilder
-from obj_recog.opencv_runtime import cvt_color, load_cv2, resize_image
+from obj_recog.opencv_runtime import (
+    OpenCvRuntimeStatus,
+    cvt_color,
+    ensure_opencv_runtime,
+    load_cv2,
+    resize_image,
+)
 from obj_recog.reconstruct import depth_to_point_cloud, depth_to_point_cloud_torch, intrinsics_for_frame
 from obj_recog.runtime_accel import detect_runtime_capabilities, device_is_cuda, resolve_precision
 from obj_recog.scene_graph import SceneGraphMemory
 from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
-from obj_recog.slam_bridge import OrbSlam3Bridge, SlamFrameResult
+from obj_recog.slam_bridge import (
+    ORBSLAM3_BRIDGE_BUILD_HINT_PATH,
+    OrbSlam3Bridge,
+    SlamFrameResult,
+    resolve_orbslam3_bridge_binary_path,
+)
 from obj_recog.simulation import SimulationRuntime
 from obj_recog.situation_explainer import (
     ExplanationResult,
@@ -50,9 +61,18 @@ from obj_recog.visualization import (
     runtime_window_position,
 )
 
-
 def _default_debug_log(message: str) -> None:
     print(f"[obj-recog] {message}", file=sys.stderr, flush=True)
+
+
+def _tsdf_requires_orbslam3_message() -> str:
+    return (
+        "3D reconstruction/TSDF mesh requires ORB-SLAM3 keyframes. "
+        f"Build {ORBSLAM3_BRIDGE_BUILD_HINT_PATH.as_posix()} and rerun with ORB-SLAM3 enabled. "
+        "On Windows, scripts/build_orbslam3_bridge_windows.ps1 produces "
+        "native/orbslam3_bridge/build/orbslam3_bridge.exe. "
+        "Tracker-only execution is only supported with non-TSDF map builders such as LocalMapBuilder."
+    )
 
 
 def _format_runtime_accel_message(
@@ -74,6 +94,23 @@ def _format_runtime_accel_message(
         f"segmentation_backend={config.segmentation_backend} "
         f"sim_render_backend={config.sim_render_backend}"
     )
+
+
+def _format_opencv_runtime_message(status: OpenCvRuntimeStatus) -> str:
+    message = (
+        "opencv runtime "
+        f"mode={status.cuda_mode} "
+        f"cv2_path={status.cv2_path or 'unknown'} "
+        f"opencv_cuda={status.cuda_available} "
+        f"build_has_cuda={status.build_has_cuda} "
+        f"cuda_devices={status.cuda_device_count} "
+        f"gpu_mat_ok={status.gpu_mat_ok} "
+        f"resize_ok={status.resize_ok} "
+        f"cvt_color_ok={status.cvt_color_ok}"
+    )
+    if status.errors:
+        message = f"{message} errors={' | '.join(status.errors)}"
+    return message
 
 
 def resize_for_inference(
@@ -794,6 +831,7 @@ def run(
     validation_probe=None,
 ) -> None:
     cv2 = load_cv2(cv2_module, cuda_mode=config.opencv_cuda)
+    opencv_status = ensure_opencv_runtime(cv2, cuda_mode=config.opencv_cuda)
     _load_app_dotenv()
     runtime_capabilities = detect_runtime_capabilities(cv2_module=cv2)
     effective_device = resolve_device(config.device)
@@ -807,6 +845,7 @@ def run(
             effective_precision=effective_precision,
         )
     )
+    debug_log(_format_opencv_runtime_message(opencv_status))
     camera_session: CameraSession | None = None
     viewer = None
     environment_viewer = None
@@ -1232,6 +1271,8 @@ def run(
                     depth_sampling_stride=depth_profile.depth_sampling_stride,
                 ),
             )
+        if bool(getattr(map_builder, "requires_slam_keyframes", False)) and slam_bridge is None:
+            raise RuntimeError(_tsdf_requires_orbslam3_message())
         if config.graph_enabled:
             scene_graph_memory = scene_graph_memory_factory(
                 graph_max_visible_nodes=config.graph_max_visible_nodes,
@@ -1706,7 +1747,7 @@ def run(
 def main() -> None:
     _load_app_dotenv()
     config = parse_config()
-    slam_bridge_factory = _resolve_main_slam_bridge_factory(config)
+    slam_bridge_factory, map_builder_factory = _resolve_main_runtime_factories(config)
     if config.validate_all_scenarios:
         from obj_recog.validation import run_validation_suite
 
@@ -1715,7 +1756,7 @@ def main() -> None:
             output_dir=config.validation_output_dir,
             run_fn=run,
             slam_bridge_factory=slam_bridge_factory,
-            map_builder_factory=TsdfMeshMapBuilder,
+            map_builder_factory=map_builder_factory,
             situation_explainer_factory=OpenAISituationExplainer,
             explanation_worker_factory=SituationExplanationWorker,
         )
@@ -1728,27 +1769,26 @@ def main() -> None:
     run(
         config,
         slam_bridge_factory=slam_bridge_factory,
-        map_builder_factory=TsdfMeshMapBuilder,
+        map_builder_factory=map_builder_factory,
         situation_explainer_factory=OpenAISituationExplainer,
         explanation_worker_factory=SituationExplanationWorker,
         environment_viewer_factory=Open3DEnvironmentViewer,
     )
 
 
-def _resolve_main_slam_bridge_factory(config: AppConfig):
+def _resolve_main_runtime_factories(config: AppConfig):
     if (
         str(getattr(config, "input_source", "live")) == "sim"
         and str(getattr(config, "sim_interface_mode", "rgb_only")) == "rgb_only"
     ):
-        binary_path = Path(__file__).resolve().parents[2] / "native" / "orbslam3_bridge" / "build" / "orbslam3_bridge"
-        if not binary_path.is_file():
-            print(
-                "[obj-recog] ORB-SLAM3 bridge binary missing; falling back to PoseTracker for RGB-only sim",
-                file=sys.stderr,
-                flush=True,
-            )
-            return None
-    return OrbSlam3Bridge
+        if resolve_orbslam3_bridge_binary_path() is None:
+            raise RuntimeError(_tsdf_requires_orbslam3_message())
+    return OrbSlam3Bridge, TsdfMeshMapBuilder
+
+
+def _resolve_main_slam_bridge_factory(config: AppConfig):
+    slam_bridge_factory, _ = _resolve_main_runtime_factories(config)
+    return slam_bridge_factory
 
 
 if __name__ == "__main__":

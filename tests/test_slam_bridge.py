@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import struct
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ from obj_recog.slam_bridge import (
     OrbSlam3Bridge,
     decode_slam_response,
     encode_frame_packet,
+    resolve_orbslam3_bridge_binary_path,
 )
 
 
@@ -224,3 +226,66 @@ def test_orbslam3_bridge_track_skips_non_json_stdout_lines(tmp_path, monkeypatch
 
     assert result.tracking_state == "TRACKING"
     assert len(fake_process.stdin.writes) == 1
+
+
+def test_resolve_orbslam3_bridge_binary_path_accepts_windows_executable_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_is_file = Path.is_file
+
+    def fake_is_file(path: Path) -> bool:
+        normalized = str(path).replace("\\", "/")
+        if normalized.endswith("/native/orbslam3_bridge/build/orbslam3_bridge"):
+            return False
+        if normalized.endswith("/native/orbslam3_bridge/build/orbslam3_bridge.exe"):
+            return True
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+
+    resolved = resolve_orbslam3_bridge_binary_path()
+
+    assert resolved is not None
+    assert str(resolved).replace("\\", "/").endswith("/native/orbslam3_bridge/build/orbslam3_bridge.exe")
+
+
+def test_orbslam3_bridge_prepends_windows_runtime_dirs_to_path(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vocab = tmp_path / "ORBvoc.txt"
+    settings = tmp_path / "camera.yaml"
+    bridge_binary = tmp_path / "orbslam3_bridge.exe"
+    runtime_a = tmp_path / "runtime-a"
+    runtime_b = tmp_path / "runtime-b"
+    vocab.write_text("", encoding="utf-8")
+    settings.write_text("", encoding="utf-8")
+    bridge_binary.write_text("", encoding="utf-8")
+    runtime_a.mkdir()
+    runtime_b.mkdir()
+    fake_process = _FakeProcess(stdout_lines=[])
+    captured: dict[str, object] = {}
+
+    def fake_popen(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return fake_process
+
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+    monkeypatch.setattr("obj_recog.slam_bridge.os.name", "nt", raising=False)
+    monkeypatch.setattr(
+        "obj_recog.slam_bridge.orbslam3_bridge_runtime_library_dirs",
+        lambda **_: (runtime_a, runtime_b),
+    )
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    OrbSlam3Bridge(
+        vocabulary_path=str(vocab),
+        settings_path=str(settings),
+        frame_width=4,
+        frame_height=3,
+        binary_path=str(bridge_binary),
+    )
+
+    assert captured["env"] is not None
+    path_entries = str(captured["env"]["PATH"]).split(";")
+    assert path_entries[:2] == [str(runtime_a), str(runtime_b)]

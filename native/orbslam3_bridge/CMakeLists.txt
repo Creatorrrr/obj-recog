@@ -3,6 +3,11 @@ project(obj_recog_orbslam3_bridge LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+  string(TOUPPER "${config}" config_upper)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} ${CMAKE_BINARY_DIR})
+endforeach()
 
 if(NOT DEFINED ORB_SLAM3_ROOT)
   message(FATAL_ERROR "ORB_SLAM3_ROOT must point to a local ORB_SLAM3 checkout")

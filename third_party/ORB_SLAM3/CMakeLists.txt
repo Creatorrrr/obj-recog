@@ -7,10 +7,15 @@ ENDIF()
 
 MESSAGE("Build type: " ${CMAKE_BUILD_TYPE})
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -Wall   -O3")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall   -O3")
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+if(MSVC)
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /O2")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2")
+else()
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O3")
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -54,7 +59,16 @@ if(NOT ORB_SLAM3_HEADLESS_VIEWER)
 include_directories(${Pangolin_INCLUDE_DIRS})
 endif()
 
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
+set(ORB_SLAM3_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${ORB_SLAM3_OUTPUT_DIRECTORY})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${ORB_SLAM3_OUTPUT_DIRECTORY})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${ORB_SLAM3_OUTPUT_DIRECTORY})
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+  string(TOUPPER "${config}" config_upper)
+  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${config_upper} ${ORB_SLAM3_OUTPUT_DIRECTORY})
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${config_upper} ${ORB_SLAM3_OUTPUT_DIRECTORY})
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} ${ORB_SLAM3_OUTPUT_DIRECTORY})
+endforeach()
 
 add_library(${PROJECT_NAME} SHARED
 src/System.cc
@@ -120,22 +134,15 @@ if(ORB_SLAM3_HEADLESS_VIEWER)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ORB_SLAM3_HEADLESS_VIEWER=1)
 endif()
 
+add_subdirectory(Thirdparty/DBoW2)
 add_subdirectory(Thirdparty/g2o)
-
-if(APPLE)
-set(ORB_SLAM3_DBOW2_LIB ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW2/lib/libDBoW2.dylib)
-set(ORB_SLAM3_G2O_LIB ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.dylib)
-else()
-set(ORB_SLAM3_DBOW2_LIB ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW2/lib/libDBoW2.so)
-set(ORB_SLAM3_G2O_LIB ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so)
-endif()
 
 target_link_libraries(${PROJECT_NAME}
 ${OpenCV_LIBS}
 ${EIGEN3_LIBS}
 ${Boost_LIBRARIES}
-${ORB_SLAM3_DBOW2_LIB}
-${ORB_SLAM3_G2O_LIB}
+DBoW2
+g2o
 OpenSSL::Crypto
 )
 
