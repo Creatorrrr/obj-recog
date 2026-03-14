@@ -62,3 +62,32 @@ def test_running_percentile_normalizer_depth_gamma_expands_mid_to_far_distances(
     assert np.all(np.diff(depthy_depth.reshape(-1)) <= 0.0)
     assert depthy_depth[0, 1] > fast_depth[0, 1]
     assert depthy_depth[0, 2] > fast_depth[0, 2]
+
+
+def test_depth_estimator_falls_back_to_eager_when_compiled_model_needs_triton() -> None:
+    calls: list[str] = []
+
+    class _CompiledModel:
+        def __call__(self, _input_batch):
+            calls.append("compiled")
+            raise RuntimeError("Cannot find a working triton installation")
+
+    class _EagerModel:
+        def __call__(self, input_batch):
+            calls.append("eager")
+            return input_batch
+
+    estimator = DepthEstimator.__new__(DepthEstimator)
+    estimator._model = _CompiledModel()
+    estimator._eager_model = _EagerModel()
+    estimator._compiled_model_active = True
+    debug_messages: list[str] = []
+    estimator._debug_log = debug_messages.append
+
+    result = estimator._run_model("payload")
+
+    assert result == "payload"
+    assert calls == ["compiled", "eager"]
+    assert estimator._model is estimator._eager_model
+    assert estimator._compiled_model_active is False
+    assert any("fallback to eager" in message for message in debug_messages)

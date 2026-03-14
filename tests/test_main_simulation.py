@@ -170,6 +170,43 @@ class _FakeMapBuilder:
         return None
 
 
+class _FakeExplainer:
+    pass
+
+
+class _FakeExplanationWorker:
+    def __init__(self) -> None:
+        self.submissions: list[tuple[int, object]] = []
+        self._queued_result = None
+        self.closed = False
+
+    def submit(self, snapshot_id: int, snapshot) -> None:
+        from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+        self.submissions.append((snapshot_id, snapshot))
+        self._queued_result = (
+            snapshot_id,
+            ExplanationResult(
+                text="TV is visible ahead.",
+                status=ExplanationStatus.READY,
+                latency_ms=42.0,
+                model="fake-explainer",
+                error_message=None,
+            ),
+        )
+
+    def poll(self):
+        queued = self._queued_result
+        self._queued_result = None
+        return queued
+
+    def is_idle(self) -> bool:
+        return self._queued_result is None
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _packet(timestamp_sec: float) -> FramePacket:
     frame = np.full((8, 8, 3), 100, dtype=np.uint8)
     return FramePacket(
@@ -213,7 +250,7 @@ def test_run_sim_mode_uses_runtime_depth_and_monocular_slam(tmp_path: Path) -> N
         input_source="sim",
         segmentation_mode="off",
         graph_enabled=False,
-        explanation_enabled=True,
+        explanation_enabled=False,
         camera_calibration=calibration,
         slam_vocabulary=slam_vocabulary,
     )
@@ -236,7 +273,6 @@ def test_run_sim_mode_uses_runtime_depth_and_monocular_slam(tmp_path: Path) -> N
         open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
         frame_source_factory=lambda *_args, **_kwargs: source,
         overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
-        explanation_worker_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sim mode should not create explanation worker")),
     )
 
     assert detector.calls == 2
@@ -291,3 +327,55 @@ def test_run_sim_mode_does_not_forward_environment_truth_to_open3d_view(tmp_path
     assert source.closed is True
     assert environment_viewer.states == []
     assert environment_viewer.closed is False
+
+
+def test_run_sim_mode_shows_explanation_panel_and_auto_refreshes_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slam_vocabulary, calibration = _write_runtime_files(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        detection_interval=1,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=True,
+        camera_calibration=calibration,
+        slam_vocabulary=slam_vocabulary,
+    )
+    source = _FakeFrameSource([_packet(0.0), _packet(0.5), _packet(1.0)])
+    fake_cv2 = _FakeCV2()
+    detector = _CountingDetector()
+    depth_estimator = _CountingDepthEstimator()
+    slam_bridge_factory = _FakeSlamBridgeFactory()
+    worker = _FakeExplanationWorker()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_kwargs: detector,
+        depth_estimator_factory=lambda **_kwargs: depth_estimator,
+        tracker_factory=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("tracker should not be used")),
+        slam_bridge_factory=slam_bridge_factory,
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: _FakeViewer(),
+        environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+        situation_explainer_factory=lambda **_kwargs: _FakeExplainer(),
+        explanation_worker_factory=lambda **_kwargs: worker,
+        explanation_panel_renderer=lambda **_kwargs: np.zeros((80, 120, 3), dtype=np.uint8),
+    )
+
+    assert "Situation Explanation" in fake_cv2.imshow_calls
+    assert len(worker.submissions) >= 1
+    assert worker.closed is True

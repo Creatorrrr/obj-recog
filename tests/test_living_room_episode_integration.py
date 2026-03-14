@@ -8,13 +8,14 @@ import pytest
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.sim_planner import OpenAILivingRoomPlanner
-from obj_recog.sim_protocol import SensorFrame
+from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, SensorFrame
 from obj_recog.simulation import LivingRoomEpisodeRunner
 
 
 class _StaticSensorBackend:
     def __init__(self) -> None:
         self._frame_index = 0
+        self.commands: list[object] = []
 
     def reset_episode(self, *, scene_spec) -> SensorFrame:
         _ = scene_spec
@@ -22,7 +23,7 @@ class _StaticSensorBackend:
         return self._frame()
 
     def apply_action(self, command) -> SensorFrame:
-        _ = command
+        self.commands.append(command)
         self._frame_index += 1
         return self._frame()
 
@@ -61,6 +62,23 @@ def _artifacts(_packet: FramePacket):
     )()
 
 
+class _FixedPlanner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan(self, *, context) -> ActionSchedule:
+        self.calls += 1
+        return ActionSchedule(
+            steps=(
+                ActionStep(ActionPrimitive.MOVE_FORWARD, 0.5),
+                ActionStep(ActionPrimitive.TURN_LEFT, 12.0),
+            ),
+            rationale="advance carefully toward the visible TV",
+            model="fake-planner",
+            issued_at_frame=context.frame_index,
+        )
+
+
 @pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY is required")
 def test_real_llm_planner_returns_a_valid_schedule_in_episode_loop(tmp_path) -> None:
     planner = OpenAILivingRoomPlanner(model="gpt-5-mini", timeout_sec=10.0)
@@ -91,3 +109,43 @@ def test_real_llm_planner_returns_a_valid_schedule_in_episode_loop(tmp_path) -> 
 
     assert runner.current_schedule is not None
     assert runner.current_schedule.steps
+
+
+def test_episode_runner_executes_only_one_llm_step_before_replanning(tmp_path) -> None:
+    planner = _FixedPlanner()
+    backend = _StaticSensorBackend()
+    runner = LivingRoomEpisodeRunner(
+        config=AppConfig(
+            camera_index=0,
+            width=16,
+            height=12,
+            device="cpu",
+            conf_threshold=0.35,
+            point_stride=1,
+            max_points=128,
+            input_source="sim",
+            sim_headless=True,
+            sim_camera_fps=2.0,
+            sim_action_batch_size=1,
+        ),
+        report_path=tmp_path / "episode_report.json",
+        planner=planner,
+        sensor_backend=backend,
+    )
+
+    for _ in range(6):
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert planner.calls == 1
+    assert len(backend.commands) == 6
+    assert backend.commands[-1].primitive is ActionPrimitive.MOVE_FORWARD
+    assert backend.commands[-1].value == pytest.approx(0.12)
+    assert runner.current_schedule is None
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert planner.calls == 2

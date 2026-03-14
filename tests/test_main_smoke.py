@@ -11,8 +11,16 @@ from obj_recog.frame_source import FramePacket
 from obj_recog.reconstruct import CameraIntrinsics
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
-from obj_recog.main import _load_app_dotenv, _resolve_main_slam_bridge_factory, main, process_frame, run
+from obj_recog.main import (
+    _format_runtime_accel_message,
+    _load_app_dotenv,
+    _resolve_main_slam_bridge_factory,
+    main,
+    process_frame,
+    run,
+)
 from obj_recog.types import Detection, PanopticSegment, SegmentationResult
+from obj_recog.runtime_accel import RuntimeCapabilities
 
 
 class FakeDetector:
@@ -577,6 +585,37 @@ class FakeOpenCamera:
     ) -> CameraSession:
         self.calls.append((preferred_name, force_default))
         return self.sessions.pop(0)
+
+
+def test_format_runtime_accel_message_includes_requested_and_resolved_device() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="auto",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+    )
+    message = _format_runtime_accel_message(
+        config,
+        RuntimeCapabilities(
+            torch_available=True,
+            cuda_available=False,
+            cuda_device_count=0,
+            cuda_device_name=None,
+            torch_cuda_version=None,
+            mps_available=False,
+            tensorrt_available=False,
+            opencv_cuda_available=False,
+        ),
+        effective_device="cpu",
+        effective_precision="fp32",
+    )
+
+    assert "requested_device=auto" in message
+    assert "resolved_device=cpu" in message
+    assert "precision=fp32" in message
 
 
 def test_process_frame_creates_frame_artifacts() -> None:
@@ -1339,6 +1378,7 @@ def test_run_positions_runtime_windows_on_first_show_for_rgb_only_sim_input() ->
         input_source="sim",
         segmentation_mode="off",
         graph_enabled=False,
+        explanation_enabled=False,
     )
     fake_cv2 = FakeCV2(key_sequence=[-1, ord("q")])
     viewer = FakeViewer()
@@ -3007,7 +3047,7 @@ def test_run_updates_explanation_scroll_offset_on_mouse_wheel(
     )
 
     assert scroll_offsets[0] == 0
-    assert scroll_offsets[-1] == 1
+    assert scroll_offsets[-1] == 3
 
 
 def test_run_toggles_depth_debug_level_with_d_key(

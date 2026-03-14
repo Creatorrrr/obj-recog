@@ -17,6 +17,17 @@ From the repo root:
 python -m pip install -e .[dev]
 ```
 
+On Windows with Python 3.12 on x64, the project metadata now pins PyTorch and
+TorchVision to the official CUDA 12.8 wheels, so a fresh install should pick up
+GPU support automatically. On other platforms or Python versions it falls back
+to the default PyPI packages.
+
+You can verify the resolved runtime like this:
+
+```bash
+python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+```
+
 Check the CLI:
 
 ```bash
@@ -36,6 +47,12 @@ PYTHONPATH=src python -m obj_recog.main \
   --depth-profile fast \
   --segmentation-mode panoptic \
   --explanation-mode on
+```
+
+The startup log now shows both the requested and resolved device, for example:
+
+```text
+[obj-recog] runtime accel requested_device=auto resolved_device=cuda precision=fp16 ...
 ```
 
 When running from this repository, the bundled ORB-SLAM3 vocabulary at

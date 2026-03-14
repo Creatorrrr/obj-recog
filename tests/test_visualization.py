@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
+import pytest
 
 from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
@@ -94,6 +95,26 @@ class _FakeRenderOption:
         self.mesh_show_back_face = None
 
 
+class _FakeViewControl:
+    def __init__(self) -> None:
+        self.lookat = None
+        self.front = None
+        self.up = None
+        self.zoom = None
+
+    def set_lookat(self, value) -> None:
+        self.lookat = np.asarray(value, dtype=np.float64)
+
+    def set_front(self, value) -> None:
+        self.front = np.asarray(value, dtype=np.float64)
+
+    def set_up(self, value) -> None:
+        self.up = np.asarray(value, dtype=np.float64)
+
+    def set_zoom(self, value: float) -> None:
+        self.zoom = float(value)
+
+
 class _FakeVisualizer:
     def __init__(self) -> None:
         self.geometry = []
@@ -101,6 +122,7 @@ class _FakeVisualizer:
         self.poll_count = 0
         self.renderer_updates = 0
         self.window_calls: list[dict[str, int | str]] = []
+        self.view_control = _FakeViewControl()
 
     def create_window(self, window_name: str, width: int, height: int, **kwargs) -> bool:
         call = {
@@ -131,6 +153,9 @@ class _FakeVisualizer:
 
     def reset_view_point(self, reset_bounding_box: bool) -> None:
         self.reset_calls.append(reset_bounding_box)
+
+    def get_view_control(self) -> _FakeViewControl:
+        return self.view_control
 
     def destroy_window(self) -> None:
         return None
@@ -828,14 +853,12 @@ def test_render_explanation_panel_renders_status_and_truncates_wrapped_body() ->
         else:
             sys.modules["cv2"] = previous_cv2
 
-        assert panel.shape[0] >= 240
+        assert panel.shape[0] >= 420
         assert fake_cv2.text_calls[0].startswith("Status: READY")
         assert any(text.startswith("Model: gpt-4.1-mini") for text in fake_cv2.text_calls)
         assert any(text.startswith("Latency: 321") for text in fake_cv2.text_calls)
-        body_lines = fake_cv2.text_calls[4:]
-        assert len(body_lines) <= 8
-        if body_lines:
-            assert body_lines[-1].endswith("...") or "불확실성:" in body_lines[-1]
+        footer_lines = [text for text in fake_cv2.text_calls if text.startswith("Wheel: scroll | Lines ")]
+        assert len(footer_lines) <= 1
 
 
 def test_render_explanation_panel_uses_injected_cv2_module() -> None:
@@ -1010,6 +1033,7 @@ def test_render_explanation_panel_supports_scroll_offset_and_returns_layout_meta
     assert metadata["max_scroll_offset"] > 0
     assert metadata["up_rect"] is not None
     assert metadata["down_rect"] is not None
+    assert metadata["scrollbar_rect"] is not None
     assert unicode_calls
     assert unicode_calls[-1][0] == "line 05"
 
@@ -1042,6 +1066,23 @@ def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:
 
     assert viewer._vis.reset_calls == [True]
     assert len(viewer._vis.geometry) == 4
+
+
+def test_open3d_viewer_applies_expected_initial_camera_on_first_mesh() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D())
+    vertices = np.array(
+        [[0.0, 0.0, 1.0], [0.2, 0.0, 1.0], [0.0, 0.2, 1.0], [0.2, 0.2, 1.2]],
+        dtype=np.float32,
+    )
+    triangles = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+    colors = np.array([[1.0, 0.0, 0.0]] * 4, dtype=np.float32)
+
+    viewer.update(vertices, triangles, colors)
+
+    np.testing.assert_allclose(viewer._vis.view_control.lookat, np.array([0.1, -0.1, -1.1]))
+    np.testing.assert_allclose(viewer._vis.view_control.front, np.array([-0.58, 0.48, 0.66]))
+    np.testing.assert_allclose(viewer._vis.view_control.up, np.array([0.0, 1.0, 0.0]))
+    assert viewer._vis.view_control.zoom == pytest.approx(0.68)
 
 
 def test_runtime_window_position_uses_primary_frame_size_grid() -> None:

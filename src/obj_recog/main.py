@@ -55,6 +55,27 @@ def _default_debug_log(message: str) -> None:
     print(f"[obj-recog] {message}", file=sys.stderr, flush=True)
 
 
+def _format_runtime_accel_message(
+    config: AppConfig,
+    runtime_capabilities,
+    *,
+    effective_device: str,
+    effective_precision: str,
+) -> str:
+    return (
+        "runtime accel "
+        f"requested_device={config.device} resolved_device={effective_device} "
+        f"precision={effective_precision} "
+        f"torch_cuda={runtime_capabilities.cuda_available} "
+        f"opencv_cuda={runtime_capabilities.opencv_cuda_available} "
+        f"tensorrt={runtime_capabilities.tensorrt_available} "
+        f"detector_backend={config.detector_backend} "
+        f"depth_backend={config.depth_backend} "
+        f"segmentation_backend={config.segmentation_backend} "
+        f"sim_render_backend={config.sim_render_backend}"
+    )
+
+
 def resize_for_inference(
     frame_bgr: np.ndarray,
     inference_width: int,
@@ -779,15 +800,12 @@ def run(
     effective_precision = resolve_precision(config.precision, effective_device)
     depth_profile = resolve_depth_profile(config.depth_profile)
     debug_log(
-        "runtime accel "
-        f"device={effective_device} precision={effective_precision} "
-        f"torch_cuda={runtime_capabilities.cuda_available} "
-        f"opencv_cuda={runtime_capabilities.opencv_cuda_available} "
-        f"tensorrt={runtime_capabilities.tensorrt_available} "
-        f"detector_backend={config.detector_backend} "
-        f"depth_backend={config.depth_backend} "
-        f"segmentation_backend={config.segmentation_backend} "
-        f"sim_render_backend={config.sim_render_backend}"
+        _format_runtime_accel_message(
+            config,
+            runtime_capabilities,
+            effective_device=effective_device,
+            effective_precision=effective_precision,
+        )
     )
     camera_session: CameraSession | None = None
     viewer = None
@@ -798,7 +816,10 @@ def run(
     scene_graph_memory = None
     calibration = None
     runtime_settings_path = config.camera_calibration
-    sim_explanation_enabled = bool(config.explanation_enabled and config.input_source != "sim")
+    explanation_api_key = os.getenv("OPENAI_API_KEY")
+    sim_explanation_enabled = bool(
+        config.explanation_enabled and (config.input_source != "sim" or bool(explanation_api_key))
+    )
     explanation_status = (
         ExplanationStatus.IDLE if sim_explanation_enabled else None
     )
@@ -813,7 +834,7 @@ def run(
     latest_explanation_request_id: int | None = None
     latest_explanation_timestamp = "-"
     explanation_refresh_status = "idle"
-    explanation_auto_refresh_enabled = False
+    explanation_auto_refresh_enabled = bool(config.input_source == "sim" and sim_explanation_enabled)
     last_explanation_request_time: float | None = None
     positioned_runtime_windows: set[str] = set()
     explanation_button_state = {
@@ -895,7 +916,7 @@ def run(
             step_count = max(1, abs(int(delta)) // 120) if abs(int(delta)) >= 120 else 1
             direction = -1 if delta > 0 else 1
             explanation_panel_state["pending_scroll"] = int(explanation_panel_state["pending_scroll"]) + (
-                direction * step_count
+                direction * step_count * 3
             )
 
     def _submit_explanation_request(
@@ -1119,7 +1140,7 @@ def run(
             except Exception as exc:
                 debug_log(f"segmentation disabled ({exc})")
         if sim_explanation_enabled:
-            api_key = os.getenv("OPENAI_API_KEY")
+            api_key = explanation_api_key
             if not api_key:
                 explanation_status = ExplanationStatus.DISABLED
             else:
@@ -1147,7 +1168,7 @@ def run(
                     debug_log(f"explanation disabled ({exc})")
         if validation_probe is not None and hasattr(validation_probe, "on_start"):
             validation_probe.on_start(
-                explanation_api_available=bool(sim_explanation_enabled and os.getenv("OPENAI_API_KEY"))
+                explanation_api_available=bool(sim_explanation_enabled and explanation_api_key)
             )
         tracker = None
         if use_slam_bridge:

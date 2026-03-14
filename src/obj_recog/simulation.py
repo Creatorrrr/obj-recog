@@ -131,7 +131,7 @@ class LivingRoomEpisodeRunner:
         self._current_schedule: ActionSchedule | None = None
         self._latest_planner_context = None
         self._closed = False
-        self._finalized = False
+        self._executed_schedule_steps = 0
         self._write_selfcalibration_artifact()
         self._write_planner_turns_artifact()
         self._write_episode_report()
@@ -162,6 +162,71 @@ class LivingRoomEpisodeRunner:
             return 6.0
         return None
 
+    @staticmethod
+    def _normalize_label(label: object) -> str:
+        return str(label or "").strip().lower().replace(" ", "_")
+
+    @classmethod
+    def _label_matches_target(cls, *, detection_label: object, target_label: str) -> bool:
+        normalized_detection = cls._normalize_label(detection_label)
+        normalized_target = cls._normalize_label(target_label)
+        if not normalized_detection or not normalized_target:
+            return False
+        return (
+            normalized_detection == normalized_target
+            or normalized_target in normalized_detection
+            or normalized_detection in normalized_target
+        )
+
+    @staticmethod
+    def _bbox_depth_m(depth_map: np.ndarray, xyxy: tuple[int, int, int, int]) -> float | None:
+        depth = np.asarray(depth_map, dtype=np.float32)
+        if depth.ndim != 2 or depth.size == 0:
+            return None
+        height, width = depth.shape[:2]
+        x1, y1, x2, y2 = (int(value) for value in xyxy)
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(x1 + 1, min(width, x2))
+        y2 = max(y1 + 1, min(height, y2))
+        crop = depth[y1:y2, x1:x2]
+        valid = np.isfinite(crop) & (crop > 0.05)
+        if not np.any(valid):
+            return None
+        return float(np.nanmedian(crop[valid]))
+
+    def _goal_visually_reached(self, *, artifacts) -> bool:
+        target_label = getattr(self._scene_spec, "semantic_target_class", "")
+        detections = list(getattr(artifacts, "detections", []) or [])
+        depth_map = np.asarray(getattr(artifacts, "depth_map", np.empty((0, 0))), dtype=np.float32)
+        frame_shape = np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape
+        if len(frame_shape) < 2:
+            return False
+        frame_height, frame_width = int(frame_shape[0]), int(frame_shape[1])
+        if frame_height <= 0 or frame_width <= 0:
+            return False
+
+        for detection in detections:
+            if not self._label_matches_target(
+                detection_label=getattr(detection, "label", ""),
+                target_label=target_label,
+            ):
+                continue
+            x1, y1, x2, y2 = (int(value) for value in getattr(detection, "xyxy", (0, 0, 0, 0)))
+            bbox_width = max(1, x2 - x1)
+            bbox_height = max(1, y2 - y1)
+            area_ratio = float(bbox_width * bbox_height) / float(max(1, frame_width * frame_height))
+            bbox_center_x = x1 + (bbox_width * 0.5)
+            center_offset_ratio = abs(bbox_center_x - (frame_width * 0.5)) / float(max(1.0, frame_width * 0.5))
+            median_depth_m = self._bbox_depth_m(depth_map, (x1, y1, x2, y2))
+            if median_depth_m is not None:
+                if median_depth_m <= 2.5 and area_ratio >= 0.08 and center_offset_ratio <= 0.35:
+                    return True
+                continue
+            if area_ratio >= 0.22 and center_offset_ratio <= 0.25:
+                return True
+        return False
+
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
         _ = timeout_sec
         if self._closed or self._latest_sensor_frame is None:
@@ -180,8 +245,8 @@ class LivingRoomEpisodeRunner:
         _ = frame_packet
         if self._closed or self._latest_sensor_frame is None:
             return
-        if self._budget_exhausted():
-            self._mark_offline_completed()
+        if self._goal_visually_reached(artifacts=artifacts):
+            self._mark_goal_completed()
             return
 
         next_command = self._select_next_command(artifacts=artifacts)
@@ -191,8 +256,6 @@ class LivingRoomEpisodeRunner:
         self._write_selfcalibration_artifact()
         self._write_planner_turns_artifact()
         self._write_episode_report()
-        if self._budget_exhausted():
-            self._mark_offline_completed()
 
     def close(self) -> None:
         self._closed = True
@@ -201,17 +264,11 @@ class LivingRoomEpisodeRunner:
             backend_close()
         self._write_episode_report()
 
-    def _budget_exhausted(self) -> bool:
-        return (
-            self._state.elapsed_sec >= float(self._config.eval_budget_sec)
-            or self._state.frame_index >= int(self._config.sim_max_steps)
-        )
-
-    def _mark_offline_completed(self) -> None:
-        self._state.phase = EpisodePhase.FAILED
+    def _mark_goal_completed(self) -> None:
+        self._state.mission_succeeded = True
+        self._state.phase = EpisodePhase.SUCCEEDED
         self._latest_sensor_frame = None
         self._write_episode_report()
-        self._finalized = True
 
     def _select_next_command(self, *, artifacts) -> UnityActionCommand:
         if self._state.phase == EpisodePhase.SELF_CALIBRATING:
@@ -257,8 +314,25 @@ class LivingRoomEpisodeRunner:
             ),
             tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
         )
-        schedule = self._planner.plan(context=context)
+        try:
+            schedule = self._planner.plan(context=context)
+        except Exception as exc:
+            schedule = ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                rationale=f"planner unavailable; pause and reassess ({exc})",
+                model="planner_error",
+                issued_at_frame=self._state.frame_index,
+            )
         self._latest_planner_context = context
+        max_schedule_steps = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
+        truncated_steps = tuple(schedule.steps[:max_schedule_steps])
+        if truncated_steps != schedule.steps:
+            schedule = ActionSchedule(
+                steps=truncated_steps,
+                rationale=schedule.rationale,
+                model=schedule.model,
+                issued_at_frame=schedule.issued_at_frame,
+            )
         if not schedule.steps:
             schedule = ActionSchedule(
                 steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
@@ -268,6 +342,7 @@ class LivingRoomEpisodeRunner:
             )
         self._current_schedule = schedule
         self._state.schedule_cursor = 0
+        self._executed_schedule_steps = 0
         self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
         self._state.planner_turn_count += 1
         self._planner_turn_logs.append(
@@ -289,9 +364,20 @@ class LivingRoomEpisodeRunner:
     def _consume_schedule_step(self) -> ActionStep:
         step = self._next_tracking_safe_step()
         if step is None:
+            self._current_schedule = None
+            self._executed_schedule_steps = 0
             self._state.phase = EpisodePhase.REASSESS
             return ActionStep(ActionPrimitive.PAUSE, 0.5)
+        self._executed_schedule_steps += 1
+        max_schedule_steps = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
         if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
+            self._current_schedule = None
+            self._executed_schedule_steps = 0
+            self._state.phase = EpisodePhase.REASSESS
+        elif self._executed_schedule_steps >= max_schedule_steps:
+            self._current_schedule = None
+            self._state.schedule_cursor = 0
+            self._executed_schedule_steps = 0
             self._state.phase = EpisodePhase.REASSESS
         else:
             self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
@@ -364,7 +450,7 @@ class LivingRoomEpisodeRunner:
     def _write_episode_report(self) -> None:
         report = EpisodeReport(
             scenario_id=self._scene_spec.scene_id,
-            success=None,
+            success=True if self._state.mission_succeeded else None,
             final_phase=self._state.phase,
             total_frames=int(self._state.frame_index),
             planner_turns=int(self._state.planner_turn_count),

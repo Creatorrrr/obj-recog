@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, Percep
 _RUNTIME_WINDOW_MARGIN_X = 32
 _RUNTIME_WINDOW_MARGIN_Y = 48
 _RUNTIME_WINDOW_GAP = 32
+_WINDOWS_FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 
 
 def _display_points_for_view(points_xyz: np.ndarray) -> np.ndarray:
@@ -51,6 +53,11 @@ def _draw_rectangle(cv2, canvas: np.ndarray, pt1: tuple[int, int], pt2: tuple[in
 
 def _find_unicode_font_path() -> str | None:
     candidates = [
+        _WINDOWS_FONT_DIR / "malgun.ttf",
+        _WINDOWS_FONT_DIR / "malgunbd.ttf",
+        _WINDOWS_FONT_DIR / "malgunsl.ttf",
+        _WINDOWS_FONT_DIR / "gulim.ttc",
+        _WINDOWS_FONT_DIR / "batang.ttc",
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
         "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -59,8 +66,9 @@ def _find_unicode_font_path() -> str | None:
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ]
     for candidate in candidates:
-        if Path(candidate).is_file():
-            return candidate
+        candidate_path = Path(candidate)
+        if candidate_path.is_file():
+            return str(candidate_path)
     return None
 
 
@@ -213,45 +221,86 @@ def _draw_explanation_button(
     )
 
 
-def explanation_panel_scroll_button_rects(
+def explanation_panel_scrollbar_geometry(
     *,
     panel_width: int,
-    panel_height: int,
+    body_top: int,
+    body_bottom: int,
+    total_line_count: int,
+    visible_line_count: int,
+    scroll_offset: int,
     margin: int = 16,
-    button_width: int = 44,
-    button_height: int = 34,
-    top_y: int = 78,
-) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
-    x2 = max(margin, int(panel_width) - margin)
-    x1 = max(0, x2 - int(button_width))
-    up_rect = (x1, int(top_y), x2, int(top_y) + int(button_height))
-    down_rect = (
-        x1,
-        max(int(top_y) + int(button_height) + margin, int(panel_height) - margin - int(button_height)),
-        x2,
-        max(int(top_y) + int(button_height) + margin, int(panel_height) - margin - int(button_height))
-        + int(button_height),
+    track_width: int = 14,
+    min_thumb_height: int = 44,
+) -> dict[str, tuple[int, int, int, int]] | None:
+    max_scroll_offset = max(0, int(total_line_count) - int(visible_line_count))
+    if max_scroll_offset <= 0:
+        return None
+
+    track_x2 = max(margin, int(panel_width) - margin)
+    track_x1 = max(0, track_x2 - int(track_width))
+    track_y1 = int(body_top)
+    track_y2 = max(track_y1 + int(min_thumb_height), int(body_bottom))
+    track_height = max(1, track_y2 - track_y1)
+    thumb_height = max(
+        int(min_thumb_height),
+        int(round(track_height * (float(visible_line_count) / max(1.0, float(total_line_count))))),
     )
-    return up_rect, down_rect
+    thumb_height = min(track_height, thumb_height)
+    max_thumb_offset = max(0, track_height - thumb_height)
+    thumb_offset = (
+        0
+        if max_scroll_offset <= 0
+        else int(round((float(scroll_offset) / float(max_scroll_offset)) * float(max_thumb_offset)))
+    )
+    thumb_y1 = track_y1 + thumb_offset
+    thumb_y2 = min(track_y2, thumb_y1 + thumb_height)
+
+    return {
+        "track_rect": (track_x1, track_y1, track_x2, track_y2),
+        "thumb_rect": (track_x1, thumb_y1, track_x2, thumb_y2),
+        "up_rect": (track_x1, track_y1, track_x2, thumb_y1),
+        "down_rect": (track_x1, thumb_y2, track_x2, track_y2),
+    }
 
 
-def _draw_panel_scroll_button(cv2, canvas: np.ndarray, rect: tuple[int, int, int, int], label: str) -> None:
-    x1, y1, x2, y2 = rect
-    _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), (45, 55, 75), -1)
-    _draw_rectangle(cv2, canvas, (x1, y1), (x2, y2), (100, 120, 165), 1)
-    text_width, text_height = _measure_text(cv2, label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    text_x = max(x1 + 6, x1 + ((x2 - x1 - text_width) // 2))
-    text_y = y1 + ((y2 - y1 + text_height) // 2)
-    cv2.putText(
-        canvas,
-        label,
-        (text_x, text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (235, 240, 255),
-        1,
-        cv2.LINE_AA,
-    )
+def _draw_panel_scrollbar(
+    cv2,
+    canvas: np.ndarray,
+    *,
+    track_rect: tuple[int, int, int, int],
+    thumb_rect: tuple[int, int, int, int],
+) -> None:
+    track_x1, track_y1, track_x2, track_y2 = track_rect
+    thumb_x1, thumb_y1, thumb_x2, thumb_y2 = thumb_rect
+    _draw_rectangle(cv2, canvas, (track_x1, track_y1), (track_x2, track_y2), (35, 42, 56), -1)
+    _draw_rectangle(cv2, canvas, (track_x1, track_y1), (track_x2, track_y2), (78, 92, 120), 1)
+    _draw_rectangle(cv2, canvas, (thumb_x1, thumb_y1), (thumb_x2, thumb_y2), (105, 140, 205), -1)
+    _draw_rectangle(cv2, canvas, (thumb_x1, thumb_y1), (thumb_x2, thumb_y2), (190, 215, 255), 1)
+
+
+def _apply_open3d_view_control(
+    control,
+    *,
+    lookat: np.ndarray,
+    front: np.ndarray,
+    up: np.ndarray,
+    zoom: float,
+) -> None:
+    if control is None:
+        return
+    set_lookat = getattr(control, "set_lookat", None)
+    set_front = getattr(control, "set_front", None)
+    set_up = getattr(control, "set_up", None)
+    set_zoom = getattr(control, "set_zoom", None)
+    if callable(set_lookat):
+        set_lookat(np.asarray(lookat, dtype=np.float64))
+    if callable(set_front):
+        set_front(np.asarray(front, dtype=np.float64))
+    if callable(set_up):
+        set_up(np.asarray(up, dtype=np.float64))
+    if callable(set_zoom):
+        set_zoom(float(zoom))
 
 
 def _draw_segmentation_legend(cv2, canvas: np.ndarray, segments: list[PanopticSegment]) -> None:
@@ -570,7 +619,7 @@ def render_explanation_panel(
     timestamp_label: str,
     refresh_status: str = "idle",
     width: int = 960,
-    height: int = 360,
+    height: int = 480,
     scroll_offset: int = 0,
     cv2_module=None,
     unicode_text_renderer=render_multiline_unicode_text,
@@ -578,14 +627,14 @@ def render_explanation_panel(
 ) -> np.ndarray | tuple[np.ndarray, dict[str, object]]:
     cv2 = load_cv2(cv2_module)
 
-    canvas = np.zeros((max(320, height), max(720, width), 3), dtype=np.uint8)
+    canvas = np.zeros((max(420, height), max(720, width), 3), dtype=np.uint8)
     header_lines = [
         f"Status: {str(status).upper()} | {timestamp_label}",
         f"Refresh: {str(refresh_status)}",
         f"Model: {model}",
         f"Latency: {'-' if latency_ms is None else int(round(latency_ms))}ms",
     ]
-    reserved_scroll_width = 84
+    reserved_scroll_width = 54
     wrap_width = max(56, int((canvas.shape[1] - reserved_scroll_width) / 13))
     body_lines = wrap_explanation_text(text, width=wrap_width, max_lines=None)
     if not body_lines:
@@ -620,35 +669,46 @@ def render_explanation_panel(
     body_left = 16
     body_top = y - 12
     line_height = 22
-    body_bottom = canvas.shape[0] - 20
+    footer_y = canvas.shape[0] - 14
+    body_bottom = canvas.shape[0] - 42
     visible_line_count = max(4, int((body_bottom - body_top) // line_height))
     max_scroll_offset = max(0, len(body_lines) - visible_line_count)
     used_scroll_offset = min(max(0, int(scroll_offset)), max_scroll_offset)
     visible_lines = body_lines[used_scroll_offset : used_scroll_offset + visible_line_count]
 
-    up_rect, down_rect = explanation_panel_scroll_button_rects(
+    scrollbar_geometry = explanation_panel_scrollbar_geometry(
         panel_width=canvas.shape[1],
-        panel_height=canvas.shape[0],
+        body_top=body_top,
+        body_bottom=body_bottom,
+        total_line_count=len(body_lines),
+        visible_line_count=visible_line_count,
+        scroll_offset=used_scroll_offset,
     )
     if max_scroll_offset > 0:
-        _draw_panel_scroll_button(cv2, canvas, up_rect, "UP")
-        _draw_panel_scroll_button(cv2, canvas, down_rect, "DN")
-        scroll_text = (
-            f"Lines {used_scroll_offset + 1}-{used_scroll_offset + len(visible_lines)}/{len(body_lines)}"
+        assert scrollbar_geometry is not None
+        _draw_panel_scrollbar(
+            cv2,
+            canvas,
+            track_rect=scrollbar_geometry["track_rect"],
+            thumb_rect=scrollbar_geometry["thumb_rect"],
         )
+        scroll_text = f"Wheel: scroll | Lines {used_scroll_offset + 1}-{used_scroll_offset + len(visible_lines)}/{len(body_lines)}"
         cv2.putText(
             canvas,
             scroll_text,
-            (16, min(canvas.shape[0] - 10, body_bottom + 4)),
+            (16, footer_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
             (170, 185, 210),
             1,
             cv2.LINE_AA,
         )
+        up_rect = scrollbar_geometry["up_rect"]
+        down_rect = scrollbar_geometry["down_rect"]
     else:
         up_rect = None
         down_rect = None
+        scrollbar_geometry = None
 
     body_origin = (body_left, body_top)
     rendered = unicode_text_renderer(
@@ -678,6 +738,7 @@ def render_explanation_panel(
                 "visible_line_count": visible_line_count,
                 "up_rect": up_rect,
                 "down_rect": down_rect,
+                "scrollbar_rect": None if scrollbar_geometry is None else scrollbar_geometry["track_rect"],
             }
         return canvas
     if return_metadata:
@@ -687,6 +748,7 @@ def render_explanation_panel(
             "visible_line_count": visible_line_count,
             "up_rect": up_rect,
             "down_rect": down_rect,
+            "scrollbar_rect": None if scrollbar_geometry is None else scrollbar_geometry["track_rect"],
         }
     return rendered
 
@@ -1227,20 +1289,13 @@ class Open3DEnvironmentViewer:
             get_view_control = getattr(self._vis, "get_view_control", None)
             if callable(get_view_control):
                 control = get_view_control()
-                if control is not None:
-                    set_lookat = getattr(control, "set_lookat", None)
-                    set_front = getattr(control, "set_front", None)
-                    set_up = getattr(control, "set_up", None)
-                    set_zoom = getattr(control, "set_zoom", None)
-                    scene_center_display = np.array([0.0, 1.1, 0.0], dtype=np.float64)
-                    if callable(set_lookat):
-                        set_lookat(scene_center_display)
-                    if callable(set_front):
-                        set_front(np.array([0.52, -0.26, -0.81], dtype=np.float64))
-                    if callable(set_up):
-                        set_up(np.array([0.0, 1.0, 0.0], dtype=np.float64))
-                    if callable(set_zoom):
-                        set_zoom(0.72)
+                _apply_open3d_view_control(
+                    control,
+                    lookat=np.array([0.0, 1.1, 0.0], dtype=np.float64),
+                    front=np.array([0.52, -0.26, -0.81], dtype=np.float64),
+                    up=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                    zoom=0.72,
+                )
             self._has_fitted_view = True
         is_active = self._vis.poll_events()
         self._vis.update_renderer()
@@ -1331,6 +1386,19 @@ class Open3DMeshViewer:
         self._update_scene_graph(scene_graph_snapshot)
         if not self._has_fitted_view and display_vertices_xyz.size > 0 and mesh_triangles.size > 0:
             self._vis.reset_view_point(True)
+            get_view_control = getattr(self._vis, "get_view_control", None)
+            if callable(get_view_control):
+                control = get_view_control()
+                bounds_min = display_vertices_xyz.min(axis=0)
+                bounds_max = display_vertices_xyz.max(axis=0)
+                mesh_center_display = ((bounds_min + bounds_max) * 0.5).astype(np.float64, copy=False)
+                _apply_open3d_view_control(
+                    control,
+                    lookat=mesh_center_display,
+                    front=np.array([-0.58, 0.48, 0.66], dtype=np.float64),
+                    up=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                    zoom=0.68,
+                )
             self._has_fitted_view = True
         is_active = self._vis.poll_events()
         self._vis.update_renderer()

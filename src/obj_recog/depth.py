@@ -142,11 +142,14 @@ class DepthEstimator:
         else:
             self._model.to(device)
         self._model.eval()
+        self._eager_model = self._model
+        self._compiled_model_active = False
         self._autocast_enabled = self._use_cuda and self._precision == "fp16"
         compile_model = getattr(torch, "compile", None)
         if self._use_cuda and self._backend == "torch" and callable(compile_model):
             try:
                 self._model = compile_model(self._model, mode="reduce-overhead")
+                self._compiled_model_active = True
             except Exception as exc:
                 self._debug_log(f"depth compile disabled ({exc})")
         self._warmup()
@@ -168,7 +171,7 @@ class DepthEstimator:
 
         with self._torch.inference_mode():
             with self._autocast():
-                prediction = self._model(input_batch)
+                prediction = self._run_model(input_batch)
                 prediction = self._torch.nn.functional.interpolate(
                     prediction.unsqueeze(1),
                     size=rgb.shape[:2],
@@ -230,13 +233,35 @@ class DepthEstimator:
             dummy = dummy.to(memory_format=self._torch.channels_last)
             with self._torch.inference_mode():
                 with self._autocast():
-                    warm = self._model(dummy)
+                    warm = self._run_model(dummy)
                     _ = warm.shape
             synchronize = getattr(self._torch.cuda, "synchronize", None)
             if callable(synchronize):
                 synchronize()
         except Exception as exc:
             self._debug_log(f"depth warmup skipped ({exc})")
+
+    def _run_model(self, input_batch):
+        try:
+            return self._model(input_batch)
+        except Exception as exc:
+            if self._compiled_model_active and self._should_disable_compiled_model(exc):
+                self._debug_log(f"depth compile fallback to eager ({exc})")
+                self._model = self._eager_model
+                self._compiled_model_active = False
+                return self._model(input_batch)
+            raise
+
+    @staticmethod
+    def _should_disable_compiled_model(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if exc.__class__.__name__ == "TritonMissing":
+            return True
+        return (
+            "triton" in message
+            or "inductor" in message
+            or "backend compiler failed" in message
+        )
 
     def _autocast(self):
         if self._autocast_enabled:

@@ -22,6 +22,7 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert config.input_source == "live"
+    assert config.device == "auto"
     assert config.scenario == "living_room_navigation_v1"
     assert config.sim_planner_model == "gpt-5-mini"
     assert config.sim_planner_timeout_sec == pytest.approx(8.0)

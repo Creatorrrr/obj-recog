@@ -16,9 +16,11 @@ dependencies = [
   "python-dotenv",
   "scipy",
   "timm",
-  "torch",
+  "torch @ https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-win_amd64.whl ; platform_system == 'Windows' and platform_machine == 'AMD64' and python_version >= '3.12' and python_version < '3.13'",
+  "torch ; not (platform_system == 'Windows' and platform_machine == 'AMD64' and python_version >= '3.12' and python_version < '3.13')",
   "transformers",
-  "torchvision",
+  "torchvision @ https://download.pytorch.org/whl/cu128/torchvision-0.25.0%2Bcu128-cp312-cp312-win_amd64.whl ; platform_system == 'Windows' and platform_machine == 'AMD64' and python_version >= '3.12' and python_version < '3.13'",
+  "torchvision ; not (platform_system == 'Windows' and platform_machine == 'AMD64' and python_version >= '3.12' and python_version < '3.13')",
   "ultralytics",
 ]
 

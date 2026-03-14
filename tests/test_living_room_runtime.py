@@ -89,6 +89,32 @@ def _artifacts(_packet: FramePacket):
     )()
 
 
+def _goal_artifacts(_packet: FramePacket):
+    return type(
+        "Artifacts",
+        (),
+        {
+            "frame_bgr": np.full((12, 16, 3), 120, dtype=np.uint8),
+            "detections": [
+                type(
+                    "Det",
+                    (),
+                    {
+                        "label": "tv",
+                        "xyxy": (1, 1, 15, 11),
+                        "confidence": 0.92,
+                    },
+                )()
+            ],
+            "segments": [],
+            "scene_graph_snapshot": None,
+            "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
+            "depth_map": np.full((12, 16), 1.6, dtype=np.float32),
+            "slam_tracking_state": "TRACKING",
+        },
+    )()
+
+
 def test_living_room_runtime_self_calibrates_before_first_planner_turn(tmp_path: Path) -> None:
     planner = _FakePlanner(
         [
@@ -138,10 +164,8 @@ def test_living_room_runtime_recovers_from_empty_schedule_with_pause_fallback(tm
         assert packet is not None
         runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
 
-    assert runner.current_schedule is not None
-    assert runner.current_schedule.steps
-    assert runner.current_schedule.steps[0].primitive == ActionPrimitive.PAUSE
     assert ("pause", 0.5) in backend.apply_calls
+    assert runner.current_phase in {EpisodePhase.EXECUTING_SCHEDULE, EpisodePhase.REASSESS}
 
 
 def test_living_room_runtime_writes_rgb_only_episode_artifacts(tmp_path: Path) -> None:
@@ -163,6 +187,44 @@ def test_living_room_runtime_writes_rgb_only_episode_artifacts(tmp_path: Path) -
     assert report_payload["success"] is None
     assert report_payload["offline_evaluation_required"] is True
     assert report_payload["sim_interface_mode"] == "rgb_only"
+
+
+def test_living_room_runtime_marks_success_when_tv_is_visually_reached(tmp_path: Path) -> None:
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_goal_artifacts(packet))
+
+    report_payload = json.loads((tmp_path / "episode_report.json").read_text(encoding="utf-8"))
+    assert runner.next_frame() is None
+    assert report_payload["success"] is True
+    assert report_payload["final_phase"] == EpisodePhase.SUCCEEDED.value
+
+
+def test_living_room_runtime_does_not_fail_early_when_soft_budgets_are_small(tmp_path: Path) -> None:
+    runner = LivingRoomEpisodeRunner(
+        config=_config(eval_budget_sec=0.1, sim_max_steps=1),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=_FakeSensorBackend(),
+    )
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    report_payload = json.loads((tmp_path / "episode_report.json").read_text(encoding="utf-8"))
+    assert runner.next_frame() is not None
+    assert report_payload["final_phase"] != EpisodePhase.FAILED.value
+    assert report_payload["success"] is None
 
 
 def test_living_room_runtime_chunks_large_schedule_steps_into_tracking_safe_substeps(tmp_path: Path) -> None:

@@ -360,7 +360,10 @@ namespace ObjRecog.UnitySim
             Vector3 goalPosition = FlattenToGround(televisionPosition + (roomFacingDirection * goalStandOffM), groundHeight);
             Vector3 spawnPosition = ResolveTelevisionSpawnPosition(television, livingRoomRoot, roomFacingDirection, groundHeight);
             spawnAnchor.position = spawnPosition;
-            spawnAnchor.rotation = LookToward(spawnPosition, televisionPosition);
+            spawnAnchor.rotation = LookToward(
+                spawnPosition,
+                ResolveTelevisionSpawnLookTarget(livingRoomRoot, televisionPosition, spawnPosition)
+            );
             goalAnchor.position = goalPosition;
             goalAnchor.rotation = LookToward(goalPosition, televisionPosition);
             return true;
@@ -655,6 +658,9 @@ namespace ObjRecog.UnitySim
                 "Lamp_Floor_01",
                 "Table_Side_Apt_01",
             };
+            float[] anchorOffsets = { 0.55f, 0.2f, -0.15f };
+            Transform bestAnchor = null;
+            float bestAnchorDistanceSq = float.NegativeInfinity;
 
             for (int anchorIndex = 0; anchorIndex < farRoomAnchorPrefixes.Length; anchorIndex++)
             {
@@ -673,10 +679,35 @@ namespace ObjRecog.UnitySim
                         continue;
                     }
 
-                    Vector3 candidate = FlattenToGround(anchor.position + (towardTv * 0.7f), groundHeight);
-                    if (!IsPlacementBlocked(candidate))
+                    Vector3 awayFromTv = -towardTv;
+                    float distanceSq = (anchor.position - television.position).sqrMagnitude;
+                    if (distanceSq > bestAnchorDistanceSq)
                     {
-                        return candidate;
+                        bestAnchorDistanceSq = distanceSq;
+                        bestAnchor = anchor;
+                    }
+
+                    for (int offsetIndex = 0; offsetIndex < anchorOffsets.Length; offsetIndex++)
+                    {
+                        float offset = anchorOffsets[offsetIndex];
+                        Vector3 candidate = FlattenToGround(anchor.position + (awayFromTv * offset), groundHeight);
+                        if (!IsPlacementBlocked(candidate))
+                        {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+
+            if (bestAnchor != null)
+            {
+                Vector3 awayFromTv = FlattenDirection(bestAnchor.position - television.position);
+                if (awayFromTv.sqrMagnitude > 0.001f)
+                {
+                    Vector3 bestAnchorCandidate = FlattenToGround(bestAnchor.position + (awayFromTv * 0.35f), groundHeight);
+                    if (!IsPlacementBlocked(bestAnchorCandidate))
+                    {
+                        return bestAnchorCandidate;
                     }
                 }
             }
@@ -798,6 +829,39 @@ namespace ObjRecog.UnitySim
             }
 
             return null;
+        }
+
+        private Vector3 ResolveTelevisionSpawnLookTarget(Transform livingRoomRoot, Vector3 televisionPosition, Vector3 spawnPosition)
+        {
+            if (Mathf.Abs(spawnPosition.x - televisionPosition.x) > 1.0f)
+            {
+                return new Vector3(televisionPosition.x, spawnPosition.y, spawnPosition.z);
+            }
+
+            string[] lookTargetPrefixes =
+            {
+                "Coffee_Table_Apt_01",
+                "Rug_Apt_01",
+                "Sofa_Apt_01",
+            };
+
+            for (int index = 0; index < lookTargetPrefixes.Length; index++)
+            {
+                Transform target = FindNamedTransformInSubtree(livingRoomRoot, lookTargetPrefixes[index]);
+                if (target == null)
+                {
+                    continue;
+                }
+
+                Vector3 horizontalDelta = target.position - spawnPosition;
+                horizontalDelta.y = 0.0f;
+                if (horizontalDelta.sqrMagnitude > 0.25f)
+                {
+                    return target.position;
+                }
+            }
+
+            return televisionPosition;
         }
 
         private Transform[] FindNamedTransformsInSubtree(Transform root, string prefix)
