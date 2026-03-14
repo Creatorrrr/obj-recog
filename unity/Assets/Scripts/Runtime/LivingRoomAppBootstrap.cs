@@ -185,6 +185,7 @@ namespace ObjRecog.UnitySim
 
             if (bootMode.Mode == SimulatorBootMode.Agent)
             {
+                Application.runInBackground = true;
                 manualInput.EnableManualMode(false);
                 Cursor.lockState = CursorLockMode.Locked;
                 Cursor.visible = false;
@@ -195,6 +196,7 @@ namespace ObjRecog.UnitySim
             }
 
             agentServer.StopServer();
+            Application.runInBackground = false;
             manualInput.EnableManualMode(true);
             sessionState.ResetEpisode();
             sessionState.ShowTransientStatus("Manual mode ready", 3.0f);

@@ -445,6 +445,7 @@ def _build_unity_rgb_sensor_backend(
         else UnityRgbClient(
             host=str(config.unity_host),
             port=int(config.unity_port),
+            timeout_sec=30.0,
             unity_player_path=config.unity_player_path,
         )
     )
