@@ -36,13 +36,14 @@ def test_living_room_scene_places_hidden_goal_in_front_of_tv() -> None:
     assert math.isclose(float(goal[2]) - tv_panel.center_xyz[2], 1.25, rel_tol=0.0, abs_tol=1e-6)
 
 
-def test_living_room_scene_targets_tv_from_central_start_area() -> None:
+def test_living_room_scene_targets_tv_from_far_side_of_same_room() -> None:
     scene = build_living_room_scene_spec()
 
     assert scene.semantic_target_class == "tv"
     assert "TV" in scene.goal_description
-    assert abs(scene.start_pose.x) <= 0.6
-    assert abs(scene.start_pose.z) <= 0.6
+    assert math.isclose(scene.start_pose.x, 2.15, rel_tol=0.0, abs_tol=1e-6)
+    assert scene.start_pose.z > 1.8
+    assert scene.start_pose.yaw_deg == 180.0
 
 
 def test_living_room_scene_builds_multi_component_furniture() -> None:

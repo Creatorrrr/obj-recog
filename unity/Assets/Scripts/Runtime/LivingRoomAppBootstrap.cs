@@ -32,14 +32,14 @@ namespace ObjRecog.UnitySim
         [SerializeField] private float cameraNearClipM = 0.2f;
         [SerializeField] private float cameraFarClipM = 120.0f;
         [SerializeField] private float goalStandOffM = 1.25f;
-        [SerializeField] private float spawnStandOffM = 3.1f;
+        [SerializeField] private float spawnStandOffM = 5.4f;
         [SerializeField] private float runtimeGroundHeightM = 0.05f;
         [SerializeField] private float characterRadiusM = 0.28f;
         [SerializeField] private float characterHeightM = 1.55f;
         [SerializeField] private bool autoRebuildInEditor = true;
         [SerializeField] private bool disableVendorInteractions = true;
         [SerializeField] private string preferredTelevisionPrefix = "TV_Apt_01";
-        [SerializeField] private Vector3 fallbackSpawnPosition = new Vector3(27.084f, 12.1f, 1.72f);
+        [SerializeField] private Vector3 fallbackSpawnPosition = new Vector3(27.084f, 12.1f, 2.35f);
         [SerializeField] private Vector3 fallbackSpawnEulerAngles = new Vector3(0.0f, 180.0f, 0.0f);
         [SerializeField] private Vector3 fallbackGoalPosition = new Vector3(27.084f, 12.1f, -2.40f);
         [SerializeField] private bool brightenSceneLighting = true;
@@ -650,29 +650,71 @@ namespace ObjRecog.UnitySim
             float groundHeight
         )
         {
-            Transform sofa = FindNamedTransformInSubtree(livingRoomRoot, "Sofa_Apt_01");
-            Transform coffeeTable = FindNamedTransformInSubtree(livingRoomRoot, "Coffee_Table_Apt_01");
-            Transform rug = FindNamedTransformInSubtree(livingRoomRoot, "Rug_Apt_01");
-
-            Vector3[] candidates =
+            string[] farRoomAnchorPrefixes =
             {
-                MidpointPosition(sofa, coffeeTable, groundHeight),
-                MidpointPosition(sofa, rug, groundHeight),
-                FlattenToGround(rug == null ? television.position + (roomFacingDirection * spawnStandOffM) : rug.position, groundHeight),
-                FlattenToGround(television.position + (roomFacingDirection * spawnStandOffM), groundHeight),
+                "Lamp_Floor_01",
+                "Table_Side_Apt_01",
             };
 
-            for (int index = 0; index < candidates.Length; index++)
+            for (int anchorIndex = 0; anchorIndex < farRoomAnchorPrefixes.Length; anchorIndex++)
             {
-                Vector3 candidate = candidates[index];
-                if (!IsFiniteVector3(candidate))
+                Transform[] anchors = FindNamedTransformsInSubtree(livingRoomRoot, farRoomAnchorPrefixes[anchorIndex]);
+                for (int index = 0; index < anchors.Length; index++)
                 {
-                    continue;
-                }
+                    Transform anchor = anchors[index];
+                    if (anchor == null)
+                    {
+                        continue;
+                    }
 
-                if (!IsPlacementBlocked(candidate))
+                    Vector3 towardTv = FlattenDirection(television.position - anchor.position);
+                    if (towardTv.sqrMagnitude < 0.001f)
+                    {
+                        continue;
+                    }
+
+                    Vector3 candidate = FlattenToGround(anchor.position + (towardTv * 0.7f), groundHeight);
+                    if (!IsPlacementBlocked(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            Vector3 sideDirection = new Vector3(-roomFacingDirection.z, 0.0f, roomFacingDirection.x);
+            float[] distanceCandidates =
+            {
+                spawnStandOffM,
+                Mathf.Max(goalStandOffM + 3.6f, spawnStandOffM - 0.75f),
+                Mathf.Max(goalStandOffM + 2.8f, spawnStandOffM - 1.5f),
+                Mathf.Max(goalStandOffM + 2.1f, spawnStandOffM - 2.2f),
+            };
+            float[] lateralOffsets = { 0.0f, 0.85f, -0.85f, 1.45f, -1.45f };
+
+            for (int distanceIndex = 0; distanceIndex < distanceCandidates.Length; distanceIndex++)
+            {
+                float distance = distanceCandidates[distanceIndex];
+                for (int offsetIndex = 0; offsetIndex < lateralOffsets.Length; offsetIndex++)
                 {
-                    return candidate;
+                    float lateralOffset = lateralOffsets[offsetIndex];
+                    Vector3 candidate = FlattenToGround(
+                        television.position + (roomFacingDirection * distance) + (sideDirection * lateralOffset),
+                        groundHeight
+                    );
+                    if (!IsPlacementBlocked(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            Transform rug = FindNamedTransformInSubtree(livingRoomRoot, "Rug_Apt_01");
+            if (rug != null)
+            {
+                Vector3 rugPosition = FlattenToGround(rug.position + (sideDirection * 1.2f), groundHeight);
+                if (!IsPlacementBlocked(rugPosition))
+                {
+                    return rugPosition;
                 }
             }
 
@@ -758,6 +800,39 @@ namespace ObjRecog.UnitySim
             return null;
         }
 
+        private Transform[] FindNamedTransformsInSubtree(Transform root, string prefix)
+        {
+            if (root == null)
+            {
+                return Array.Empty<Transform>();
+            }
+
+            Transform[] transforms = root.GetComponentsInChildren<Transform>(true);
+            int count = 0;
+            for (int index = 0; index < transforms.Length; index++)
+            {
+                Transform candidate = transforms[index];
+                if (candidate != null && candidate.name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    count += 1;
+                }
+            }
+
+            Transform[] matches = new Transform[count];
+            int offset = 0;
+            for (int index = 0; index < transforms.Length; index++)
+            {
+                Transform candidate = transforms[index];
+                if (candidate != null && candidate.name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    matches[offset] = candidate;
+                    offset += 1;
+                }
+            }
+
+            return matches;
+        }
+
         private float ResolveRoomGroundHeight(Transform livingRoomRoot)
         {
             string[] preferredFloorReferences =
@@ -816,24 +891,6 @@ namespace ObjRecog.UnitySim
         {
             position.y = groundHeight;
             return position;
-        }
-
-        private static Vector3 MidpointPosition(Transform first, Transform second, float groundHeight)
-        {
-            if (first == null || second == null)
-            {
-                return Vector3.positiveInfinity;
-            }
-
-            return FlattenToGround((first.position + second.position) * 0.5f, groundHeight);
-        }
-
-        private static bool IsFiniteVector3(Vector3 value)
-        {
-            return
-                !float.IsNaN(value.x) && !float.IsInfinity(value.x) &&
-                !float.IsNaN(value.y) && !float.IsInfinity(value.y) &&
-                !float.IsNaN(value.z) && !float.IsInfinity(value.z);
         }
 
         private static Vector3 FlattenDirection(Vector3 direction)

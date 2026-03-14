@@ -137,7 +137,7 @@ def build_living_room_scene_spec() -> LivingRoomSceneSpec:
         room_size_xyz=(room_width, room_height, room_depth),
         wall_thickness_m=wall_thickness,
         window_wall="front",
-        start_pose=RobotPose(x=0.35, y=1.25, z=-0.15, yaw_deg=0.0, camera_pan_deg=0.0),
+        start_pose=RobotPose(x=2.15, y=1.25, z=2.15, yaw_deg=180.0, camera_pan_deg=0.0),
         hidden_goal_pose_xyz=(tv_panel_center[0], 1.25, tv_panel_center[2] + tv_front_goal_offset_m),
         objects=objects,
         lights=lights,
