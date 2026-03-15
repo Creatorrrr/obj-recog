@@ -11,6 +11,7 @@ from obj_recog.frame_source import FramePacket
 from obj_recog.scene_graph import GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, EpisodePhase, SensorFrame
 from obj_recog.simulation import LivingRoomEpisodeRunner, LivingRoomSimulationRuntime
+from obj_recog.types import PanopticSegment
 
 
 class _FakePlanner:
@@ -82,6 +83,9 @@ def _artifacts(
     detections: list[object] | None = None,
     scene_graph_snapshot: SceneGraphSnapshot | None = None,
     slam_tracking_state: str = "TRACKING",
+    depth_m: float = 1.5,
+    camera_pose_world: np.ndarray | None = None,
+    segments: list[PanopticSegment] | None = None,
 ):
     return type(
         "Artifacts",
@@ -89,11 +93,17 @@ def _artifacts(
         {
             "frame_bgr": np.asarray(packet.frame_bgr, dtype=np.uint8),
             "detections": list(detections or []),
-            "segments": [],
+            "segments": list(segments or []),
             "scene_graph_snapshot": scene_graph_snapshot,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
-            "depth_map": np.full((12, 16), 1.5, dtype=np.float32),
+            "mesh_triangles": np.empty((0, 3), dtype=np.int32),
+            "depth_map": np.full((12, 16), depth_m, dtype=np.float32),
             "slam_tracking_state": slam_tracking_state,
+            "camera_pose_world": (
+                np.asarray(camera_pose_world, dtype=np.float32)
+                if camera_pose_world is not None
+                else np.eye(4, dtype=np.float32)
+            ),
         },
     )()
 
@@ -580,6 +590,145 @@ def test_living_room_runtime_writes_planner_memory_to_turn_log(tmp_path: Path) -
     assert "memory" in payload["prompt"]
     assert payload["prompt"]["memory"]["target_memory"]["label"] == target_label
     assert payload["prompt"]["memory"]["recent_searches"] == []
+
+
+def test_living_room_runtime_records_action_effects_and_search_metadata(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                rationale="reassess",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, depth_m=0.6, camera_pose_world=np.eye(4, dtype=np.float32)),
+    )
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, depth_m=0.6, camera_pose_world=np.eye(4, dtype=np.float32)),
+    )
+
+    assert len(planner.calls) >= 2
+    effect = planner.calls[1].recent_action_effects[0]
+    search = planner.calls[1].memory.recent_searches[0]
+    assert effect.action == "move_forward:0.12"
+    assert effect.likely_blocked is True
+    assert search.likely_blocked is True
+    assert search.pose_progress_m == pytest.approx(0.0)
+    assert search.entered_new_view is False
+    assert search.evidence_gained is False
+
+
+def test_living_room_runtime_applies_replan_frame_budget(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(
+                    ActionStep(ActionPrimitive.TURN_LEFT, 6.0),
+                    ActionStep(ActionPrimitive.TURN_LEFT, 6.0),
+                    ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),
+                ),
+                rationale="scan then advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                rationale="replan",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(sim_action_batch_size=4, sim_replan_interval_sec=0.4, sim_camera_fps=2.0),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert runner.current_phase == EpisodePhase.REASSESS
+    assert len(planner.calls) == 1
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert len(planner.calls) >= 2
+
+
+def test_living_room_runtime_writes_enhanced_planner_turn_payload(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                rationale="reassess",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    for _ in range(2):
+        packet = runner.next_frame()
+        assert packet is not None
+        runner.record_runtime_observation(
+            frame_packet=packet,
+            artifacts=_artifacts(packet, depth_m=0.6, camera_pose_world=np.eye(4, dtype=np.float32)),
+        )
+
+    turns = (tmp_path / "planner_turns.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    payload = json.loads(turns[-1])
+    assert "goal_estimate" in payload["prompt"]
+    assert "navigation_affordances" in payload["prompt"]
+    assert "recent_action_effects" in payload["prompt"]
+    assert "constraints" in payload["prompt"]
+    assert payload["prompt"]["recent_action_effects"][0]["likely_blocked"] is True
+    assert payload["prompt"]["recent_searches"][0]["likely_blocked"] is True
 
 
 def test_simulation_runtime_uses_living_room_scene_and_resets_backend(tmp_path: Path) -> None:

@@ -67,28 +67,35 @@ def _direction_bucket(x_center: float, width: int) -> str:
 
 def _summarize_detections(frame_artifacts: FrameArtifacts, max_detections: int) -> list[str]:
     frame_width = int(frame_artifacts.frame_bgr.shape[1])
+    frame_height = int(frame_artifacts.frame_bgr.shape[0])
     entries: list[str] = []
     for detection in sorted(
         frame_artifacts.detections,
         key=lambda item: float(item.confidence),
         reverse=True,
     )[:max_detections]:
-        x1, _y1, x2, _y2 = detection.xyxy
+        x1, y1, x2, y2 = detection.xyxy
         center_x = (int(x1) + int(x2)) / 2.0
         direction = _direction_bucket(center_x, frame_width)
+        box_width = max(1, int(x2) - int(x1))
+        box_height = max(1, int(y2) - int(y1))
+        area_ratio = float(box_width * box_height) / float(max(1, frame_width * frame_height))
         entries.append(
-            f"- {detection.label} (conf={detection.confidence:.2f}, direction={direction})"
+            f"- {detection.label} (conf={detection.confidence:.2f}, direction={direction}, "
+            f"bbox=({int(x1)},{int(y1)})-({int(x2)},{int(y2)}), area={area_ratio:.3f})"
         )
     return entries
 
 
 def _summarize_segments(frame_artifacts: FrameArtifacts, max_segments: int = 12) -> list[str]:
+    frame_area = max(1, int(frame_artifacts.frame_bgr.shape[0]) * int(frame_artifacts.frame_bgr.shape[1]))
     entries: list[str] = []
     for index, segment in enumerate(
         sorted(frame_artifacts.segments, key=lambda item: int(item.area_pixels), reverse=True)[:max_segments],
         start=1,
     ):
-        entries.append(f"- {segment.label} (area_rank={index})")
+        coverage_ratio = float(int(segment.area_pixels)) / float(frame_area)
+        entries.append(f"- {segment.label} (area_rank={index}, coverage={coverage_ratio:.3f})")
     return entries
 
 
@@ -140,8 +147,13 @@ def build_explanation_snapshot(
     graph_edges = _summarize_graph_edges(frame_artifacts, max_graph_edges=max_graph_edges)
     graph_nodes = _summarize_graph_nodes(frame_artifacts, max_graph_nodes=max_graph_nodes)
     segments = _summarize_segments(frame_artifacts)
+    frame_height, frame_width = frame_artifacts.frame_bgr.shape[:2]
 
-    sections = ["Visible objects", *(detections or ["- none"])]
+    sections = [
+        "Visible objects",
+        f"- image_size={int(frame_width)}x{int(frame_height)}",
+        *(detections or ["- none"]),
+    ]
     if segments:
         sections.extend(["", "Visible structural segments", *segments])
     if graph_edges:

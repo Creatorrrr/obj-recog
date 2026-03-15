@@ -938,6 +938,95 @@ def test_render_explanation_panel_uses_unicode_text_renderer_for_body_lines() ->
     ]]
 
 
+def test_render_explanation_panel_includes_request_context_and_uses_taller_default_panel() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    unicode_calls: list[list[str]] = []
+
+    def _fake_unicode_renderer(canvas, lines, *, origin, line_height, color):
+        unicode_calls.append(list(lines))
+        return canvas
+
+    fake_cv2 = _FakeCV2()
+    panel = render_explanation_panel(
+        status="loading",
+        text="response summary",
+        model="gpt-5-mini",
+        latency_ms=18.0,
+        timestamp_label="12:34:56",
+        request_context="Visible objects\n- chair\n- table",
+        cv2_module=fake_cv2,
+        unicode_text_renderer=_fake_unicode_renderer,
+    )
+
+    assert panel.shape[0] >= 1080
+    assert "Request chars: 31" in fake_cv2.text_calls
+    assert "Response chars: 16" in fake_cv2.text_calls
+    assert unicode_calls
+    assert unicode_calls[-1][0] == "LLM request"
+    assert "LLM response" in unicode_calls[-1]
+
+
+def test_render_explanation_panel_supports_planner_tabs_and_returns_tab_metadata() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+        def getTextSize(self, text, font, scale, thickness):
+            return ((len(text) * 7, 12), 0)
+
+    unicode_calls: list[list[str]] = []
+
+    def _fake_unicode_renderer(canvas, lines, *, origin, line_height, color):
+        unicode_calls.append(list(lines))
+        return canvas
+
+    fake_cv2 = _FakeCV2()
+    panel, metadata = render_explanation_panel(
+        status="ready",
+        text="explanation response",
+        model="gpt-5-mini",
+        latency_ms=22.0,
+        timestamp_label="12:34:56",
+        planner_request_context='{"goal":"tv","mode":"inferred"}',
+        planner_response_text='{"rationale":"scan left","steps":["turn_left","move_forward"]}',
+        active_tab="planner_request",
+        cv2_module=fake_cv2,
+        unicode_text_renderer=_fake_unicode_renderer,
+        return_metadata=True,
+    )
+
+    assert panel.shape[0] >= 1080
+    assert metadata["active_tab"] == "planner_request"
+    assert "planner_request" in metadata["tab_rects"]
+    assert "planner_response" in metadata["tab_rects"]
+    assert unicode_calls
+    assert unicode_calls[-1][0] == "Planner request"
+    assert any(text == "Planner Req" for text in fake_cv2.text_calls)
+
+
 def test_render_explanation_panel_shows_ready_empty_response_message() -> None:
     class _FakeCV2:
         FONT_HERSHEY_SIMPLEX = 0

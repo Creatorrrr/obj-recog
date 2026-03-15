@@ -147,6 +147,9 @@ def test_build_explanation_snapshot_includes_expected_sections_and_limits() -> N
     assert "segment_11" in snapshot.structured_context
     assert "segment_12" not in snapshot.structured_context
     assert snapshot.structured_context.count("ego ->") <= 20
+    assert "image_size=32x24" in snapshot.structured_context
+    assert "bbox=" in snapshot.structured_context
+    assert "coverage=" in snapshot.structured_context
 
 
 def test_build_explanation_snapshot_degrades_without_graph_or_segments() -> None:

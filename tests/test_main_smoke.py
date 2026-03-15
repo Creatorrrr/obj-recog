@@ -3198,6 +3198,128 @@ def test_run_updates_explanation_scroll_offset_on_mouse_wheel(
     assert scroll_offsets[-1] == 3
 
 
+def test_run_switches_explanation_panel_tabs_on_tab_click(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from obj_recog.situation_explainer import ExplanationResult, ExplanationStatus
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        disable_slam_calibration=True,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_cv2 = FakeCV2(
+        key_sequence=[-1, -1, ord("q")],
+        mouse_events=[
+            ("Object Recognition", FakeCV2.EVENT_LBUTTONDOWN, 620, 460),
+            ("Situation Explanation", FakeCV2.EVENT_LBUTTONDOWN, 180, 150),
+        ],
+    )
+    camera_session = CameraSession(
+        capture=FakeCapture(
+            width=640,
+            height=480,
+            frames=[
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                np.zeros((480, 640, 3), dtype=np.uint8),
+            ],
+        ),
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    worker = FakeExplanationWorker(
+        results=[
+            (
+                1,
+                ExplanationResult(
+                    text="scene summary",
+                    status=ExplanationStatus.READY,
+                    latency_ms=25.0,
+                    model="fake-model",
+                    error_message=None,
+                ),
+            ),
+            None,
+        ]
+    )
+    active_tabs: list[str] = []
+
+    def _fake_explanation_panel_renderer(
+        *,
+        status,
+        text,
+        model,
+        latency_ms,
+        timestamp_label,
+        active_tab="explanation",
+        cv2_module=None,
+        return_metadata=False,
+        **_,
+    ):
+        active_tabs.append(str(active_tab))
+        panel = np.zeros((360, 960, 3), dtype=np.uint8)
+        metadata = {
+            "scroll_offset": 0,
+            "max_scroll_offset": 0,
+            "up_rect": None,
+            "down_rect": None,
+            "tab_rects": {
+                "explanation": (16, 134, 126, 166),
+                "planner_request": (138, 134, 268, 166),
+                "planner_response": (280, 134, 420, 166),
+            },
+            "active_tab": str(active_tab),
+        }
+        if return_metadata:
+            return panel, metadata
+        return panel
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        map_builder_factory=lambda **_: FakeMapBuilder(),
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: FakeViewer(),
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=lambda *args, **kwargs: type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "disabled",
+                "settings_path": "/tmp/generated.yaml",
+                "calibration": None,
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": FakeSlamBridge(),
+            },
+        )(),
+        explanation_worker_factory=lambda **_: worker,
+        explanation_panel_renderer=_fake_explanation_panel_renderer,
+    )
+
+    assert active_tabs[0] == "explanation"
+    assert active_tabs[-1] == "planner_request"
+
+
 def test_run_toggles_depth_debug_level_with_d_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

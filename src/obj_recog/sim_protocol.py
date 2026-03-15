@@ -97,6 +97,72 @@ class SensorFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerObjectObservation:
+    label: str
+    confidence: float
+    direction: str
+    bbox_area_ratio: float
+    depth_m: float | None
+    is_target_match: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerSegmentObservation:
+    label: str
+    coverage_ratio: float
+    dominant_direction: str
+    opening_hint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerNavigationAffordances:
+    forward_clearance_m: float | None
+    left_clearance_m: float | None
+    right_clearance_m: float | None
+    rear_clearance_m: float | None
+    front_blocked: bool
+    candidate_open_directions: tuple[str, ...]
+    dead_end_likelihood: float
+    best_exploration_direction: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerReconstructionBrief:
+    pose_delta_m: float | None
+    yaw_delta_deg: float | None
+    mesh_vertex_count: int
+    mesh_triangle_count: int
+    mesh_growth_delta: int
+    frontier_directions: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerGoalEstimate:
+    status: str
+    bearing_hint: str | None
+    distance_hint: str | None
+    evidence_sources: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerActionEffectSummary:
+    action: str
+    estimated_motion: str
+    clearance_change: str
+    target_evidence_change: str
+    likely_blocked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerConstraintSummary:
+    allowed_primitives: tuple[str, ...]
+    tracking_safe_limits: dict[str, float]
+    batch_step_limit: int
+    replan_frame_budget: int
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PerceptionSnapshot:
     visible_detections: tuple[str, ...]
     visible_segments: tuple[str, ...]
@@ -106,6 +172,10 @@ class PerceptionSnapshot:
     target_detection: dict[str, float | str | None] | None
     calibration_status: str
     tracking_status: str
+    objects: tuple[PlannerObjectObservation, ...] = ()
+    structural_segments: tuple[PlannerSegmentObservation, ...] = ()
+    navigation_affordances: PlannerNavigationAffordances | None = None
+    reconstruction_brief: PlannerReconstructionBrief | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +194,10 @@ class PlannerSearchOutcome:
     executed_actions: tuple[str, ...]
     target_visible_after_search: bool
     tracking_status: str
+    entered_new_view: bool = False
+    pose_progress_m: float | None = None
+    likely_blocked: bool = False
+    evidence_gained: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,8 +212,12 @@ class PlannerContext:
     phase: EpisodePhase
     frame_index: int
     goal_description: str
+    target_label: str
     perception: PerceptionSnapshot
     memory: PlannerMemorySnapshot
+    goal_estimate: PlannerGoalEstimate
+    recent_action_effects: tuple[PlannerActionEffectSummary, ...]
+    constraints: PlannerConstraintSummary
     recent_actions: tuple[str, ...]
 
 

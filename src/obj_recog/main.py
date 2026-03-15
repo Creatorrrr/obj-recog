@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import inspect
+import json
 import os
 import time
 from dataclasses import replace
@@ -42,6 +43,7 @@ from obj_recog.slam_bridge import (
     resolve_orbslam3_bridge_binary_path,
 )
 from obj_recog.simulation import SimulationRuntime
+from obj_recog.sim_planner import planner_prompt_from_context
 from obj_recog.situation_explainer import (
     ExplanationResult,
     ExplanationStatus,
@@ -63,6 +65,35 @@ from obj_recog.visualization import (
 
 def _default_debug_log(message: str) -> None:
     print(f"[obj-recog] {message}", file=sys.stderr, flush=True)
+
+
+def _planner_request_context_from_frame_packet(frame_packet: FramePacket | None) -> str:
+    if frame_packet is None or getattr(frame_packet, "planner_context", None) is None:
+        return ""
+    try:
+        return planner_prompt_from_context(frame_packet.planner_context)
+    except Exception:
+        return str(frame_packet.planner_context)
+
+
+def _planner_response_text_from_frame_packet(frame_packet: FramePacket | None) -> str:
+    if frame_packet is None or getattr(frame_packet, "planner_schedule", None) is None:
+        return ""
+    schedule = frame_packet.planner_schedule
+    steps = [
+        {
+            "primitive": getattr(getattr(step, "primitive", None), "value", getattr(step, "primitive", "")),
+            "value": float(getattr(step, "value", 0.0)),
+        }
+        for step in tuple(getattr(schedule, "steps", ()) or ())
+    ]
+    payload = {
+        "rationale": str(getattr(schedule, "rationale", "")),
+        "model": str(getattr(schedule, "model", "")),
+        "issued_at_frame": int(getattr(schedule, "issued_at_frame", 0)),
+        "steps": steps,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _tsdf_requires_orbslam3_message() -> str:
@@ -882,7 +913,10 @@ def run(
     )
     explanation_snapshot_id = 0
     latest_explanation_request_id: int | None = None
+    latest_explanation_request_context = ""
     latest_explanation_timestamp = "-"
+    latest_planner_request_context = ""
+    latest_planner_response_text = ""
     explanation_refresh_status = "idle"
     explanation_auto_refresh_enabled = bool(config.input_source == "sim" and sim_explanation_enabled)
     last_explanation_request_time: float | None = None
@@ -892,10 +926,16 @@ def run(
         "rect": None,
     }
     explanation_panel_state = {
-        "scroll_offset": 0,
+        "active_tab": "explanation",
+        "scroll_offsets": {
+            "explanation": 0,
+            "planner_request": 0,
+            "planner_response": 0,
+        },
         "pending_scroll": 0,
         "up_rect": None,
         "down_rect": None,
+        "tab_rects": {},
     }
     explanation_mouse_callback_registered = False
     explanation_panel_mouse_callback_registered = False
@@ -950,6 +990,12 @@ def run(
 
     def _handle_explanation_window_mouse(event, x, y, _flags, _param) -> None:
         if event == getattr(cv2, "EVENT_LBUTTONDOWN", None):
+            tab_rects = dict(explanation_panel_state.get("tab_rects", {}) or {})
+            for tab_name, rect in tab_rects.items():
+                if point_in_rect(int(x), int(y), rect):
+                    explanation_panel_state["active_tab"] = str(tab_name)
+                    explanation_panel_state["pending_scroll"] = 0
+                    return
             if point_in_rect(int(x), int(y), explanation_panel_state.get("up_rect")):
                 explanation_panel_state["pending_scroll"] = int(explanation_panel_state["pending_scroll"]) - 1
             elif point_in_rect(int(x), int(y), explanation_panel_state.get("down_rect")):
@@ -976,6 +1022,7 @@ def run(
     ) -> bool:
         nonlocal explanation_snapshot_id
         nonlocal latest_explanation_request_id
+        nonlocal latest_explanation_request_context
         nonlocal latest_explanation_timestamp
         nonlocal explanation_status
         nonlocal explanation_result
@@ -1003,6 +1050,7 @@ def run(
             max_graph_edges=config.explanation_max_graph_edges,
             timestamp_label=request_timestamp_label,
         )
+        latest_explanation_request_context = str(snapshot.structured_context)
         explanation_worker.submit(snapshot.snapshot_id, snapshot)
         if not preserve_displayed_explanation:
             explanation_status = ExplanationStatus.LOADING
@@ -1013,7 +1061,7 @@ def run(
                 model=config.explanation_model,
                 error_message=None,
             )
-            explanation_panel_state["scroll_offset"] = 0
+            explanation_panel_state["scroll_offsets"]["explanation"] = 0
             explanation_panel_state["pending_scroll"] = 0
         return True
 
@@ -1050,7 +1098,7 @@ def run(
                     error_message=None,
                 )
                 explanation_status = ExplanationStatus.IDLE
-                explanation_panel_state["scroll_offset"] = 0
+                explanation_panel_state["scroll_offsets"]["explanation"] = 0
                 explanation_panel_state["pending_scroll"] = 0
 
     if config.list_cameras:
@@ -1378,6 +1426,8 @@ def run(
                 latest_explanation_request_id = None
                 explanation_refresh_status = "idle"
                 last_explanation_request_time = None
+                latest_planner_request_context = ""
+                latest_planner_response_text = ""
                 explanation_button_state["pending_toggle"] = False
                 if sim_explanation_enabled:
                     explanation_result = ExplanationResult(
@@ -1395,6 +1445,8 @@ def run(
                 if restarted_stream:
                     continue
                 break
+            latest_planner_request_context = _planner_request_context_from_frame_packet(frame_packet)
+            latest_planner_response_text = _planner_response_text_from_frame_packet(frame_packet)
             frame_bgr = np.asarray(frame_packet.frame_bgr, dtype=np.uint8)
             frame_timestamp_sec = frame_packet.timestamp_sec
             artifacts, cached_detections = process_frame(
@@ -1421,9 +1473,6 @@ def run(
                 effective_device=effective_device,
                 cv2_module=cv2,
             )
-            record_runtime_observation = getattr(frame_source, "record_runtime_observation", None)
-            if frame_packet is not None and callable(record_runtime_observation):
-                record_runtime_observation(frame_packet=frame_packet, artifacts=artifacts)
             if frame_index == 0:
                 debug_log("first runtime frame processed")
 
@@ -1525,6 +1574,10 @@ def run(
                 artifacts.visible_graph_nodes = list(scene_graph_snapshot.visible_nodes)
                 artifacts.visible_graph_edges = list(scene_graph_snapshot.visible_edges)
 
+            record_runtime_observation = getattr(frame_source, "record_runtime_observation", None)
+            if frame_packet is not None and callable(record_runtime_observation):
+                record_runtime_observation(frame_packet=frame_packet, artifacts=artifacts)
+
             if explanation_worker is not None:
                 explanation_poll_result = explanation_worker.poll()
                 if explanation_poll_result is not None:
@@ -1539,7 +1592,7 @@ def run(
                             explanation_status = result.status
                             latest_explanation_timestamp = time.strftime("%H:%M:%S")
                             explanation_refresh_status = "idle"
-                            explanation_panel_state["scroll_offset"] = 0
+                            explanation_panel_state["scroll_offsets"]["explanation"] = 0
                             explanation_panel_state["pending_scroll"] = 0
                         elif preserve_previous_explanation:
                             explanation_refresh_status = "failed"
@@ -1547,7 +1600,7 @@ def run(
                             explanation_result = result
                             explanation_status = result.status
                             explanation_refresh_status = "failed"
-                            explanation_panel_state["scroll_offset"] = 0
+                            explanation_panel_state["scroll_offsets"]["explanation"] = 0
                             explanation_panel_state["pending_scroll"] = 0
 
             now = time_source()
@@ -1602,11 +1655,15 @@ def run(
                 cv2.setMouseCallback("Object Recognition", _handle_object_window_mouse)
                 explanation_mouse_callback_registered = True
             if sim_explanation_enabled:
+                active_tab = str(explanation_panel_state.get("active_tab", "explanation"))
+                scroll_offsets = explanation_panel_state.get("scroll_offsets", {})
+                current_scroll_offset = int(scroll_offsets.get(active_tab, 0))
                 if int(explanation_panel_state["pending_scroll"]) != 0:
-                    explanation_panel_state["scroll_offset"] = max(
+                    current_scroll_offset = max(
                         0,
-                        int(explanation_panel_state["scroll_offset"]) + int(explanation_panel_state["pending_scroll"]),
+                        current_scroll_offset + int(explanation_panel_state["pending_scroll"]),
                     )
+                    explanation_panel_state["scroll_offsets"][active_tab] = current_scroll_offset
                     explanation_panel_state["pending_scroll"] = 0
                 try:
                     panel_render_result = explanation_panel_renderer(
@@ -1615,8 +1672,12 @@ def run(
                         model=explanation_result.model or config.explanation_model,
                         latency_ms=explanation_result.latency_ms,
                         timestamp_label=latest_explanation_timestamp,
+                        request_context=latest_explanation_request_context,
+                        planner_request_context=latest_planner_request_context,
+                        planner_response_text=latest_planner_response_text,
+                        active_tab=active_tab,
                         refresh_status=explanation_refresh_status,
-                        scroll_offset=int(explanation_panel_state["scroll_offset"]),
+                        scroll_offset=current_scroll_offset,
                         cv2_module=cv2,
                         return_metadata=True,
                     )
@@ -1632,15 +1693,20 @@ def run(
                     )
                 if isinstance(panel_render_result, tuple):
                     panel, panel_metadata = panel_render_result
-                    explanation_panel_state["scroll_offset"] = int(
-                        panel_metadata.get("scroll_offset", explanation_panel_state["scroll_offset"])
+                    explanation_panel_state["scroll_offsets"][active_tab] = int(
+                        panel_metadata.get("scroll_offset", explanation_panel_state["scroll_offsets"].get(active_tab, 0))
                     )
                     explanation_panel_state["up_rect"] = panel_metadata.get("up_rect")
                     explanation_panel_state["down_rect"] = panel_metadata.get("down_rect")
+                    explanation_panel_state["tab_rects"] = dict(panel_metadata.get("tab_rects", {}) or {})
+                    explanation_panel_state["active_tab"] = str(
+                        panel_metadata.get("active_tab", explanation_panel_state.get("active_tab", "explanation"))
+                    )
                 else:
                     panel = panel_render_result
                     explanation_panel_state["up_rect"] = None
                     explanation_panel_state["down_rect"] = None
+                    explanation_panel_state["tab_rects"] = {}
                 _imshow_runtime_window(
                     cv2,
                     "Situation Explanation",
@@ -1689,6 +1755,7 @@ def run(
                 latest_explanation_request_id = None
                 explanation_refresh_status = "idle"
                 last_explanation_request_time = None
+                latest_explanation_request_context = ""
                 if sim_explanation_enabled:
                     explanation_result = ExplanationResult(
                         text="",
@@ -1702,10 +1769,14 @@ def run(
                         if explanation_status == ExplanationStatus.DISABLED
                         else ExplanationStatus.IDLE
                     )
-                explanation_panel_state["scroll_offset"] = 0
+                explanation_panel_state["scroll_offsets"]["explanation"] = 0
+                explanation_panel_state["scroll_offsets"]["planner_request"] = 0
+                explanation_panel_state["scroll_offsets"]["planner_response"] = 0
                 explanation_panel_state["pending_scroll"] = 0
                 explanation_panel_state["up_rect"] = None
                 explanation_panel_state["down_rect"] = None
+                explanation_panel_state["tab_rects"] = {}
+                explanation_panel_state["active_tab"] = "explanation"
                 explanation_button_state["pending_toggle"] = False
                 frame_index += 1
                 continue

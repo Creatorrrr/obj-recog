@@ -8,8 +8,9 @@ import numpy as np
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.main import run
+from obj_recog.scene_graph import GraphNode, SceneGraphSnapshot
 from obj_recog.slam_bridge import SlamFrameResult
-from obj_recog.types import Detection
+from obj_recog.types import Detection, PanopticSegment, SegmentationResult
 
 
 class _FakeCV2:
@@ -207,6 +208,97 @@ class _FakeExplanationWorker:
         self.closed = True
 
 
+class _ImmediateSegmentationWorker:
+    def __init__(self, **_kwargs) -> None:
+        self._submitted_frame_index = None
+        self._returned = False
+        self.closed = False
+
+    def is_idle(self) -> bool:
+        return True
+
+    def submit(self, frame_index: int, _frame_bgr: np.ndarray) -> None:
+        self._submitted_frame_index = frame_index
+        self._returned = False
+
+    def poll(self):
+        if self._submitted_frame_index is None or self._returned:
+            return None
+        mask = np.ones((8, 8), dtype=bool)
+        self._returned = True
+        return (
+            self._submitted_frame_index,
+            SegmentationResult(
+                overlay_bgr=np.zeros((8, 8, 3), dtype=np.uint8),
+                segment_id_map=np.ones((8, 8), dtype=np.int32),
+                segments=[
+                    PanopticSegment(
+                        segment_id=1,
+                        label_id=1,
+                        label="floor",
+                        color_rgb=(0, 255, 0),
+                        mask=mask,
+                        area_pixels=int(mask.sum()),
+                    )
+                ],
+            ),
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSceneGraphMemory:
+    def __init__(self, **_kwargs) -> None:
+        self.update_calls: list[tuple[list[object], list[PanopticSegment]]] = []
+
+    def update(
+        self,
+        *,
+        frame_index: int,
+        detections: list[object],
+        segments: list[PanopticSegment],
+        depth_map: np.ndarray,
+        intrinsics,
+        camera_pose_world: np.ndarray,
+        slam_tracking_state: str,
+    ) -> SceneGraphSnapshot:
+        _ = (depth_map, intrinsics, camera_pose_world, slam_tracking_state)
+        self.update_calls.append((list(detections), list(segments)))
+        nodes = (
+            GraphNode(
+                id="ego",
+                type="ego",
+                label="camera",
+                state="visible",
+                confidence=1.0,
+                world_centroid=np.zeros(3, dtype=np.float32),
+                last_seen_frame=frame_index,
+                last_seen_direction="front",
+                source_track_id=None,
+            ),
+            GraphNode(
+                id="seg-floor-1",
+                type="segment",
+                label="floor",
+                state="visible",
+                confidence=1.0,
+                world_centroid=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                last_seen_frame=frame_index,
+                last_seen_direction="front",
+                source_track_id=1,
+            ),
+        )
+        return SceneGraphSnapshot(
+            frame_index=frame_index,
+            camera_pose_world=np.eye(4, dtype=np.float32),
+            nodes=nodes,
+            edges=(),
+            visible_node_ids=("ego", "seg-floor-1"),
+            visible_edge_keys=(),
+        )
+
+
 def _packet(timestamp_sec: float) -> FramePacket:
     frame = np.full((8, 8, 3), 100, dtype=np.uint8)
     return FramePacket(
@@ -379,3 +471,49 @@ def test_run_sim_mode_shows_explanation_panel_and_auto_refreshes_when_enabled(
     assert "Situation Explanation" in fake_cv2.imshow_calls
     assert len(worker.submissions) >= 1
     assert worker.closed is True
+
+
+def test_run_sim_mode_records_runtime_observation_after_segments_and_scene_graph(tmp_path: Path) -> None:
+    slam_vocabulary, calibration = _write_runtime_files(tmp_path)
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        detection_interval=1,
+        input_source="sim",
+        segmentation_mode="panoptic",
+        graph_enabled=True,
+        explanation_enabled=False,
+        camera_calibration=calibration,
+        slam_vocabulary=slam_vocabulary,
+    )
+    source = _FakeFrameSource([_packet(0.0)])
+    scene_graph_memory = _FakeSceneGraphMemory()
+
+    run(
+        config,
+        cv2_module=_FakeCV2(),
+        detector_factory=lambda **_kwargs: _CountingDetector(),
+        depth_estimator_factory=lambda **_kwargs: _CountingDepthEstimator(),
+        tracker_factory=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("tracker should not be used")),
+        slam_bridge_factory=_FakeSlamBridgeFactory(),
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: _FakeViewer(),
+        environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+        segmentation_worker_factory=lambda **_kwargs: _ImmediateSegmentationWorker(),
+        scene_graph_memory_factory=lambda **_kwargs: scene_graph_memory,
+    )
+
+    assert len(source.runtime_observations) == 1
+    recorded_artifacts = source.runtime_observations[0][1]
+    assert recorded_artifacts.segments
+    assert recorded_artifacts.segments[0].label == "floor"
+    assert recorded_artifacts.scene_graph_snapshot is not None
+    assert scene_graph_memory.update_calls[0][1][0].label == "floor"

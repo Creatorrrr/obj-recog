@@ -79,7 +79,7 @@ def render_multiline_unicode_text(
     origin: tuple[int, int],
     line_height: int,
     color: tuple[int, int, int],
-    font_size: int = 16,
+    font_size: int = 14,
     image_module=None,
     draw_module=None,
     font_module=None,
@@ -617,9 +617,13 @@ def render_explanation_panel(
     model: str,
     latency_ms: float | None,
     timestamp_label: str,
+    request_context: str = "",
+    planner_request_context: str = "",
+    planner_response_text: str = "",
+    active_tab: str = "explanation",
     refresh_status: str = "idle",
     width: int = 960,
-    height: int = 480,
+    height: int = 1080,
     scroll_offset: int = 0,
     cv2_module=None,
     unicode_text_renderer=render_multiline_unicode_text,
@@ -628,15 +632,26 @@ def render_explanation_panel(
     cv2 = load_cv2(cv2_module)
 
     canvas = np.zeros((max(420, height), max(720, width), 3), dtype=np.uint8)
+    resolved_active_tab = str(active_tab or "explanation")
+    if resolved_active_tab not in {"explanation", "planner_request", "planner_response"}:
+        resolved_active_tab = "explanation"
     header_lines = [
         f"Status: {str(status).upper()} | {timestamp_label}",
         f"Refresh: {str(refresh_status)}",
         f"Model: {model}",
         f"Latency: {'-' if latency_ms is None else int(round(latency_ms))}ms",
+        f"Request chars: {len(str(request_context or ''))}",
+        f"Response chars: {len(str(text or ''))}",
     ]
     reserved_scroll_width = 54
-    wrap_width = max(56, int((canvas.shape[1] - reserved_scroll_width) / 13))
-    body_lines = wrap_explanation_text(text, width=wrap_width, max_lines=None)
+    wrap_width = max(64, int((canvas.shape[1] - reserved_scroll_width) / 14))
+    request_lines = wrap_explanation_text(str(request_context or ""), width=wrap_width, max_lines=None)
+    response_lines = wrap_explanation_text(text, width=wrap_width, max_lines=None)
+    body_lines = (
+        ["LLM request", *request_lines, "", "LLM response", *response_lines]
+        if request_lines
+        else response_lines
+    )
     if not body_lines:
         if str(status) == ExplanationStatus.DISABLED:
             body_lines = ["OPENAI_API_KEY가 없어 상황 설명 기능이 비활성화되었습니다."]
@@ -651,6 +666,35 @@ def render_explanation_panel(
         else:
             body_lines = ["우하단 Explain 버튼을 클릭하거나 e 키를 눌러 현재 상황 설명을 요청하세요."]
 
+    if request_lines and not response_lines and body_lines:
+        body_lines.extend(["Waiting for model response..."])
+
+    planner_request_lines = wrap_explanation_text(
+        str(planner_request_context or ""),
+        width=wrap_width,
+        max_lines=None,
+    )
+    if planner_request_lines:
+        planner_request_lines = ["Planner request", *planner_request_lines]
+    else:
+        planner_request_lines = ["Planner request not available yet."]
+
+    planner_response_lines = wrap_explanation_text(
+        str(planner_response_text or ""),
+        width=wrap_width,
+        max_lines=None,
+    )
+    if planner_response_lines:
+        planner_response_lines = ["Planner response", *planner_response_lines]
+    else:
+        planner_response_lines = ["Planner response not available yet."]
+
+    body_lines = {
+        "explanation": list(body_lines),
+        "planner_request": planner_request_lines,
+        "planner_response": planner_response_lines,
+    }.get(resolved_active_tab, list(body_lines))
+
     y = 28
     for line in header_lines:
         cv2.putText(
@@ -658,17 +702,59 @@ def render_explanation_panel(
             line,
             (16, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.40,
             (210, 230, 255),
             1,
             cv2.LINE_AA,
         )
-        y += 20
-    y += 12
+        y += 18
+    y += 8
+
+    tab_specs = (
+        ("explanation", "Explain"),
+        ("planner_request", "Planner Req"),
+        ("planner_response", "Planner Resp"),
+    )
+    tab_rects: dict[str, tuple[int, int, int, int]] = {}
+    get_text_size = getattr(cv2, "getTextSize", None)
+    draw_rectangle = getattr(cv2, "rectangle", None)
+    tab_top = y - 2
+    tab_height = 32
+    tab_x = 16
+    tab_gap = 12
+    for tab_name, label in tab_specs:
+        if callable(get_text_size):
+            try:
+                (label_size, _baseline) = get_text_size(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+                label_width = int(label_size[0])
+            except Exception:
+                label_width = len(label) * 7
+        else:
+            label_width = len(label) * 7
+        tab_width = max(110, label_width + 28)
+        tab_rect = (tab_x, tab_top, tab_x + tab_width, tab_top + tab_height)
+        tab_rects[tab_name] = tab_rect
+        if callable(draw_rectangle):
+            fill_color = (78, 112, 168) if tab_name == resolved_active_tab else (36, 46, 62)
+            border_color = (150, 180, 225) if tab_name == resolved_active_tab else (92, 108, 138)
+            draw_rectangle(canvas, (tab_rect[0], tab_rect[1]), (tab_rect[2], tab_rect[3]), fill_color, -1)
+            draw_rectangle(canvas, (tab_rect[0], tab_rect[1]), (tab_rect[2], tab_rect[3]), border_color, 1)
+        cv2.putText(
+            canvas,
+            label,
+            (tab_rect[0] + 12, tab_rect[1] + 21),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (245, 245, 245),
+            1,
+            cv2.LINE_AA,
+        )
+        tab_x = tab_rect[2] + tab_gap
+    y = tab_top + tab_height + 18
 
     body_left = 16
     body_top = y - 12
-    line_height = 22
+    line_height = 18
     footer_y = canvas.shape[0] - 14
     body_bottom = canvas.shape[0] - 42
     visible_line_count = max(4, int((body_bottom - body_top) // line_height))
@@ -719,18 +805,19 @@ def render_explanation_panel(
         color=(245, 245, 245),
     )
     if rendered is canvas:
+        text_y = body_top
         for line in visible_lines:
             cv2.putText(
                 canvas,
                 line,
-                (body_left, y),
+                (body_left, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.42,
                 (245, 245, 245),
                 1,
                 cv2.LINE_AA,
             )
-            y += line_height
+            text_y += line_height
         if return_metadata:
             return canvas, {
                 "scroll_offset": used_scroll_offset,
@@ -739,6 +826,8 @@ def render_explanation_panel(
                 "up_rect": up_rect,
                 "down_rect": down_rect,
                 "scrollbar_rect": None if scrollbar_geometry is None else scrollbar_geometry["track_rect"],
+                "tab_rects": tab_rects,
+                "active_tab": resolved_active_tab,
             }
         return canvas
     if return_metadata:
@@ -749,6 +838,8 @@ def render_explanation_panel(
             "up_rect": up_rect,
             "down_rect": down_rect,
             "scrollbar_rect": None if scrollbar_geometry is None else scrollbar_geometry["track_rect"],
+            "tab_rects": tab_rects,
+            "active_tab": resolved_active_tab,
         }
     return rendered
 

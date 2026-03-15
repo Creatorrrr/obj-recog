@@ -10,7 +10,7 @@ import numpy as np
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
-from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context
+from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context, planner_prompt_from_context
 from obj_recog.sim_protocol import (
     ActionPrimitive,
     ActionSchedule,
@@ -18,11 +18,15 @@ from obj_recog.sim_protocol import (
     EpisodePhase,
     EpisodeReport,
     HiddenWorldState,
+    PlannerActionEffectSummary,
+    PlannerNavigationAffordances,
+    PlannerReconstructionBrief,
     PlannerSearchOutcome,
     RobotPose,
     SensorFrame,
     UnityActionCommand,
 )
+from obj_recog.types import PanopticSegment
 from obj_recog.sim_scene import build_living_room_scene_spec
 from obj_recog.unity_rgb import UnityRgbClient, command_from_step
 
@@ -130,10 +134,15 @@ class LivingRoomEpisodeRunner:
         self._action_history: list[str] = []
         self._planner_turn_logs: list[dict[str, object]] = []
         self._completed_search_history: list[PlannerSearchOutcome] = []
+        self._recent_action_effects: list[PlannerActionEffectSummary] = []
         self._current_schedule: ActionSchedule | None = None
         self._active_schedule_start_frame: int | None = None
+        self._active_schedule_start_observation: dict[str, object] | None = None
         self._active_schedule_executed_steps: list[str] = []
+        self._previous_observation_state: dict[str, object] | None = None
+        self._pending_action_step: ActionStep | None = None
         self._latest_planner_context = None
+        self._latest_planner_schedule: ActionSchedule | None = None
         self._closed = False
         self._executed_schedule_steps = 0
         self._write_selfcalibration_artifact()
@@ -202,6 +211,136 @@ class LivingRoomEpisodeRunner:
         if not np.any(valid):
             return None
         return float(np.nanmedian(crop[valid]))
+
+    @staticmethod
+    def _camera_yaw_deg(camera_pose_world: np.ndarray | None) -> float | None:
+        pose = np.asarray(camera_pose_world, dtype=np.float32)
+        if pose.shape != (4, 4):
+            return None
+        yaw_rad = math.atan2(float(pose[0, 2]), float(pose[2, 2]))
+        return float(math.degrees(yaw_rad))
+
+    @staticmethod
+    def _pose_progress_m(previous_pose: np.ndarray | None, current_pose: np.ndarray | None) -> float | None:
+        previous = np.asarray(previous_pose, dtype=np.float32)
+        current = np.asarray(current_pose, dtype=np.float32)
+        if previous.shape != (4, 4) or current.shape != (4, 4):
+            return None
+        previous_xyz = previous[:3, 3]
+        current_xyz = current[:3, 3]
+        return float(np.linalg.norm(current_xyz - previous_xyz))
+
+    @staticmethod
+    def _angle_delta_deg(previous_yaw_deg: float | None, current_yaw_deg: float | None) -> float | None:
+        if previous_yaw_deg is None or current_yaw_deg is None:
+            return None
+        delta = float(current_yaw_deg) - float(previous_yaw_deg)
+        while delta > 180.0:
+            delta -= 360.0
+        while delta < -180.0:
+            delta += 360.0
+        return delta
+
+    @staticmethod
+    def _sector_clearance(
+        depth_map: np.ndarray,
+        *,
+        x_bounds: tuple[float, float],
+        y_bounds: tuple[float, float],
+    ) -> float | None:
+        depth = np.asarray(depth_map, dtype=np.float32)
+        if depth.ndim != 2 or depth.size == 0:
+            return None
+        height, width = depth.shape[:2]
+        x1 = int(max(0, min(width - 1, round(width * float(x_bounds[0])))))
+        x2 = int(max(x1 + 1, min(width, round(width * float(x_bounds[1])))))
+        y1 = int(max(0, min(height - 1, round(height * float(y_bounds[0])))))
+        y2 = int(max(y1 + 1, min(height, round(height * float(y_bounds[1])))))
+        crop = depth[y1:y2, x1:x2]
+        valid = crop[np.isfinite(crop) & (crop > 0.05)]
+        if valid.size == 0:
+            return None
+        return float(np.nanpercentile(valid, 30))
+
+    def _navigation_affordances_summary(self, *, artifacts) -> PlannerNavigationAffordances:
+        depth_map = np.asarray(getattr(artifacts, "depth_map", np.empty((0, 0))), dtype=np.float32)
+        forward_clearance_m = self._sector_clearance(depth_map, x_bounds=(0.35, 0.65), y_bounds=(0.45, 0.95))
+        left_clearance_m = self._sector_clearance(depth_map, x_bounds=(0.0, 0.35), y_bounds=(0.45, 0.95))
+        right_clearance_m = self._sector_clearance(depth_map, x_bounds=(0.65, 1.0), y_bounds=(0.45, 0.95))
+        previous_affordances = None
+        if self._previous_observation_state is not None:
+            previous_affordances = self._previous_observation_state.get("navigation_affordances")
+        rear_clearance_m = None
+        if isinstance(previous_affordances, PlannerNavigationAffordances):
+            rear_clearance_m = previous_affordances.forward_clearance_m
+        direction_scores = {
+            "front": -1.0 if forward_clearance_m is None else float(forward_clearance_m),
+            "left": -1.0 if left_clearance_m is None else float(left_clearance_m),
+            "right": -1.0 if right_clearance_m is None else float(right_clearance_m),
+        }
+        candidate_open_directions = tuple(
+            direction
+            for direction, clearance in sorted(direction_scores.items(), key=lambda item: item[1], reverse=True)
+            if clearance >= 1.15
+        )
+        front_blocked = forward_clearance_m is not None and forward_clearance_m < 0.8
+        side_clearances = [value for value in (left_clearance_m, right_clearance_m) if value is not None]
+        side_best = max(side_clearances) if side_clearances else None
+        dead_end_likelihood = 0.15
+        if front_blocked and (side_best is None or side_best < 0.85):
+            dead_end_likelihood = 0.9
+        elif front_blocked:
+            dead_end_likelihood = 0.55
+        elif not candidate_open_directions:
+            dead_end_likelihood = 0.45
+        best_exploration_direction = None
+        if candidate_open_directions:
+            best_exploration_direction = candidate_open_directions[0]
+        else:
+            best_exploration_direction = max(direction_scores.items(), key=lambda item: item[1])[0]
+        return PlannerNavigationAffordances(
+            forward_clearance_m=forward_clearance_m,
+            left_clearance_m=left_clearance_m,
+            right_clearance_m=right_clearance_m,
+            rear_clearance_m=rear_clearance_m,
+            front_blocked=bool(front_blocked),
+            candidate_open_directions=candidate_open_directions,
+            dead_end_likelihood=float(np.clip(dead_end_likelihood, 0.0, 1.0)),
+            best_exploration_direction=best_exploration_direction,
+        )
+
+    def _observation_state_from_artifacts(self, *, artifacts) -> dict[str, object]:
+        navigation_affordances = self._navigation_affordances_summary(artifacts=artifacts)
+        target_detection = self._target_detection_summary(artifacts=artifacts)
+        scene_graph_snapshot = getattr(artifacts, "scene_graph_snapshot", None)
+        visible_graph_relations = tuple(
+            f"{edge.source}->{edge.relation}->{edge.target}"
+            for edge in ((scene_graph_snapshot.visible_edges if scene_graph_snapshot is not None else ()) or ())
+        )
+        return {
+            "camera_pose_world": np.asarray(
+                getattr(artifacts, "camera_pose_world", np.empty((0, 0))),
+                dtype=np.float32,
+            ).copy(),
+            "yaw_deg": self._camera_yaw_deg(getattr(artifacts, "camera_pose_world", None)),
+            "target_detection": target_detection,
+            "visible_detection_labels": tuple(
+                str(getattr(item, "label", "")) for item in list(getattr(artifacts, "detections", []) or [])
+            ),
+            "visible_segment_labels": tuple(
+                str(getattr(item, "label", "")) for item in list(getattr(artifacts, "segments", []) or [])
+            ),
+            "visible_graph_relations": visible_graph_relations,
+            "navigation_affordances": navigation_affordances,
+            "mesh_vertex_count": int(np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3)))).shape[0]),
+            "mesh_triangle_count": int(np.asarray(getattr(artifacts, "mesh_triangles", np.empty((0, 3)))).shape[0]),
+            "tracking_status": str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
+        }
+
+    def _replan_frame_budget(self) -> int:
+        interval_sec = float(getattr(self._config, "sim_replan_interval_sec", 1.0))
+        fps = float(max(self._camera_rig.fps, 1e-6))
+        return max(1, int(math.ceil(interval_sec * fps)))
 
     def _target_detection_summary(self, *, artifacts) -> dict[str, float | str | None] | None:
         target_label = getattr(self._scene_spec, "semantic_target_class", "")
@@ -276,9 +415,185 @@ class LivingRoomEpisodeRunner:
                 return True
         return False
 
+    def _reconstruction_brief(self, *, observation_state: dict[str, object]) -> PlannerReconstructionBrief:
+        previous_state = self._previous_observation_state
+        pose_delta_m = None
+        yaw_delta_deg = None
+        mesh_growth_delta = 0
+        if previous_state is not None:
+            pose_delta_m = self._pose_progress_m(
+                previous_state.get("camera_pose_world"),
+                observation_state.get("camera_pose_world"),
+            )
+            yaw_delta_deg = self._angle_delta_deg(
+                previous_state.get("yaw_deg"),
+                observation_state.get("yaw_deg"),
+            )
+            mesh_growth_delta = int(observation_state["mesh_vertex_count"]) - int(previous_state.get("mesh_vertex_count", 0))
+        navigation_affordances = observation_state.get("navigation_affordances")
+        frontier_directions = ()
+        if isinstance(navigation_affordances, PlannerNavigationAffordances):
+            frontier_directions = tuple(navigation_affordances.candidate_open_directions[:3])
+        return PlannerReconstructionBrief(
+            pose_delta_m=pose_delta_m,
+            yaw_delta_deg=yaw_delta_deg,
+            mesh_vertex_count=int(observation_state["mesh_vertex_count"]),
+            mesh_triangle_count=int(observation_state["mesh_triangle_count"]),
+            mesh_growth_delta=int(mesh_growth_delta),
+            frontier_directions=frontier_directions,
+        )
+
+    @staticmethod
+    def _clearance_change_text(
+        previous_affordances: PlannerNavigationAffordances | None,
+        current_affordances: PlannerNavigationAffordances | None,
+    ) -> str:
+        if previous_affordances is None or current_affordances is None:
+            return "unknown"
+        previous_clearance = previous_affordances.forward_clearance_m
+        current_clearance = current_affordances.forward_clearance_m
+        if previous_clearance is None or current_clearance is None:
+            return "unknown"
+        delta = float(current_clearance) - float(previous_clearance)
+        if abs(delta) < 0.08:
+            return "forward:stable"
+        return f"forward:{delta:+.2f}m"
+
+    @staticmethod
+    def _target_evidence_change_text(
+        previous_target_detection: dict[str, float | str | None] | None,
+        current_target_detection: dict[str, float | str | None] | None,
+    ) -> str:
+        if previous_target_detection is None and current_target_detection is None:
+            return "none"
+        if previous_target_detection is None and current_target_detection is not None:
+            return "appeared"
+        if previous_target_detection is not None and current_target_detection is None:
+            return "lost"
+        previous_area = float(previous_target_detection.get("area_ratio") or 0.0)
+        current_area = float(current_target_detection.get("area_ratio") or 0.0)
+        if current_area >= previous_area + 0.01:
+            return "stronger"
+        if current_area + 0.01 < previous_area:
+            return "weaker"
+        return "stable"
+
+    def _likely_blocked(
+        self,
+        *,
+        step: ActionStep,
+        previous_state: dict[str, object],
+        current_state: dict[str, object],
+    ) -> bool:
+        translation_progress = self._pose_progress_m(
+            previous_state.get("camera_pose_world"),
+            current_state.get("camera_pose_world"),
+        )
+        yaw_delta_deg = self._angle_delta_deg(
+            previous_state.get("yaw_deg"),
+            current_state.get("yaw_deg"),
+        )
+        previous_affordances = previous_state.get("navigation_affordances")
+        current_affordances = current_state.get("navigation_affordances")
+        if step.primitive in {
+            ActionPrimitive.MOVE_FORWARD,
+            ActionPrimitive.MOVE_BACKWARD,
+            ActionPrimitive.STRAFE_LEFT,
+            ActionPrimitive.STRAFE_RIGHT,
+        }:
+            previous_forward = (
+                None
+                if not isinstance(previous_affordances, PlannerNavigationAffordances)
+                else previous_affordances.forward_clearance_m
+            )
+            current_forward = (
+                None
+                if not isinstance(current_affordances, PlannerNavigationAffordances)
+                else current_affordances.forward_clearance_m
+            )
+            if translation_progress is not None and translation_progress < 0.025:
+                if previous_forward is None or previous_forward < 1.0:
+                    return True
+                if current_forward is not None and current_forward <= previous_forward + 0.05:
+                    return True
+        if step.primitive in {ActionPrimitive.TURN_LEFT, ActionPrimitive.TURN_RIGHT}:
+            return yaw_delta_deg is not None and abs(float(yaw_delta_deg)) < 2.0
+        return False
+
+    def _record_recent_action_effect(self, *, current_state: dict[str, object]) -> None:
+        if self._pending_action_step is None or self._previous_observation_state is None:
+            return
+        previous_state = self._previous_observation_state
+        translation_progress = self._pose_progress_m(
+            previous_state.get("camera_pose_world"),
+            current_state.get("camera_pose_world"),
+        )
+        yaw_delta_deg = self._angle_delta_deg(
+            previous_state.get("yaw_deg"),
+            current_state.get("yaw_deg"),
+        )
+        estimated_motion_parts = []
+        if translation_progress is not None:
+            estimated_motion_parts.append(f"translation={translation_progress:.2f}m")
+        if yaw_delta_deg is not None:
+            estimated_motion_parts.append(f"yaw={yaw_delta_deg:+.1f}deg")
+        if not estimated_motion_parts:
+            estimated_motion_parts.append("pose_unavailable")
+        effect = PlannerActionEffectSummary(
+            action=self._format_action_step(self._pending_action_step),
+            estimated_motion=", ".join(estimated_motion_parts),
+            clearance_change=self._clearance_change_text(
+                previous_state.get("navigation_affordances"),
+                current_state.get("navigation_affordances"),
+            ),
+            target_evidence_change=self._target_evidence_change_text(
+                previous_state.get("target_detection"),
+                current_state.get("target_detection"),
+            ),
+            likely_blocked=self._likely_blocked(
+                step=self._pending_action_step,
+                previous_state=previous_state,
+                current_state=current_state,
+            ),
+        )
+        self._recent_action_effects.append(effect)
+        self._recent_action_effects = self._recent_action_effects[-4:]
+        self._pending_action_step = None
+
     def _finalize_completed_search(self, *, artifacts) -> None:
         if self._active_schedule_start_frame is None:
             return
+        current_state = self._observation_state_from_artifacts(artifacts=artifacts)
+        start_state = self._active_schedule_start_observation or {}
+        pose_progress_m = self._pose_progress_m(
+            start_state.get("camera_pose_world"),
+            current_state.get("camera_pose_world"),
+        )
+        start_signature = {
+            "detections": set(start_state.get("visible_detection_labels", ())),
+            "segments": set(start_state.get("visible_segment_labels", ())),
+            "relations": set(start_state.get("visible_graph_relations", ())),
+        }
+        end_signature = {
+            "detections": set(current_state.get("visible_detection_labels", ())),
+            "segments": set(current_state.get("visible_segment_labels", ())),
+            "relations": set(current_state.get("visible_graph_relations", ())),
+        }
+        entered_new_view = bool(
+            end_signature["detections"] - start_signature["detections"]
+            or end_signature["segments"] - start_signature["segments"]
+            or end_signature["relations"] - start_signature["relations"]
+            or (pose_progress_m is not None and pose_progress_m >= 0.08)
+        )
+        evidence_gained = bool(
+            self._target_evidence_change_text(
+                start_state.get("target_detection"),
+                current_state.get("target_detection"),
+            )
+            in {"appeared", "stronger"}
+            or entered_new_view
+        )
+        likely_blocked = any(item.likely_blocked for item in self._recent_action_effects[-4:])
         self._completed_search_history.append(
             PlannerSearchOutcome(
                 start_frame=int(self._active_schedule_start_frame),
@@ -286,10 +601,15 @@ class LivingRoomEpisodeRunner:
                 executed_actions=tuple(self._active_schedule_executed_steps),
                 target_visible_after_search=self._target_visible_in_artifacts(artifacts=artifacts),
                 tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
+                entered_new_view=entered_new_view,
+                pose_progress_m=pose_progress_m,
+                likely_blocked=likely_blocked,
+                evidence_gained=evidence_gained,
             )
         )
         self._completed_search_history = self._completed_search_history[-4:]
         self._active_schedule_start_frame = None
+        self._active_schedule_start_observation = None
         self._active_schedule_executed_steps = []
 
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
@@ -301,6 +621,7 @@ class LivingRoomEpisodeRunner:
             frame_bgr=np.asarray(sensor_frame.frame_bgr, dtype=np.uint8),
             timestamp_sec=float(sensor_frame.timestamp_sec),
             planner_context=self._latest_planner_context,
+            planner_schedule=self._latest_planner_schedule,
             calibration_source="self_calibration/converged"
             if self._state.selfcal_step_index >= len(self._selfcal_actions)
             else "self_calibration/pending",
@@ -310,11 +631,15 @@ class LivingRoomEpisodeRunner:
         _ = frame_packet
         if self._closed or self._latest_sensor_frame is None:
             return
+        current_state = self._observation_state_from_artifacts(artifacts=artifacts)
+        self._record_recent_action_effect(current_state=current_state)
         if self._goal_visually_reached(artifacts=artifacts):
+            self._previous_observation_state = current_state
             self._mark_goal_completed()
             return
 
         next_command = self._select_next_command(artifacts=artifacts)
+        self._previous_observation_state = current_state
         self._latest_sensor_frame = self._sensor_backend.apply_action(next_command)
         self._state.frame_index += 1
         self._state.elapsed_sec += 1.0 / max(self._camera_rig.fps, 1e-6)
@@ -346,6 +671,7 @@ class LivingRoomEpisodeRunner:
         else:
             step = ActionStep(ActionPrimitive.PAUSE, 0.5)
         self._action_history.append(self._format_action_step(step))
+        self._pending_action_step = step
         return command_from_step(step.primitive, step.value)
 
     def _advance_self_calibration(self) -> ActionStep:
@@ -360,6 +686,11 @@ class LivingRoomEpisodeRunner:
 
     def _plan_next_schedule(self, *, artifacts) -> None:
         self._finalize_completed_search(artifacts=artifacts)
+        observation_state = self._observation_state_from_artifacts(artifacts=artifacts)
+        reconstruction_brief = self._reconstruction_brief(observation_state=observation_state)
+        batch_step_limit = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
+        replan_frame_budget = self._replan_frame_budget()
+        depth_map = np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1))), dtype=np.float32)
         context = build_planner_context(
             phase=self._state.phase,
             frame_index=self._state.frame_index,
@@ -367,12 +698,14 @@ class LivingRoomEpisodeRunner:
             detections=list(getattr(artifacts, "detections", []) or []),
             scene_graph_snapshot=getattr(artifacts, "scene_graph_snapshot", None),
             reconstruction_summary={
-                "mesh_vertices": int(np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3)))).shape[0]),
-                "tracked_points": int(np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3)))).shape[0]),
+                "mesh_vertices": int(reconstruction_brief.mesh_vertex_count),
+                "mesh_triangles": int(reconstruction_brief.mesh_triangle_count),
+                "tracked_points": int(reconstruction_brief.mesh_vertex_count),
+                "mesh_growth_delta": int(reconstruction_brief.mesh_growth_delta),
             },
             depth_summary={
-                "min_depth_m": float(np.nanmin(np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1)))))),
-                "median_depth_m": float(np.nanmedian(np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1)))))),
+                "min_depth_m": float(np.nanmin(depth_map)),
+                "median_depth_m": float(np.nanmedian(depth_map)),
             },
             recent_actions=tuple(self._action_history[-8:]),
             recent_searches=tuple(self._completed_search_history),
@@ -381,7 +714,20 @@ class LivingRoomEpisodeRunner:
                 "converged" if self._state.selfcal_step_index >= len(self._selfcal_actions) else "pending"
             ),
             tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
-            target_detection=self._target_detection_summary(artifacts=artifacts),
+            target_detection=observation_state.get("target_detection"),
+            segments=list(getattr(artifacts, "segments", []) or []),
+            depth_map=depth_map,
+            frame_shape=tuple(np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape[:2]),
+            navigation_affordances=observation_state.get("navigation_affordances"),
+            reconstruction_brief=reconstruction_brief,
+            recent_action_effects=tuple(self._recent_action_effects),
+            batch_step_limit=batch_step_limit,
+            replan_frame_budget=replan_frame_budget,
+            tracking_safe_limits={
+                primitive.value: self._tracking_safe_step_limit(primitive)
+                for primitive in ActionPrimitive
+                if self._tracking_safe_step_limit(primitive) is not None
+            },
         )
         try:
             schedule = self._planner.plan(context=context)
@@ -393,8 +739,7 @@ class LivingRoomEpisodeRunner:
                 issued_at_frame=self._state.frame_index,
             )
         self._latest_planner_context = context
-        max_schedule_steps = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
-        truncated_steps = tuple(schedule.steps[:max_schedule_steps])
+        truncated_steps = tuple(schedule.steps[:batch_step_limit])
         if truncated_steps != schedule.steps:
             schedule = ActionSchedule(
                 steps=truncated_steps,
@@ -409,8 +754,10 @@ class LivingRoomEpisodeRunner:
                 model=getattr(self._planner, "model", "fallback"),
                 issued_at_frame=self._state.frame_index,
             )
+        self._latest_planner_schedule = schedule
         self._current_schedule = schedule
         self._active_schedule_start_frame = int(self._state.frame_index)
+        self._active_schedule_start_observation = observation_state
         self._active_schedule_executed_steps = []
         self._state.schedule_cursor = 0
         self._executed_schedule_steps = 0
@@ -442,11 +789,17 @@ class LivingRoomEpisodeRunner:
         self._active_schedule_executed_steps.append(self._format_action_step(step))
         self._executed_schedule_steps += 1
         max_schedule_steps = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
+        replan_frame_budget = self._replan_frame_budget()
         if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
             self._current_schedule = None
             self._executed_schedule_steps = 0
             self._state.phase = EpisodePhase.REASSESS
         elif self._executed_schedule_steps >= max_schedule_steps:
+            self._current_schedule = None
+            self._state.schedule_cursor = 0
+            self._executed_schedule_steps = 0
+            self._state.phase = EpisodePhase.REASSESS
+        elif self._executed_schedule_steps >= replan_frame_budget:
             self._current_schedule = None
             self._state.schedule_cursor = 0
             self._executed_schedule_steps = 0
@@ -494,62 +847,13 @@ class LivingRoomEpisodeRunner:
         lines = []
         for item in self._planner_turn_logs:
             prompt = item["prompt"]
+            prompt_payload = json.loads(planner_prompt_from_context(prompt))
             lines.append(
                 json.dumps(
                     {
                         "frame_index": item["frame_index"],
                         "phase": item["phase"],
-                        "prompt": {
-                            "phase": prompt.phase.value,
-                            "frame_index": prompt.frame_index,
-                            "goal_description": prompt.goal_description,
-                            "visible_detections": list(prompt.perception.visible_detections),
-                            "visible_segments": list(prompt.perception.visible_segments),
-                            "visible_graph_relations": list(prompt.perception.visible_graph_relations),
-                            "reconstruction_summary": dict(prompt.perception.reconstruction_summary),
-                            "depth_summary": dict(prompt.perception.depth_summary),
-                            "target_detection": (
-                                None
-                                if prompt.perception.target_detection is None
-                                else dict(prompt.perception.target_detection)
-                            ),
-                            "calibration_status": prompt.perception.calibration_status,
-                            "tracking_status": prompt.perception.tracking_status,
-                            "memory": {
-                                "target_memory": (
-                                    None
-                                    if prompt.memory.target_memory is None
-                                    else {
-                                        "label": prompt.memory.target_memory.label,
-                                        "kind": prompt.memory.target_memory.kind,
-                                        "state": prompt.memory.target_memory.state,
-                                        "last_seen_direction": prompt.memory.target_memory.last_seen_direction,
-                                        "age_frames": int(prompt.memory.target_memory.age_frames),
-                                    }
-                                ),
-                                "nonvisible_observations": [
-                                    {
-                                        "label": observation.label,
-                                        "kind": observation.kind,
-                                        "state": observation.state,
-                                        "last_seen_direction": observation.last_seen_direction,
-                                        "age_frames": int(observation.age_frames),
-                                    }
-                                    for observation in prompt.memory.nonvisible_observations
-                                ],
-                                "recent_searches": [
-                                    {
-                                        "start_frame": int(search.start_frame),
-                                        "end_frame": int(search.end_frame),
-                                        "executed_actions": list(search.executed_actions),
-                                        "target_visible_after_search": bool(search.target_visible_after_search),
-                                        "tracking_status": search.tracking_status,
-                                    }
-                                    for search in prompt.memory.recent_searches
-                                ],
-                            },
-                            "recent_actions": list(prompt.recent_actions),
-                        },
+                        "prompt": prompt_payload,
                         "schedule": item["schedule"],
                     },
                     ensure_ascii=False,
