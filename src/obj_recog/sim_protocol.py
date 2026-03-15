@@ -211,6 +211,7 @@ class PlannerActionEffectSummary:
     vision_progress_m: float | None = None
     fused_progress_m: float | None = None
     progress_source: str = "unknown"
+    frame_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +271,10 @@ class PlannerMemoryObservation:
     state: str
     last_seen_direction: str | None
     age_frames: int
+    last_seen_frame: int | None = None
+    confidence: float | None = None
+    relative_xyz: tuple[float, float, float] | None = None
+    distance_bucket: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +298,24 @@ class PlannerMemorySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerGoalCompletionEvidence:
+    forward_progress_since_last_seen_m: float | None
+    estimated_remaining_distance_m: float | None
+    recent_close_sighting: bool
+    target_disappeared_after_approach: bool
+    memory_freshness: str
+    anchor_matches: int
+    contradictions: tuple[str, ...] = ()
+    last_seen_frame: int | None = None
+    last_seen_direction: str | None = None
+    last_seen_relative_xyz: tuple[float, float, float] | None = None
+    last_seen_distance_bucket: str | None = None
+    target_memory_confidence: float | None = None
+    anchor_labels: tuple[str, ...] = ()
+    visible_anchor_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerContext:
     phase: EpisodePhase
     frame_index: int
@@ -301,6 +324,7 @@ class PlannerContext:
     perception: PerceptionSnapshot
     memory: PlannerMemorySnapshot
     goal_estimate: PlannerGoalEstimate
+    goal_completion_evidence: PlannerGoalCompletionEvidence | None
     recent_action_effects: tuple[PlannerActionEffectSummary, ...]
     constraints: PlannerConstraintSummary
     recent_actions: tuple[str, ...]

@@ -21,6 +21,7 @@ from obj_recog.sim_protocol import (
     PlannerConstraintSummary,
     PlannerContext,
     PlannerGoalCompletion,
+    PlannerGoalCompletionEvidence,
     PlannerGoalEstimate,
     PlannerMemoryObservation,
     PlannerMemorySnapshot,
@@ -51,10 +52,13 @@ _PLANNER_SYSTEM_INSTRUCTIONS = (
     "For aim_camera, yaw_deg > 0 means right, yaw_deg < 0 means left, pitch_deg > 0 means up, pitch_deg < 0 means down. "
     "aim_camera sets an absolute camera yaw/pitch target, not a relative pan. "
     "rotate_body is always relative body yaw, and translate is always relative body-frame motion. "
-    "Judge final goal completion from the current evidence, not from hidden ground truth. "
-    "Use detections, segmentation labels, scene-graph memory, relative_xyz, depth hints, and recent action effects together. "
-    "If the goal already appears achieved, set goal_completion.reached=true, explain why in goal_completion.rationale, "
-    "and do not request extra motion. "
+    "Judge goal_completion before planning actions, using only current prompt evidence and not hidden ground truth. "
+    "Use detections, segmentation labels, scene-graph memory, relative_xyz, depth hints, goal_completion_evidence, and recent action effects together. "
+    "If target_detection is missing, you may still set goal_completion.reached=true when target memory is fresh or warm and at least two strong cues support arrival: "
+    "estimated_remaining_distance_m <= 1.0, target_disappeared_after_approach=true, recent_close_sighting=true, or anchor_matches >= 2. "
+    "Bias goal_completion.reached=false when memory_freshness is stale, contradictions is non-empty, or estimated_remaining_distance_m > 1.5. "
+    "Only set goal_completion.reached=true when goal_completion.confidence >= 0.65. "
+    "When goal_completion.reached=true, goal_completion.rationale must cite the evidence field names you used and commands must be empty or pause-only. "
     "Behavior modes: "
     "If goal_hypothesis.status is visible, center the target first and then approach it. "
     "Do not mix opposing body rotations or contradictory camera aims in the same batch. "
@@ -131,13 +135,27 @@ def _visible_target_present(
     return False
 
 
-def _memory_observation_from_node(node: GraphNode, *, frame_index: int) -> PlannerMemoryObservation:
+def _memory_observation_from_node(
+    node: GraphNode,
+    *,
+    frame_index: int,
+    camera_pose_world: np.ndarray | None,
+) -> PlannerMemoryObservation:
+    relative_xyz = _relative_xyz(
+        world_centroid=node.world_centroid,
+        camera_pose_world=camera_pose_world,
+    )
+    depth_m = None if relative_xyz is None else max(0.0, float(relative_xyz[2]))
     return PlannerMemoryObservation(
         label=str(node.label),
         kind=str(node.type),
         state=str(node.state),
         last_seen_direction=node.last_seen_direction,
         age_frames=max(0, int(frame_index) - int(node.last_seen_frame)),
+        last_seen_frame=int(node.last_seen_frame),
+        confidence=float(node.confidence),
+        relative_xyz=relative_xyz,
+        distance_bucket=_distance_bucket(depth_m),
     )
 
 
@@ -157,6 +175,7 @@ def _planner_memory_snapshot(
         )
 
     recent_searches_tuple = tuple(recent_searches)
+    camera_pose_world = scene_graph_snapshot.camera_pose_world
     visible_target_present = _visible_target_present(
         detections=detections,
         scene_graph_snapshot=scene_graph_snapshot,
@@ -180,7 +199,11 @@ def _planner_memory_snapshot(
     target_memory = None
     if not visible_target_present and target_candidates:
         latest_target = max(target_candidates, key=lambda item: (int(item.last_seen_frame), float(item.confidence)))
-        target_memory = _memory_observation_from_node(latest_target, frame_index=frame_index)
+        target_memory = _memory_observation_from_node(
+            latest_target,
+            frame_index=frame_index,
+            camera_pose_world=camera_pose_world,
+        )
 
     nonvisible_nodes = sorted(
         nonvisible_by_kind_label.values(),
@@ -188,7 +211,11 @@ def _planner_memory_snapshot(
         reverse=True,
     )[:6]
     nonvisible_observations = tuple(
-        _memory_observation_from_node(node, frame_index=frame_index)
+        _memory_observation_from_node(
+            node,
+            frame_index=frame_index,
+            camera_pose_world=camera_pose_world,
+        )
         for node in nonvisible_nodes
     )
     return PlannerMemorySnapshot(
@@ -630,6 +657,15 @@ def _target_family(target_label: str) -> str:
     return "generic"
 
 
+def _memory_freshness(age_frames: int) -> str:
+    age = max(0, int(age_frames))
+    if age <= 6:
+        return "fresh"
+    if age <= 18:
+        return "warm"
+    return "stale"
+
+
 def _goal_estimate_from_context(
     *,
     target_label: str,
@@ -654,15 +690,27 @@ def _goal_estimate_from_context(
         )
 
     if memory.target_memory is not None:
+        freshness = _memory_freshness(memory.target_memory.age_frames)
         evidence_sources = ["target_memory"]
         if memory.target_memory.last_seen_direction:
             evidence_sources.append(f"memory_direction:{memory.target_memory.last_seen_direction}")
+        if memory.target_memory.distance_bucket:
+            evidence_sources.append(f"memory_distance:{memory.target_memory.distance_bucket}")
+        if memory.target_memory.relative_xyz is not None:
+            evidence_sources.append(
+                "memory_relative_xyz:"
+                + ",".join(f"{float(value):.3f}" for value in memory.target_memory.relative_xyz)
+            )
         return PlannerGoalEstimate(
             status="remembered",
             bearing_hint=memory.target_memory.last_seen_direction,
-            distance_hint=None if memory.target_memory.age_frames <= 6 else "stale_memory",
+            distance_hint=(
+                memory.target_memory.distance_bucket
+                if memory.target_memory.distance_bucket is not None
+                else ("stale_memory" if freshness == "stale" else None)
+            ),
             evidence_sources=tuple(evidence_sources),
-            confidence=0.72 if memory.target_memory.age_frames <= 6 else 0.5,
+            confidence={"fresh": 0.76, "warm": 0.66, "stale": 0.45}[freshness],
         )
 
     object_items = tuple(object_observations)
@@ -814,6 +862,7 @@ def build_planner_context(
     navigation_affordances: PlannerNavigationAffordances | None = None,
     reconstruction_brief: PlannerReconstructionBrief | None = None,
     goal_estimate: PlannerGoalEstimate | None = None,
+    goal_completion_evidence: PlannerGoalCompletionEvidence | None = None,
     recent_action_effects: Iterable[PlannerActionEffectSummary] = (),
     constraints: PlannerConstraintSummary | None = None,
     allowed_command_kinds: Iterable[str] | None = None,
@@ -914,6 +963,7 @@ def build_planner_context(
         ),
         memory=memory,
         goal_estimate=resolved_goal_estimate,
+        goal_completion_evidence=goal_completion_evidence,
         recent_action_effects=tuple(recent_action_effects)[-4:],
         constraints=resolved_constraints,
         recent_actions=tuple(str(item) for item in recent_actions),
@@ -937,6 +987,10 @@ def _memory_prompt_payload(memory: PlannerMemorySnapshot) -> dict[str, object]:
                 "state": memory.target_memory.state,
                 "last_seen_direction": memory.target_memory.last_seen_direction,
                 "age_frames": int(memory.target_memory.age_frames),
+                "last_seen_frame": memory.target_memory.last_seen_frame,
+                "confidence": memory.target_memory.confidence,
+                "relative_xyz": memory.target_memory.relative_xyz,
+                "distance_bucket": memory.target_memory.distance_bucket,
             }
         ),
         "nonvisible_observations": [
@@ -946,6 +1000,10 @@ def _memory_prompt_payload(memory: PlannerMemorySnapshot) -> dict[str, object]:
                 "state": item.state,
                 "last_seen_direction": item.last_seen_direction,
                 "age_frames": int(item.age_frames),
+                "last_seen_frame": item.last_seen_frame,
+                "confidence": item.confidence,
+                "relative_xyz": item.relative_xyz,
+                "distance_bucket": item.distance_bucket,
             }
             for item in memory.nonvisible_observations
         ],
@@ -966,6 +1024,29 @@ def _memory_prompt_payload(memory: PlannerMemorySnapshot) -> dict[str, object]:
     }
 
 
+def _goal_completion_evidence_payload(
+    evidence: PlannerGoalCompletionEvidence | None,
+) -> dict[str, object] | None:
+    if evidence is None:
+        return None
+    return {
+        "forward_progress_since_last_seen_m": evidence.forward_progress_since_last_seen_m,
+        "estimated_remaining_distance_m": evidence.estimated_remaining_distance_m,
+        "recent_close_sighting": bool(evidence.recent_close_sighting),
+        "target_disappeared_after_approach": bool(evidence.target_disappeared_after_approach),
+        "memory_freshness": evidence.memory_freshness,
+        "anchor_matches": int(evidence.anchor_matches),
+        "contradictions": list(evidence.contradictions),
+        "last_seen_frame": evidence.last_seen_frame,
+        "last_seen_direction": evidence.last_seen_direction,
+        "last_seen_relative_xyz": evidence.last_seen_relative_xyz,
+        "last_seen_distance_bucket": evidence.last_seen_distance_bucket,
+        "target_memory_confidence": evidence.target_memory_confidence,
+        "anchor_labels": list(evidence.anchor_labels),
+        "visible_anchor_labels": list(evidence.visible_anchor_labels),
+    }
+
+
 def _goal_hypothesis_payload(goal_estimate: PlannerGoalEstimate) -> dict[str, object]:
     return {
         "status": goal_estimate.status,
@@ -980,6 +1061,7 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
     navigation_affordances = context.perception.navigation_affordances
     reconstruction_brief = context.perception.reconstruction_brief
     memory_payload = _memory_prompt_payload(context.memory)
+    goal_completion_evidence = _goal_completion_evidence_payload(context.goal_completion_evidence)
     current_camera_state = context.perception.current_camera_state
     return {
         "request_type": "multimodal_planner_core",
@@ -1019,6 +1101,7 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
             "evidence_sources": list(context.goal_estimate.evidence_sources),
             "confidence": float(context.goal_estimate.confidence),
         },
+        "goal_completion_evidence": goal_completion_evidence,
         "robot_state": {
             "tracking_status": context.perception.tracking_status,
             "calibration_status": context.perception.calibration_status,
@@ -1043,6 +1126,7 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                     "vision_progress_m": item.vision_progress_m,
                     "fused_progress_m": item.fused_progress_m,
                     "progress_source": item.progress_source,
+                    "frame_index": item.frame_index,
                 }
                 for item in context.recent_action_effects
             ],
@@ -1223,6 +1307,7 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                 "vision_progress_m": item.vision_progress_m,
                 "fused_progress_m": item.fused_progress_m,
                 "progress_source": item.progress_source,
+                "frame_index": item.frame_index,
             }
             for item in context.recent_action_effects
         ],

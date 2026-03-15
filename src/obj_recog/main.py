@@ -153,8 +153,10 @@ def _planner_summary_text_from_frame_packet(frame_packet: FramePacket | None) ->
     if frame_packet is None or getattr(frame_packet, "planner_schedule", None) is None:
         return ""
     schedule = frame_packet.planner_schedule
+    planner_context = getattr(frame_packet, "planner_context", None)
     goal_hypothesis = getattr(schedule, "goal_hypothesis", None)
     goal_completion = getattr(schedule, "goal_completion", None)
+    goal_completion_evidence = None if planner_context is None else getattr(planner_context, "goal_completion_evidence", None)
     safety_flags = getattr(schedule, "safety_flags", None)
     summary_lines = [
         str(getattr(schedule, "situation_summary", "") or getattr(schedule, "rationale", "")).strip(),
@@ -169,6 +171,26 @@ def _planner_summary_text_from_frame_packet(frame_packet: FramePacket | None) ->
         rationale = str(getattr(goal_completion, "rationale", "")).strip()
         if rationale:
             summary_lines.append(f"Completion rationale: {rationale}")
+    if goal_completion_evidence is not None:
+        evidence_parts = [
+            f"memory={str(getattr(goal_completion_evidence, 'memory_freshness', 'none'))}",
+            f"anchor_matches={int(getattr(goal_completion_evidence, 'anchor_matches', 0))}",
+            (
+                "recent_close_sighting="
+                + str(bool(getattr(goal_completion_evidence, "recent_close_sighting", False))).lower()
+            ),
+            (
+                "target_disappeared_after_approach="
+                + str(bool(getattr(goal_completion_evidence, "target_disappeared_after_approach", False))).lower()
+            ),
+        ]
+        estimated_remaining_distance_m = getattr(goal_completion_evidence, "estimated_remaining_distance_m", None)
+        if estimated_remaining_distance_m is not None:
+            evidence_parts.append(f"estimated_remaining_distance_m={float(estimated_remaining_distance_m):.2f}")
+        contradictions = tuple(getattr(goal_completion_evidence, "contradictions", ()) or ())
+        if contradictions:
+            evidence_parts.append("contradictions=" + ", ".join(str(item) for item in contradictions))
+        summary_lines.append("Completion evidence: " + " | ".join(evidence_parts))
     if goal_hypothesis is not None:
         evidence = ", ".join(str(item) for item in tuple(getattr(goal_hypothesis, "evidence_sources", ()) or ()))
         summary_lines.append(

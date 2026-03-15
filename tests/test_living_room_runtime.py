@@ -8,11 +8,13 @@ import pytest
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
+from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import (
     ActionSchedule,
     CommandKind,
     EpisodePhase,
     MotionCommand,
+    PlannerActionEffectSummary,
     PlannerGoalCompletion,
     RigCapabilities,
     SensorFrame,
@@ -136,6 +138,7 @@ def _artifacts(
     packet: FramePacket,
     *,
     detections: list[object] | None = None,
+    scene_graph_snapshot: SceneGraphSnapshot | None = None,
     slam_tracking_state: str = "TRACKING",
     depth_m: float = 1.5,
     camera_pose_world: np.ndarray | None = None,
@@ -152,7 +155,7 @@ def _artifacts(
             "frame_bgr": np.asarray(packet.frame_bgr, dtype=np.uint8),
             "detections": list(detections or []),
             "segments": [],
-            "scene_graph_snapshot": None,
+            "scene_graph_snapshot": scene_graph_snapshot,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
             "mesh_triangles": np.empty((0, 3), dtype=np.int32),
             "depth_map": depth_map,
@@ -180,6 +183,81 @@ def _goal_artifacts(packet: FramePacket):
         detections=[_detection(label="tv", xyxy=(1, 1, 15, 11))],
         depth_m=1.6,
         camera_pose_world=np.eye(4, dtype=np.float32),
+    )
+
+
+def _scene_graph_snapshot_for_goal_memory() -> SceneGraphSnapshot:
+    return SceneGraphSnapshot(
+        frame_index=40,
+        camera_pose_world=np.eye(4, dtype=np.float32),
+        nodes=(
+            GraphNode(
+                id="ego",
+                type="ego",
+                label="ego",
+                state="visible",
+                confidence=1.0,
+                world_centroid=None,
+                last_seen_frame=40,
+                last_seen_direction=None,
+                source_track_id=None,
+            ),
+            GraphNode(
+                id="tv-1",
+                type="object",
+                label="tv",
+                state="occluded",
+                confidence=0.89,
+                world_centroid=np.array([0.15, 0.0, 0.95], dtype=np.float32),
+                last_seen_frame=38,
+                last_seen_direction="front",
+                source_track_id=7,
+            ),
+            GraphNode(
+                id="wall-1",
+                type="segment",
+                label="wall",
+                state="visible",
+                confidence=0.99,
+                world_centroid=np.array([0.1, 0.0, 2.6], dtype=np.float32),
+                last_seen_frame=40,
+                last_seen_direction="front",
+                source_track_id=8,
+            ),
+            GraphNode(
+                id="cabinet-1",
+                type="object",
+                label="cabinet",
+                state="visible",
+                confidence=0.91,
+                world_centroid=np.array([0.4, 0.0, 1.3], dtype=np.float32),
+                last_seen_frame=40,
+                last_seen_direction="front-right",
+                source_track_id=9,
+            ),
+        ),
+        edges=(
+            GraphEdge(
+                source="tv-1",
+                target="wall-1",
+                relation="attached_to",
+                confidence=0.83,
+                last_updated_frame=38,
+                distance_bucket="near",
+                source_kind="detection",
+            ),
+            GraphEdge(
+                source="tv-1",
+                target="cabinet-1",
+                relation="above",
+                confidence=0.79,
+                last_updated_frame=38,
+                distance_bucket="near",
+                source_kind="detection",
+            ),
+        ),
+        visible_node_ids=("ego", "wall-1", "cabinet-1"),
+        visible_edge_keys=(),
     )
 
 
@@ -337,7 +415,7 @@ def test_living_room_runtime_logs_target_detection_with_relative_xyz_and_camera_
     assert payload["prompt"]["robot_state"]["current_camera_state"] == {"yaw_deg": 0.0, "pitch_deg": 0.0}
 
 
-def test_living_room_runtime_marks_success_when_target_is_visually_reached(tmp_path: Path) -> None:
+def test_living_room_runtime_does_not_mark_success_from_visual_reach_without_llm_completion(tmp_path: Path) -> None:
     runner = LivingRoomEpisodeRunner(
         config=_config(),
         report_path=tmp_path / "episode.json",
@@ -352,9 +430,9 @@ def test_living_room_runtime_marks_success_when_target_is_visually_reached(tmp_p
     runner.record_runtime_observation(frame_packet=packet, artifacts=_goal_artifacts(packet))
 
     report_payload = json.loads((tmp_path / "episode_report.json").read_text(encoding="utf-8"))
-    assert runner.next_frame() is None
-    assert report_payload["success"] is True
-    assert report_payload["final_phase"] == EpisodePhase.SUCCEEDED.value
+    assert report_payload["success"] is None
+    assert report_payload["final_phase"] != EpisodePhase.SUCCEEDED.value
+    assert runner.current_schedule is not None
 
 
 def test_living_room_runtime_marks_success_when_planner_reports_goal_completion(tmp_path: Path) -> None:
@@ -395,6 +473,90 @@ def test_living_room_runtime_marks_success_when_planner_reports_goal_completion(
     assert runner.next_frame() is None
     assert report_payload["success"] is True
     assert report_payload["final_phase"] == EpisodePhase.SUCCEEDED.value
+
+
+def test_living_room_runtime_passes_goal_completion_evidence_to_planner_and_logs_it(tmp_path: Path) -> None:
+    class _EvidencePlanner:
+        model = "fake-llm"
+
+        def __init__(self) -> None:
+            self.contexts = []
+
+        def plan(self, *, context, frame_bgr=None):
+            _ = frame_bgr
+            self.contexts.append(context)
+            evidence = context.goal_completion_evidence
+            assert evidence is not None
+            assert evidence.memory_freshness == "fresh"
+            assert evidence.recent_close_sighting is True
+            assert evidence.target_disappeared_after_approach is True
+            assert evidence.anchor_matches == 2
+            assert evidence.estimated_remaining_distance_m == pytest.approx(0.55)
+            return ActionSchedule(
+                commands=(),
+                rationale="goal already completed from memory-guided evidence",
+                model=self.model,
+                issued_at_frame=context.frame_index,
+                situation_summary="The robot has already reached the TV front position.",
+                goal_hypothesis=context.goal_estimate,
+                goal_completion=PlannerGoalCompletion(
+                    reached=True,
+                    confidence=0.91,
+                    rationale=(
+                        "Reached from goal_completion_evidence: estimated_remaining_distance_m, "
+                        "target_disappeared_after_approach, recent_close_sighting, anchor_matches."
+                    ),
+                ),
+                confidence=0.91,
+            )
+
+    planner = _EvidencePlanner()
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+    runner._state.frame_index = 40
+    runner._recent_action_effects = [
+        PlannerActionEffectSummary(
+            action="translate:forward:distance_m:0.40",
+            estimated_motion="commanded=0.40m, fused=0.40m, source=commanded",
+            clearance_change="forward:-0.20m",
+            target_evidence_change="lost",
+            likely_blocked=False,
+            commanded_progress_m=0.40,
+            vision_progress_m=0.0,
+            fused_progress_m=0.40,
+            progress_source="commanded",
+            frame_index=39,
+        )
+    ]
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(
+            packet,
+            detections=[],
+            scene_graph_snapshot=_scene_graph_snapshot_for_goal_memory(),
+            camera_pose_world=np.eye(4, dtype=np.float32),
+        ),
+    )
+
+    report_payload = json.loads((tmp_path / "episode_report.json").read_text(encoding="utf-8"))
+    turns = (tmp_path / "planner_turns.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    prompt_payload = json.loads(turns[-1])["prompt"]
+    evidence_payload = prompt_payload["goal_completion_evidence"]
+
+    assert report_payload["success"] is True
+    assert evidence_payload["memory_freshness"] == "fresh"
+    assert evidence_payload["target_disappeared_after_approach"] is True
+    assert evidence_payload["anchor_matches"] == 2
+    assert evidence_payload["estimated_remaining_distance_m"] == pytest.approx(0.55)
 
 
 def test_living_room_runtime_logs_macro_actions_once_even_when_microstepped(tmp_path: Path) -> None:

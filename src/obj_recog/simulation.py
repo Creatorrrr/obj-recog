@@ -25,6 +25,7 @@ from obj_recog.sim_protocol import (
     PlannerActionEffectSummary,
     PlannerCameraState,
     PlannerGoalCompletion,
+    PlannerGoalCompletionEvidence,
     PlannerNavigationAffordances,
     PlannerNavigationSectorObservation,
     PlannerReconstructionBrief,
@@ -60,6 +61,11 @@ _DEFAULT_RIG_CAPABILITIES = RigCapabilities(
     camera_pitch_limit_deg=55.0,
 )
 _INITIALIZING_RECOVERY_FRAME_THRESHOLD = 6
+_GOAL_COMPLETION_CONFIDENCE_THRESHOLD = 0.65
+_GOAL_MEMORY_FRESH_MAX_AGE_FRAMES = 6
+_GOAL_MEMORY_WARM_MAX_AGE_FRAMES = 18
+_GOAL_COMPLETION_NEAR_DISTANCE_M = 1.5
+_GOAL_COMPLETION_MAX_REMAINING_DISTANCE_M = 1.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +360,257 @@ class LivingRoomEpisodeRunner:
             normalized_detection == normalized_target
             or normalized_target in normalized_detection
             or normalized_detection in normalized_target
+        )
+
+    @classmethod
+    def _labels_equivalent(cls, *, left_label: object, right_label: object) -> bool:
+        normalized_left = cls._normalize_label(left_label)
+        normalized_right = cls._normalize_label(right_label)
+        if not normalized_left or not normalized_right:
+            return False
+        if (
+            normalized_left == normalized_right
+            or normalized_left in normalized_right
+            or normalized_right in normalized_left
+        ):
+            return True
+        alias_groups = (
+            {"sofa", "couch"},
+            {"console", "tv_console", "media_console"},
+        )
+        return any(normalized_left in group and normalized_right in group for group in alias_groups)
+
+    @staticmethod
+    def _memory_freshness_label(age_frames: int | None) -> str:
+        if age_frames is None:
+            return "none"
+        age = max(0, int(age_frames))
+        if age <= _GOAL_MEMORY_FRESH_MAX_AGE_FRAMES:
+            return "fresh"
+        if age <= _GOAL_MEMORY_WARM_MAX_AGE_FRAMES:
+            return "warm"
+        return "stale"
+
+    @staticmethod
+    def _action_effect_progress_m(effect: PlannerActionEffectSummary) -> float:
+        for value in (
+            effect.fused_progress_m,
+            effect.commanded_progress_m,
+            effect.vision_progress_m,
+        ):
+            if value is not None:
+                return max(0.0, float(value))
+        return 0.0
+
+    def _latest_target_graph_node(self, *, scene_graph_snapshot):
+        if scene_graph_snapshot is None:
+            return None
+        target_label = getattr(self._scene_spec, "semantic_target_class", "")
+        matches = [
+            node
+            for node in tuple(getattr(scene_graph_snapshot, "nodes", ()) or ())
+            if getattr(node, "id", "") != "ego"
+            and self._label_matches_target(
+                detection_label=getattr(node, "label", ""),
+                target_label=target_label,
+            )
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: (int(getattr(item, "last_seen_frame", 0)), float(getattr(item, "confidence", 0.0))))
+
+    def _target_anchor_labels(self, *, scene_graph_snapshot, target_node) -> tuple[str, ...]:
+        if scene_graph_snapshot is None or target_node is None:
+            return ()
+        node_lookup = {
+            str(getattr(node, "id", "")): node
+            for node in tuple(getattr(scene_graph_snapshot, "nodes", ()) or ())
+        }
+        target_label = getattr(self._scene_spec, "semantic_target_class", "")
+        anchors: set[str] = set()
+        for edge in tuple(getattr(scene_graph_snapshot, "edges", ()) or ()):
+            other_node = None
+            if getattr(edge, "source", None) == getattr(target_node, "id", None):
+                other_node = node_lookup.get(str(getattr(edge, "target", "")))
+            elif getattr(edge, "target", None) == getattr(target_node, "id", None):
+                other_node = node_lookup.get(str(getattr(edge, "source", "")))
+            if other_node is None or getattr(other_node, "id", "") == "ego":
+                continue
+            anchor_label = self._normalize_label(getattr(other_node, "label", ""))
+            if anchor_label and not self._label_matches_target(
+                detection_label=anchor_label,
+                target_label=target_label,
+            ):
+                anchors.add(anchor_label)
+        target_centroid = np.asarray(getattr(target_node, "world_centroid", np.empty((0,))), dtype=np.float32)
+        if not anchors and target_centroid.shape == (3,):
+            for node in tuple(getattr(scene_graph_snapshot, "nodes", ()) or ()):
+                if getattr(node, "id", "") in {"ego", getattr(target_node, "id", "")}:
+                    continue
+                world_centroid = np.asarray(getattr(node, "world_centroid", np.empty((0,))), dtype=np.float32)
+                if world_centroid.shape != (3,):
+                    continue
+                if float(np.linalg.norm(world_centroid - target_centroid)) > 2.0:
+                    continue
+                anchor_label = self._normalize_label(getattr(node, "label", ""))
+                if anchor_label and not self._label_matches_target(
+                    detection_label=anchor_label,
+                    target_label=target_label,
+                ):
+                    anchors.add(anchor_label)
+        return tuple(sorted(anchors))
+
+    def _visible_context_labels(self, *, artifacts) -> tuple[str, ...]:
+        labels = {
+            self._normalize_label(getattr(item, "label", ""))
+            for item in tuple(getattr(artifacts, "detections", ()) or ())
+            if self._normalize_label(getattr(item, "label", ""))
+        }
+        labels.update(
+            self._normalize_label(getattr(item, "label", ""))
+            for item in tuple(getattr(artifacts, "segments", ()) or ())
+            if self._normalize_label(getattr(item, "label", ""))
+        )
+        scene_graph_snapshot = getattr(artifacts, "scene_graph_snapshot", None)
+        if scene_graph_snapshot is not None:
+            for node in tuple(getattr(scene_graph_snapshot, "visible_nodes", ()) or ()):
+                if getattr(node, "id", "") == "ego":
+                    continue
+                label = self._normalize_label(getattr(node, "label", ""))
+                if label:
+                    labels.add(label)
+        return tuple(sorted(labels))
+
+    def _goal_completion_evidence(
+        self,
+        *,
+        artifacts,
+        observation_state: dict[str, object],
+    ) -> PlannerGoalCompletionEvidence:
+        frame_index = int(self._state.frame_index)
+        target_detection = observation_state.get("target_detection")
+        scene_graph_snapshot = getattr(artifacts, "scene_graph_snapshot", None)
+        target_node = self._latest_target_graph_node(scene_graph_snapshot=scene_graph_snapshot)
+        target_visible = target_detection is not None
+
+        last_seen_frame = None if target_node is None else int(getattr(target_node, "last_seen_frame", 0))
+        last_seen_direction = None if target_node is None else getattr(target_node, "last_seen_direction", None)
+        target_memory_confidence = None if target_node is None else float(getattr(target_node, "confidence", 0.0))
+        age_frames = None if last_seen_frame is None else max(0, frame_index - last_seen_frame)
+        memory_freshness = self._memory_freshness_label(age_frames)
+
+        last_seen_relative_xyz = None
+        last_seen_distance_bucket = None
+        if target_visible:
+            relative_xyz_value = target_detection.get("relative_xyz") or target_detection.get("center_ray_xyz")
+            if isinstance(relative_xyz_value, (list, tuple)) and len(relative_xyz_value) == 3:
+                last_seen_relative_xyz = tuple(round(float(value), 3) for value in relative_xyz_value)
+            median_depth_m = target_detection.get("median_depth_m")
+            if median_depth_m is not None:
+                depth_m = max(0.0, float(median_depth_m))
+                last_seen_distance_bucket = (
+                    "near" if depth_m <= _GOAL_COMPLETION_NEAR_DISTANCE_M else "mid" if depth_m <= 3.5 else "far"
+                )
+            last_seen_direction = target_detection.get("horizontal_position") or last_seen_direction
+            target_memory_confidence = float(target_detection.get("confidence") or target_memory_confidence or 0.0)
+            last_seen_frame = frame_index
+            age_frames = 0
+            memory_freshness = "fresh"
+        elif target_node is not None:
+            camera_pose_world = np.asarray(getattr(artifacts, "camera_pose_world", np.empty((0, 0))), dtype=np.float32)
+            world_centroid = np.asarray(getattr(target_node, "world_centroid", np.empty((0,))), dtype=np.float32)
+            if world_centroid.shape == (3,) and camera_pose_world.shape == (4, 4):
+                pose_inv = np.linalg.inv(camera_pose_world)
+                homogeneous = np.concatenate((world_centroid, np.array([1.0], dtype=np.float32)))
+                camera_xyz = pose_inv @ homogeneous
+                last_seen_relative_xyz = tuple(round(float(value), 3) for value in camera_xyz[:3])
+                depth_m = max(0.0, float(last_seen_relative_xyz[2]))
+                last_seen_distance_bucket = (
+                    "near" if depth_m <= _GOAL_COMPLETION_NEAR_DISTANCE_M else "mid" if depth_m <= 3.5 else "far"
+                )
+
+        forward_progress_since_last_seen_m = None
+        if last_seen_frame is not None:
+            forward_progress_since_last_seen_m = round(
+                sum(
+                    self._action_effect_progress_m(effect)
+                    for effect in self._recent_action_effects
+                    if (effect.frame_index is None or int(effect.frame_index) > int(last_seen_frame))
+                    and str(effect.action).startswith("translate:forward")
+                ),
+                3,
+            )
+        elif target_visible:
+            forward_progress_since_last_seen_m = 0.0
+
+        estimated_remaining_distance_m = None
+        if target_visible and target_detection is not None and target_detection.get("median_depth_m") is not None:
+            estimated_remaining_distance_m = round(max(0.0, float(target_detection.get("median_depth_m") or 0.0)), 3)
+        elif last_seen_relative_xyz is not None:
+            last_seen_depth_m = max(0.0, float(last_seen_relative_xyz[2]))
+            progress_m = 0.0 if forward_progress_since_last_seen_m is None else float(forward_progress_since_last_seen_m)
+            estimated_remaining_distance_m = round(max(0.0, last_seen_depth_m - progress_m), 3)
+
+        recent_close_sighting = bool(
+            (last_seen_distance_bucket == "near")
+            or (last_seen_relative_xyz is not None and float(last_seen_relative_xyz[2]) <= _GOAL_COMPLETION_NEAR_DISTANCE_M)
+        )
+
+        target_disappeared_after_approach = bool(
+            not target_visible
+            and any(
+                str(effect.action).startswith("translate:forward")
+                and self._action_effect_progress_m(effect) >= 0.08
+                and str(effect.target_evidence_change) in {"lost", "weaker"}
+                and (last_seen_frame is None or effect.frame_index is None or int(effect.frame_index) > int(last_seen_frame))
+                for effect in self._recent_action_effects
+            )
+        )
+
+        anchor_labels = self._target_anchor_labels(
+            scene_graph_snapshot=scene_graph_snapshot,
+            target_node=target_node,
+        )
+        visible_labels = self._visible_context_labels(artifacts=artifacts)
+        visible_anchor_labels = tuple(
+            anchor_label
+            for anchor_label in anchor_labels
+            if any(
+                self._labels_equivalent(left_label=anchor_label, right_label=visible_label)
+                for visible_label in visible_labels
+            )
+        )
+        contradictions: list[str] = []
+        if not target_visible and target_node is None:
+            contradictions.append("no_target_memory_or_detection")
+        if memory_freshness == "stale":
+            contradictions.append("memory_freshness=stale")
+        if estimated_remaining_distance_m is not None and estimated_remaining_distance_m > _GOAL_COMPLETION_MAX_REMAINING_DISTANCE_M:
+            contradictions.append(
+                f"estimated_remaining_distance_m={float(estimated_remaining_distance_m):.2f}>1.5"
+            )
+        if target_visible and estimated_remaining_distance_m is not None and estimated_remaining_distance_m > _GOAL_COMPLETION_NEAR_DISTANCE_M:
+            contradictions.append(
+                f"visible_target_depth_m={float(estimated_remaining_distance_m):.2f}>1.5"
+            )
+        if anchor_labels and not visible_anchor_labels:
+            contradictions.append("anchor_matches=0")
+
+        return PlannerGoalCompletionEvidence(
+            forward_progress_since_last_seen_m=forward_progress_since_last_seen_m,
+            estimated_remaining_distance_m=estimated_remaining_distance_m,
+            recent_close_sighting=recent_close_sighting,
+            target_disappeared_after_approach=target_disappeared_after_approach,
+            memory_freshness=memory_freshness,
+            anchor_matches=len(visible_anchor_labels),
+            contradictions=tuple(contradictions),
+            last_seen_frame=last_seen_frame,
+            last_seen_direction=None if last_seen_direction is None else str(last_seen_direction),
+            last_seen_relative_xyz=last_seen_relative_xyz,
+            last_seen_distance_bucket=last_seen_distance_bucket,
+            target_memory_confidence=target_memory_confidence,
+            anchor_labels=anchor_labels,
+            visible_anchor_labels=visible_anchor_labels,
         )
 
     @staticmethod
@@ -836,7 +1093,11 @@ class LivingRoomEpisodeRunner:
     @staticmethod
     def _schedule_reports_goal_reached(schedule: ActionSchedule | None) -> bool:
         goal_completion = None if schedule is None else getattr(schedule, "goal_completion", None)
-        return bool(goal_completion is not None and bool(getattr(goal_completion, "reached", False)))
+        return bool(
+            goal_completion is not None
+            and bool(getattr(goal_completion, "reached", False))
+            and float(getattr(goal_completion, "confidence", 0.0) or 0.0) >= _GOAL_COMPLETION_CONFIDENCE_THRESHOLD
+        )
 
     def _visual_goal_completion_assessment(self, *, artifacts) -> PlannerGoalCompletion | None:
         target_detection = self._target_detection_summary(artifacts=artifacts)
@@ -1110,6 +1371,7 @@ class LivingRoomEpisodeRunner:
             vision_progress_m=executed_macro.vision_progress_m,
             fused_progress_m=executed_macro.fused_progress_m,
             progress_source=str(executed_macro.progress_source),
+            frame_index=int(self._state.frame_index),
         )
         self._recent_action_effects.append(effect)
         self._recent_action_effects = self._recent_action_effects[-4:]
@@ -1261,6 +1523,7 @@ class LivingRoomEpisodeRunner:
         backend_close = getattr(self._sensor_backend, "close", None)
         if callable(backend_close):
             backend_close()
+        self._write_planner_turns_artifact()
         self._write_episode_report()
 
     def _mark_goal_completed(self) -> None:
@@ -1269,6 +1532,7 @@ class LivingRoomEpisodeRunner:
         self._current_schedule = None
         self._active_macro_execution = None
         self._latest_sensor_frame = None
+        self._write_planner_turns_artifact()
         self._write_episode_report()
 
     def _record_planner_turn(self, *, context, schedule: ActionSchedule) -> None:
@@ -1920,6 +2184,10 @@ class LivingRoomEpisodeRunner:
             else (CommandKind.AIM_CAMERA.value, CommandKind.PAUSE.value)
         )
         depth_map = np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1))), dtype=np.float32)
+        goal_completion_evidence = self._goal_completion_evidence(
+            artifacts=artifacts,
+            observation_state=observation_state,
+        )
         context = build_planner_context(
             phase=self._state.phase,
             frame_index=self._state.frame_index,
@@ -1955,6 +2223,7 @@ class LivingRoomEpisodeRunner:
             current_camera_state=self._current_camera_state,
             navigation_affordances=observation_state.get("navigation_affordances"),
             reconstruction_brief=reconstruction_brief,
+            goal_completion_evidence=goal_completion_evidence,
             recent_action_effects=tuple(self._recent_action_effects),
             allowed_command_kinds=allowed_command_kinds,
             max_commands_per_schedule=max_commands_per_schedule,
@@ -1999,10 +2268,6 @@ class LivingRoomEpisodeRunner:
         truncated_commands = tuple(schedule.commands[:max_commands_per_schedule])
         if truncated_commands != schedule.commands:
             schedule = replace(schedule, commands=truncated_commands)
-        if schedule.goal_completion is None:
-            visual_goal_completion = self._visual_goal_completion_assessment(artifacts=artifacts)
-            if visual_goal_completion is not None:
-                schedule = replace(schedule, goal_completion=visual_goal_completion)
         if self._schedule_reports_goal_reached(schedule):
             self._latest_planner_schedule = schedule
             self._record_planner_turn(context=context, schedule=schedule)

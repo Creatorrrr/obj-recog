@@ -13,6 +13,7 @@ from obj_recog.sim_protocol import (
     EpisodePhase,
     PlannerActionEffectSummary,
     PlannerCameraState,
+    PlannerGoalCompletionEvidence,
     PlannerSearchOutcome,
 )
 from obj_recog.types import Detection, PanopticSegment
@@ -278,6 +279,122 @@ def test_planner_context_includes_target_detection_summary_when_target_is_visibl
     assert context.perception.target_detection is not None
     assert prompt_payload["target_detection"]["relative_xyz"] == [0.1, -0.2, 1.9]
     assert prompt_payload["target_detection"]["center_ray_xyz"] == [0.1, -0.2, 1.9]
+
+
+def test_planner_context_serializes_memory_coordinates_and_goal_completion_evidence() -> None:
+    target_node = GraphNode(
+        id="tv-1",
+        type="object",
+        label="tv",
+        state="occluded",
+        confidence=0.88,
+        world_centroid=np.array([0.2, 0.0, 1.1], dtype=np.float32),
+        last_seen_frame=24,
+        last_seen_direction="front",
+        source_track_id=7,
+    )
+    wall_node = GraphNode(
+        id="wall-1",
+        type="segment",
+        label="wall",
+        state="visible",
+        confidence=0.99,
+        world_centroid=np.array([0.1, 0.0, 2.8], dtype=np.float32),
+        last_seen_frame=30,
+        last_seen_direction="front",
+        source_track_id=8,
+    )
+    cabinet_node = GraphNode(
+        id="cabinet-1",
+        type="object",
+        label="cabinet",
+        state="visible",
+        confidence=0.94,
+        world_centroid=np.array([0.4, 0.0, 1.4], dtype=np.float32),
+        last_seen_frame=30,
+        last_seen_direction="front-right",
+        source_track_id=9,
+    )
+    scene_graph = _graph_snapshot(
+        nodes=(_ego_node(), target_node, wall_node, cabinet_node),
+        visible_node_ids=("ego", "wall-1", "cabinet-1"),
+        edges=(
+            GraphEdge(
+                source="tv-1",
+                target="wall-1",
+                relation="attached_to",
+                confidence=0.82,
+                last_updated_frame=24,
+                distance_bucket="near",
+                source_kind="detection",
+            ),
+            GraphEdge(
+                source="tv-1",
+                target="cabinet-1",
+                relation="above",
+                confidence=0.77,
+                last_updated_frame=24,
+                distance_bucket="near",
+                source_kind="detection",
+            ),
+        ),
+    )
+    context = build_planner_context(
+        phase=EpisodePhase.REASSESS,
+        frame_index=30,
+        detections=[
+            Detection(
+                xyxy=(1, 1, 8, 8),
+                class_id=1,
+                label="cabinet",
+                confidence=0.85,
+                color=(200, 200, 0),
+            )
+        ],
+        scene_graph_snapshot=scene_graph,
+        reconstruction_summary={"mesh_vertices": 1200, "tracked_points": 480},
+        depth_summary={"min_depth_m": 0.6, "median_depth_m": 1.3},
+        recent_actions=("translate:forward:distance_m:0.32",),
+        target_label="tv",
+        calibration_status="converged",
+        tracking_status="TRACKING",
+        segments=(
+            PanopticSegment(
+                segment_id=1,
+                label_id=1,
+                label="wall",
+                color_rgb=(255, 255, 255),
+                mask=np.ones((10, 10), dtype=bool),
+                area_pixels=100,
+            ),
+        ),
+        goal_completion_evidence=PlannerGoalCompletionEvidence(
+            forward_progress_since_last_seen_m=0.62,
+            estimated_remaining_distance_m=0.48,
+            recent_close_sighting=True,
+            target_disappeared_after_approach=True,
+            memory_freshness="fresh",
+            anchor_matches=2,
+            contradictions=(),
+            last_seen_frame=24,
+            last_seen_direction="front",
+            last_seen_relative_xyz=(0.2, 0.0, 1.1),
+            last_seen_distance_bucket="near",
+            target_memory_confidence=0.88,
+            anchor_labels=("cabinet", "wall"),
+            visible_anchor_labels=("cabinet", "wall"),
+        ),
+    )
+    prompt_payload = json.loads(planner_prompt_from_context(context))
+
+    assert prompt_payload["memory"]["target_memory"]["last_seen_frame"] == 24
+    assert prompt_payload["memory"]["target_memory"]["confidence"] == pytest.approx(0.88)
+    assert prompt_payload["memory"]["target_memory"]["relative_xyz"] == [0.2, 0.0, 1.1]
+    assert prompt_payload["memory"]["target_memory"]["distance_bucket"] == "near"
+    assert prompt_payload["goal_completion_evidence"]["estimated_remaining_distance_m"] == pytest.approx(0.48)
+    assert prompt_payload["goal_completion_evidence"]["target_disappeared_after_approach"] is True
+    assert prompt_payload["goal_completion_evidence"]["anchor_matches"] == 2
+    assert prompt_payload["goal_completion_evidence"]["visible_anchor_labels"] == ["cabinet", "wall"]
 
 
 def test_openai_planner_sends_rgb_image_and_parses_structured_commands() -> None:
