@@ -17,6 +17,7 @@
 */
 
 #include "Atlas.h"
+#include "PlatformCompat.h"
 #include "Viewer.h"
 
 #include "GeometricCamera.h"

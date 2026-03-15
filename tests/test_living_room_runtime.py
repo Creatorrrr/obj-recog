@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
@@ -118,6 +119,32 @@ def _goal_artifacts(_packet: FramePacket):
             "scene_graph_snapshot": None,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
             "depth_map": np.full((12, 16), 1.6, dtype=np.float32),
+            "slam_tracking_state": "TRACKING",
+        },
+    )()
+
+
+def _visible_tv_artifacts(_packet: FramePacket):
+    return type(
+        "Artifacts",
+        (),
+        {
+            "frame_bgr": np.full((12, 16, 3), 120, dtype=np.uint8),
+            "detections": [
+                type(
+                    "Det",
+                    (),
+                    {
+                        "label": "tv",
+                        "xyxy": (5, 2, 9, 6),
+                        "confidence": 0.92,
+                    },
+                )()
+            ],
+            "segments": [],
+            "scene_graph_snapshot": None,
+            "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
+            "depth_map": np.full((12, 16), 3.2, dtype=np.float32),
             "slam_tracking_state": "TRACKING",
         },
     )()
@@ -238,6 +265,36 @@ def test_living_room_runtime_writes_rgb_only_episode_artifacts(tmp_path: Path) -
     assert report_payload["success"] is None
     assert report_payload["offline_evaluation_required"] is True
     assert report_payload["sim_interface_mode"] == "rgb_only"
+
+
+def test_living_room_runtime_logs_target_detection_summary_for_visible_tv(tmp_path: Path) -> None:
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner(
+            [
+                ActionSchedule(
+                    steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.24),),
+                    rationale="approach visible tv",
+                    model="fake-planner",
+                    issued_at_frame=0,
+                )
+            ]
+        ),
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_visible_tv_artifacts(packet))
+
+    turns = (tmp_path / "planner_turns.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    payload = json.loads(turns[-1])
+    assert payload["prompt"]["target_detection"]["label"] == "tv"
+    assert payload["prompt"]["target_detection"]["horizontal_position"] == "center"
+    assert payload["prompt"]["target_detection"]["median_depth_m"] == pytest.approx(3.2)
 
 
 def test_living_room_runtime_marks_success_when_tv_is_visually_reached(tmp_path: Path) -> None:

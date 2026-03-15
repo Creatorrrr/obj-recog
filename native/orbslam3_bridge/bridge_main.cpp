@@ -13,6 +13,11 @@
 #include <memory>
 #include <vector>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 #include <opencv2/opencv.hpp>
 
 #define private public
@@ -154,6 +159,14 @@ class ScopedStreamRedirect {
 
 int main(int argc, char** argv) {
     try {
+#ifdef _WIN32
+        if (_setmode(_fileno(stdin), _O_BINARY) == -1) {
+            throw std::runtime_error("failed to configure stdin for binary frame packets");
+        }
+        if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
+            throw std::runtime_error("failed to configure stdout for binary responses");
+        }
+#endif
         const Options options = ParseArgs(argc, argv);
         std::unique_ptr<ORB_SLAM3::System> system;
         {

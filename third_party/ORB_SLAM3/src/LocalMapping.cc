@@ -18,6 +18,7 @@
 
 
 #include "LocalMapping.h"
+#include "PlatformCompat.h"
 #include "LoopClosing.h"
 #include "ORBmatcher.h"
 #include "Optimizer.h"

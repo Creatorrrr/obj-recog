@@ -9,12 +9,18 @@ foreach(config Debug Release RelWithDebInfo MinSizeRel)
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} ${CMAKE_BINARY_DIR})
 endforeach()
 
+if(MSVC)
+  add_compile_definitions(_HAS_STD_BYTE=0)
+endif()
+
 if(NOT DEFINED ORB_SLAM3_ROOT)
   message(FATAL_ERROR "ORB_SLAM3_ROOT must point to a local ORB_SLAM3 checkout")
 endif()
 
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(Boost CONFIG REQUIRED COMPONENTS serialization)
+find_package(OpenSSL REQUIRED)
 
 add_executable(orbslam3_bridge bridge_main.cpp)
 target_compile_definitions(
@@ -36,12 +42,18 @@ target_link_directories(
   orbslam3_bridge
   PRIVATE
     ${ORB_SLAM3_ROOT}/lib
+    ${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib
+    ${ORB_SLAM3_ROOT}/Thirdparty/g2o/lib
 )
 
 target_link_libraries(
   orbslam3_bridge
   PRIVATE
     ORB_SLAM3
+    DBoW2
+    g2o
+    Boost::serialization
+    OpenSSL::Crypto
     ${OpenCV_LIBS}
     Eigen3::Eigen
 )

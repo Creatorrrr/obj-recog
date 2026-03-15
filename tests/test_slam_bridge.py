@@ -14,6 +14,7 @@ from obj_recog.slam_bridge import (
     OrbSlam3Bridge,
     decode_slam_response,
     encode_frame_packet,
+    orbslam3_bridge_runtime_library_dirs,
     resolve_orbslam3_bridge_binary_path,
 )
 
@@ -156,6 +157,14 @@ class _FakePipeWriter:
         return None
 
 
+class _BrokenPipeWriter:
+    def write(self, payload: bytes) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        return None
+
+
 class _FakePipeReader:
     def __init__(self, lines: list[bytes]) -> None:
         self._lines = list(lines)
@@ -165,13 +174,25 @@ class _FakePipeReader:
             return b""
         return self._lines.pop(0)
 
+    def read(self) -> bytes:
+        data = b"".join(self._lines)
+        self._lines.clear()
+        return data
+
 
 class _FakeProcess:
-    def __init__(self, stdout_lines: list[bytes], stderr_lines: list[bytes] | None = None) -> None:
-        self.stdin = _FakePipeWriter()
+    def __init__(
+        self,
+        stdout_lines: list[bytes],
+        stderr_lines: list[bytes] | None = None,
+        *,
+        stdin=None,
+        returncode: int | None = None,
+    ) -> None:
+        self.stdin = _FakePipeWriter() if stdin is None else stdin
         self.stdout = _FakePipeReader(stdout_lines)
         self.stderr = _FakePipeReader(stderr_lines or [])
-        self._returncode: int | None = None
+        self._returncode: int | None = returncode
 
     def poll(self) -> int | None:
         return self._returncode
@@ -226,6 +247,37 @@ def test_orbslam3_bridge_track_skips_non_json_stdout_lines(tmp_path, monkeypatch
 
     assert result.tracking_state == "TRACKING"
     assert len(fake_process.stdin.writes) == 1
+
+
+def test_orbslam3_bridge_track_surfaces_native_stderr_when_pipe_breaks(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vocab = tmp_path / "ORBvoc.txt"
+    settings = tmp_path / "camera.yaml"
+    bridge_binary = tmp_path / "orbslam3_bridge.exe"
+    vocab.write_text("", encoding="utf-8")
+    settings.write_text("", encoding="utf-8")
+    bridge_binary.write_text("", encoding="utf-8")
+    fake_process = _FakeProcess(
+        stdout_lines=[],
+        stderr_lines=[b"truncated grayscale payload\n"],
+        stdin=_BrokenPipeWriter(),
+        returncode=1,
+    )
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: fake_process)
+
+    bridge = OrbSlam3Bridge(
+        vocabulary_path=str(vocab),
+        settings_path=str(settings),
+        frame_width=4,
+        frame_height=3,
+        binary_path=str(bridge_binary),
+    )
+
+    with pytest.raises(RuntimeError, match="truncated grayscale payload"):
+        bridge.track(np.zeros((3, 4), dtype=np.uint8), timestamp=0.25)
 
 
 def test_resolve_orbslam3_bridge_binary_path_accepts_windows_executable_candidate(
@@ -289,3 +341,23 @@ def test_orbslam3_bridge_prepends_windows_runtime_dirs_to_path(
     assert captured["env"] is not None
     path_entries = str(captured["env"]["PATH"]).split(";")
     assert path_entries[:2] == [str(runtime_a), str(runtime_b)]
+
+
+def test_orbslam3_bridge_runtime_library_dirs_include_windows_dependency_bins(tmp_path) -> None:
+    bridge_build = tmp_path / "native" / "orbslam3_bridge" / "build"
+    orbslam_lib = tmp_path / "third_party" / "ORB_SLAM3" / "lib"
+    dbow2_lib = tmp_path / "third_party" / "ORB_SLAM3" / "Thirdparty" / "DBoW2" / "lib"
+    g2o_lib = tmp_path / "third_party" / "ORB_SLAM3" / "Thirdparty" / "g2o" / "lib"
+    opencv_bin = tmp_path / "build" / "opencv-cuda" / "install" / "x64" / "vc17" / "bin"
+    vcpkg_bin = tmp_path / "build" / "vcpkg" / "installed" / "x64-windows" / "bin"
+    for directory in (bridge_build, orbslam_lib, dbow2_lib, g2o_lib, opencv_bin, vcpkg_bin):
+        directory.mkdir(parents=True)
+
+    runtime_dirs = orbslam3_bridge_runtime_library_dirs(repo_root=tmp_path)
+
+    assert bridge_build in runtime_dirs
+    assert orbslam_lib in runtime_dirs
+    assert dbow2_lib in runtime_dirs
+    assert g2o_lib in runtime_dirs
+    assert opencv_bin in runtime_dirs
+    assert vcpkg_bin in runtime_dirs

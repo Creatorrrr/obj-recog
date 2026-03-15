@@ -20,8 +20,7 @@
 #ifndef SYSTEM_H
 #define SYSTEM_H
 
-
-#include <unistd.h>
+#include "PlatformCompat.h"
 #include<stdio.h>
 #include<stdlib.h>
 #include<string>

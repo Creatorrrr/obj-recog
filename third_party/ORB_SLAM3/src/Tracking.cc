@@ -18,6 +18,7 @@
 
 
 #include "Tracking.h"
+#include "PlatformCompat.h"
 
 #include "ORBmatcher.h"
 #include "FrameDrawer.h"

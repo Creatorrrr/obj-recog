@@ -18,6 +18,7 @@
 
 
 #include "Viewer.h"
+#include "PlatformCompat.h"
 #ifndef ORB_SLAM3_HEADLESS_VIEWER
 #include <pangolin/pangolin.h>
 #endif

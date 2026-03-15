@@ -24,8 +24,8 @@
 //#define REGISTER_TIMES
 
 #include "CameraModels/GeometricCamera.h"
+#include "PlatformCompat.h"
 
-#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>

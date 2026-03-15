@@ -173,6 +173,7 @@ def test_tsdf_mesh_map_builder_integrates_keyframes_and_decimates_mesh() -> None
     assert volume.depth_sampling_stride == 6
     assert update.is_keyframe is True
     assert update.keyframe_id == 11
+    assert update.mesh_revision == 1
     assert update.mesh_vertices_xyz.shape == (3, 3)
     assert update.mesh_triangles.shape == (1, 3)
     assert update.mesh_vertex_colors.shape == (3, 3)
@@ -308,6 +309,7 @@ def test_tsdf_mesh_map_builder_recolors_vertices_from_segmentation_observation()
 
     assert mesh_vertices_xyz.shape == (3, 3)
     assert mesh_triangles.shape == (2, 3)
+    assert builder.current_mesh_revision() == 2
     np.testing.assert_allclose(
         mesh_vertex_colors[0],
         np.array([0.55, 0.0, 0.45], dtype=np.float32),

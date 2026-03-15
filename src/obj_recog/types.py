@@ -89,3 +89,4 @@ class FrameArtifacts:
     scene_graph_snapshot: SceneGraphSnapshot | None = None
     visible_graph_nodes: list[GraphNode] = field(default_factory=list)
     visible_graph_edges: list[GraphEdge] = field(default_factory=list)
+    mesh_revision: int | None = None

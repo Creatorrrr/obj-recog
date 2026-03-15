@@ -4,7 +4,11 @@ param(
     [string]$OrbSlam3Root = "",
     [string]$OpenCvDir = "",
     [string]$Eigen3Dir = "",
+    [string]$BoostDir = "",
+    [string]$OpenSSLDir = "",
     [string]$CMakePrefixPath = "",
+    [string]$CMakeToolchainFile = "",
+    [string]$VcpkgTriplet = "x64-windows",
     [string]$VcVarsPath = "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 )
 
@@ -131,6 +135,58 @@ function Add-StringItems {
     }
 }
 
+function Get-CMakeCacheValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$CachePath,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+
+    if (-not (Test-Path -LiteralPath $CachePath -PathType Leaf)) {
+        return ""
+    }
+
+    $line = Get-Content $CachePath | Where-Object { $_ -match "^${Key}:[^=]+=.*$" } | Select-Object -First 1
+    if (-not $line) {
+        return ""
+    }
+    return (($line -split "=", 2)[1]).Trim()
+}
+
+function Reset-CMakeBuildDirectoryIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildDir,
+        [Parameter(Mandatory = $true)][string]$Generator,
+        [string]$ToolchainFile = ""
+    )
+
+    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        return
+    }
+
+    $cachedGenerator = Get-CMakeCacheValue -CachePath $cachePath -Key "CMAKE_GENERATOR"
+    $cachedToolchain = Get-CMakeCacheValue -CachePath $cachePath -Key "CMAKE_TOOLCHAIN_FILE"
+    $requestedToolchain = if ($ToolchainFile) { Convert-ToCMakePath $ToolchainFile } else { "" }
+
+    $requiresReset = $false
+    if ($cachedGenerator -and $cachedGenerator -ne $Generator) {
+        $requiresReset = $true
+    }
+    if ($requestedToolchain) {
+        if ($cachedToolchain -ne $requestedToolchain) {
+            $requiresReset = $true
+        }
+    } elseif ($cachedToolchain) {
+        $requiresReset = $true
+    }
+
+    if ($requiresReset) {
+        Write-Step "Resetting cached build directory $BuildDir"
+        Remove-Item -LiteralPath $BuildDir -Recurse -Force
+        New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    }
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $resolvedOrbSlam3Root = if ($OrbSlam3Root) {
     (Resolve-Path $OrbSlam3Root).Path
@@ -140,6 +196,7 @@ $resolvedOrbSlam3Root = if ($OrbSlam3Root) {
 $bridgeDir = (Resolve-Path (Join-Path $repoRoot "native\orbslam3_bridge")).Path
 $bridgeBuildDir = Join-Path $bridgeDir "build"
 $orbSlam3BuildDir = Join-Path $resolvedOrbSlam3Root "build"
+$defaultVcpkgToolchain = Join-Path $repoRoot "build\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
 if (-not (Test-Path -LiteralPath $resolvedOrbSlam3Root -PathType Container)) {
     throw "ORB-SLAM3 checkout not found at $resolvedOrbSlam3Root"
@@ -166,6 +223,12 @@ if (-not $Generator) {
 }
 
 $isMultiConfigGenerator = $Generator -like "Visual Studio*" -or $Generator -like "Ninja Multi-Config"
+$resolvedToolchainFile = ""
+if ($CMakeToolchainFile) {
+    $resolvedToolchainFile = (Resolve-Path $CMakeToolchainFile).Path
+} elseif (Test-Path -LiteralPath $defaultVcpkgToolchain -PathType Leaf) {
+    $resolvedToolchainFile = $defaultVcpkgToolchain
+}
 $openCvDirResolved = Resolve-CMakePackageDir `
     -ExplicitPath $OpenCvDir `
     -EnvironmentVariables @("OpenCV_DIR") `
@@ -174,7 +237,24 @@ $openCvDirResolved = Resolve-CMakePackageDir `
 $eigen3DirResolved = Resolve-CMakePackageDir `
     -ExplicitPath $Eigen3Dir `
     -EnvironmentVariables @("Eigen3_DIR", "EIGEN3_DIR") `
+    -SearchRoot (Join-Path $repoRoot "build\vcpkg\installed") `
     -ConfigFileName "Eigen3Config.cmake"
+$boostDirResolved = Resolve-CMakePackageDir `
+    -ExplicitPath $BoostDir `
+    -EnvironmentVariables @("Boost_DIR") `
+    -SearchRoot (Join-Path $repoRoot "build\vcpkg\installed") `
+    -ConfigFileName "BoostConfig.cmake"
+$openSslDirResolved = Resolve-CMakePackageDir `
+    -ExplicitPath $OpenSSLDir `
+    -EnvironmentVariables @("OpenSSL_DIR") `
+    -SearchRoot (Join-Path $repoRoot "build\vcpkg\installed") `
+    -ConfigFileName "OpenSSLConfig.cmake"
+$openSslRootDir = ""
+if ($openSslDirResolved) {
+    $openSslRootDir = Split-Path -Parent (Split-Path -Parent $openSslDirResolved)
+}
+$openSslCryptoLibrary = if ($openSslRootDir) { Join-Path $openSslRootDir "lib\libcrypto.lib" } else { "" }
+$openSslSslLibrary = if ($openSslRootDir) { Join-Path $openSslRootDir "lib\libssl.lib" } else { "" }
 
 $cmakePrefixEntries = New-Object System.Collections.Generic.List[string]
 if ($CMakePrefixPath) {
@@ -199,8 +279,30 @@ if ($openCvDirResolved) {
 if ($eigen3DirResolved) {
     $commonConfigureArgs.Add("-DEigen3_DIR=$(Convert-ToCMakePath $eigen3DirResolved)")
 }
+if ($boostDirResolved) {
+    $commonConfigureArgs.Add("-DBoost_DIR=$(Convert-ToCMakePath $boostDirResolved)")
+}
+if ($openSslDirResolved) {
+    $commonConfigureArgs.Add("-DOpenSSL_DIR=$(Convert-ToCMakePath $openSslDirResolved)")
+}
+if ($openSslRootDir) {
+    $commonConfigureArgs.Add("-DOPENSSL_ROOT_DIR=$(Convert-ToCMakePath $openSslRootDir)")
+}
+if ($openSslCryptoLibrary -and (Test-Path -LiteralPath $openSslCryptoLibrary -PathType Leaf)) {
+    $commonConfigureArgs.Add("-DOPENSSL_CRYPTO_LIBRARY=$(Convert-ToCMakePath $openSslCryptoLibrary)")
+}
+if ($openSslSslLibrary -and (Test-Path -LiteralPath $openSslSslLibrary -PathType Leaf)) {
+    $commonConfigureArgs.Add("-DOPENSSL_SSL_LIBRARY=$(Convert-ToCMakePath $openSslSslLibrary)")
+}
 if ($cmakePrefixEntries.Count -gt 0) {
     $commonConfigureArgs.Add("-DCMAKE_PREFIX_PATH=$($cmakePrefixEntries -join ';')")
+}
+Add-StringItems -List $commonConfigureArgs -Items @("-DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON")
+if ($resolvedToolchainFile) {
+    $commonConfigureArgs.Add("-DCMAKE_TOOLCHAIN_FILE=$(Convert-ToCMakePath $resolvedToolchainFile)")
+    if ($VcpkgTriplet) {
+        $commonConfigureArgs.Add("-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet")
+    }
 }
 
 $vocabularyArchive = Join-Path $resolvedOrbSlam3Root "Vocabulary\ORBvoc.txt.tar.gz"
@@ -217,6 +319,8 @@ if (-not (Test-Path -LiteralPath $vocabularyText -PathType Leaf)) {
 }
 
 New-Item -ItemType Directory -Force -Path $orbSlam3BuildDir, $bridgeBuildDir | Out-Null
+Reset-CMakeBuildDirectoryIfNeeded -BuildDir $orbSlam3BuildDir -Generator $Generator -ToolchainFile $resolvedToolchainFile
+Reset-CMakeBuildDirectoryIfNeeded -BuildDir $bridgeBuildDir -Generator $Generator -ToolchainFile $resolvedToolchainFile
 
 $orbConfigureArgs = New-Object System.Collections.Generic.List[string]
 Add-StringItems -List $orbConfigureArgs -Items @("-S", $resolvedOrbSlam3Root, "-B", $orbSlam3BuildDir)

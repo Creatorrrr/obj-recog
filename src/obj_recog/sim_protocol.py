@@ -103,6 +103,7 @@ class PerceptionSnapshot:
     visible_graph_relations: tuple[str, ...]
     reconstruction_summary: dict[str, float | int]
     depth_summary: dict[str, float | int]
+    target_detection: dict[str, float | str | None] | None
     calibration_status: str
     tracking_status: str
 

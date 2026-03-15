@@ -311,13 +311,22 @@ def _update_viewer(viewer, artifacts: FrameArtifacts) -> bool:
             artifacts.mesh_triangles,
             artifacts.mesh_vertex_colors,
             artifacts.scene_graph_snapshot,
+            artifacts.mesh_revision,
         )
     except TypeError:
-        return viewer.update(
-            artifacts.mesh_vertices_xyz,
-            artifacts.mesh_triangles,
-            artifacts.mesh_vertex_colors,
-        )
+        try:
+            return viewer.update(
+                artifacts.mesh_vertices_xyz,
+                artifacts.mesh_triangles,
+                artifacts.mesh_vertex_colors,
+                artifacts.scene_graph_snapshot,
+            )
+        except TypeError:
+            return viewer.update(
+                artifacts.mesh_vertices_xyz,
+                artifacts.mesh_triangles,
+                artifacts.mesh_vertex_colors,
+            )
 
 
 def process_frame(
@@ -519,6 +528,7 @@ def process_frame(
         getattr(map_update, "dense_map_points_rgb", mesh_vertex_colors),
         dtype=np.float32,
     ).reshape(-1, 3)
+    mesh_revision = getattr(map_update, "mesh_revision", None)
     dense_z_span = _camera_space_z_span(dense_map_points_xyz, camera_pose_world)
     mesh_z_span = _camera_space_z_span(mesh_vertices_xyz, camera_pose_world)
 
@@ -625,6 +635,7 @@ def process_frame(
         segments=[],
         depth_diagnostics=depth_diagnostics,
         perception_diagnostics=perception_diagnostics,
+        mesh_revision=(None if mesh_revision is None else int(mesh_revision)),
     )
     return artifacts, list(detections)
 
@@ -1454,6 +1465,12 @@ def run(
                             artifacts.mesh_vertices_xyz = np.asarray(mesh_vertices_xyz, dtype=np.float32).reshape(-1, 3)
                             artifacts.mesh_triangles = np.asarray(mesh_triangles, dtype=np.int32).reshape(-1, 3)
                             artifacts.mesh_vertex_colors = np.asarray(mesh_vertex_colors, dtype=np.float32).reshape(-1, 3)
+                            current_mesh_revision_getter = getattr(map_builder, "current_mesh_revision", None)
+                            artifacts.mesh_revision = (
+                                int(current_mesh_revision_getter())
+                                if callable(current_mesh_revision_getter)
+                                else None
+                            )
                             artifacts.points_xyz = artifacts.mesh_vertices_xyz
                             artifacts.points_rgb = artifacts.mesh_vertex_colors
                             artifacts.dense_map_points_xyz = artifacts.mesh_vertices_xyz

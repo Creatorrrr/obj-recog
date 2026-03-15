@@ -22,6 +22,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_definitions(-DCOMPILEDWITHC11)
 message(STATUS "Using C++17 toolchain mode.")
 
+if(MSVC)
+  add_compile_definitions(_HAS_STD_BYTE=0)
+endif()
+
 LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
 
 find_package(OpenCV 4.4)
@@ -36,7 +40,12 @@ find_package(Eigen3 REQUIRED)
 if(TARGET Eigen3::Eigen)
   get_target_property(EIGEN3_INCLUDE_DIR Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
 endif()
-find_package(Boost REQUIRED COMPONENTS serialization)
+find_package(Boost CONFIG REQUIRED COMPONENTS serialization)
+if(TARGET Boost::headers)
+  get_target_property(BOOST_INCLUDE_DIRS Boost::headers INTERFACE_INCLUDE_DIRECTORIES)
+elseif(TARGET Boost::boost)
+  get_target_property(BOOST_INCLUDE_DIRS Boost::boost INTERFACE_INCLUDE_DIRECTORIES)
+endif()
 find_package(OpenSSL REQUIRED)
 find_package(realsense2)
 option(ORB_SLAM3_HEADLESS_VIEWER "Build ORB-SLAM3 without Pangolin viewer support" ON)
@@ -52,11 +61,17 @@ ${PROJECT_SOURCE_DIR}/include
 ${PROJECT_SOURCE_DIR}/include/CameraModels
 ${PROJECT_SOURCE_DIR}/Thirdparty/Sophus
 ${EIGEN3_INCLUDE_DIR}
-${Boost_INCLUDE_DIRS}
+${BOOST_INCLUDE_DIRS}
 )
 
 if(NOT ORB_SLAM3_HEADLESS_VIEWER)
 include_directories(${Pangolin_INCLUDE_DIRS})
+endif()
+
+if(MSVC)
+  set(ORB_SLAM3_LIB_TYPE STATIC)
+else()
+  set(ORB_SLAM3_LIB_TYPE SHARED)
 endif()
 
 set(ORB_SLAM3_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
@@ -70,7 +85,7 @@ foreach(config Debug Release RelWithDebInfo MinSizeRel)
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} ${ORB_SLAM3_OUTPUT_DIRECTORY})
 endforeach()
 
-add_library(${PROJECT_NAME} SHARED
+add_library(${PROJECT_NAME} ${ORB_SLAM3_LIB_TYPE}
 src/System.cc
 src/Tracking.cc
 src/LocalMapping.cc
@@ -140,7 +155,7 @@ add_subdirectory(Thirdparty/g2o)
 target_link_libraries(${PROJECT_NAME}
 ${OpenCV_LIBS}
 ${EIGEN3_LIBS}
-${Boost_LIBRARIES}
+Boost::serialization
 DBoW2
 g2o
 OpenSSL::Crypto

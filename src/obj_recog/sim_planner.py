@@ -26,6 +26,15 @@ _PLANNER_SYSTEM_INSTRUCTIONS = (
     "Current visible evidence takes priority over memory. "
     "Avoid repeating the same recent unsuccessful search when other unexplored options exist, "
     "but revisiting is allowed if new evidence appears or there is no better alternative. "
+    "When the target is not currently visible, return a coordinated search batch of 2 to 4 steps "
+    "instead of a single isolated action unless pausing is the only safe option. "
+    "Favor committing to one promising direction for a short batch over oscillating left/right every turn. "
+    "Use camera pans to confirm visibility, but pair them with translation or heading changes when recent pure scans failed. "
+    "When the target is visible, use target_detection to judge whether it is left/right of center, still far away, or already close. "
+    "If the target is off-center, prefer small turns or camera pans to center it before adding more forward motion. "
+    "When target_detection says left or right, do not include an opposite-direction turn or camera pan in the same batch unless the target is already near center. "
+    "If the target is visible and far away, keep the batch committed in the same centering direction and add forward motion instead of restarting a generic search. "
+    "If the target is visible while tracking is INITIALIZING or RELOCALIZING, keep motions visually smooth and avoid large repeated pans. "
     "Never infer hidden furniture or exact room coordinates. "
     "Return JSON only with keys rationale and steps. "
     "Each step must include primitive and value. "
@@ -153,6 +162,7 @@ def build_planner_context(
     target_label: str = "",
     calibration_status: str,
     tracking_status: str,
+    target_detection: dict[str, float | str | None] | None = None,
 ) -> PlannerContext:
     detections_tuple = tuple(detections)
     visible_detections = tuple(str(item.label) for item in detections_tuple)
@@ -179,6 +189,7 @@ def build_planner_context(
             visible_graph_relations=visible_graph_relations,
             reconstruction_summary=dict(reconstruction_summary),
             depth_summary=dict(depth_summary),
+            target_detection=None if target_detection is None else dict(target_detection),
             calibration_status=str(calibration_status),
             tracking_status=str(tracking_status),
         ),
@@ -203,6 +214,11 @@ def planner_prompt_from_context(context: PlannerContext) -> str:
         "visible_graph_relations": list(context.perception.visible_graph_relations),
         "reconstruction_summary": dict(context.perception.reconstruction_summary),
         "depth_summary": dict(context.perception.depth_summary),
+        "target_detection": (
+            None
+            if context.perception.target_detection is None
+            else dict(context.perception.target_detection)
+        ),
         "calibration_status": context.perception.calibration_status,
         "tracking_status": context.perception.tracking_status,
         "memory": {

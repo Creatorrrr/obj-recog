@@ -1347,6 +1347,7 @@ class Open3DMeshViewer:
         self._graph_edges = o3d.geometry.LineSet()
         self._ego_lines = o3d.geometry.LineSet()
         self._has_fitted_view = False
+        self._last_mesh_revision: int | None = None
         self._vis.add_geometry(self._mesh)
         self._vis.add_geometry(self._graph_nodes)
         self._vis.add_geometry(self._graph_edges)
@@ -1367,22 +1368,26 @@ class Open3DMeshViewer:
         mesh_triangles: np.ndarray,
         mesh_vertex_colors: np.ndarray,
         scene_graph_snapshot: SceneGraphSnapshot | None = None,
+        mesh_revision: int | None = None,
         *_unused,
     ) -> bool:
         display_vertices_xyz = _display_points_for_view(mesh_vertices_xyz)
-        self._mesh.vertices = self._o3d.utility.Vector3dVector(
-            display_vertices_xyz.astype(np.float64, copy=False)
-        )
-        self._mesh.triangles = self._o3d.utility.Vector3iVector(
-            mesh_triangles.astype(np.int32, copy=False)
-        )
-        self._mesh.vertex_colors = self._o3d.utility.Vector3dVector(
-            mesh_vertex_colors.astype(np.float64, copy=False)
-        )
-        compute_normals = getattr(self._mesh, "compute_vertex_normals", None)
-        if callable(compute_normals):
-            compute_normals()
-        self._vis.update_geometry(self._mesh)
+        mesh_dirty = mesh_revision is None or mesh_revision != self._last_mesh_revision
+        if mesh_dirty:
+            self._mesh.vertices = self._o3d.utility.Vector3dVector(
+                display_vertices_xyz.astype(np.float64, copy=False)
+            )
+            self._mesh.triangles = self._o3d.utility.Vector3iVector(
+                mesh_triangles.astype(np.int32, copy=False)
+            )
+            self._mesh.vertex_colors = self._o3d.utility.Vector3dVector(
+                mesh_vertex_colors.astype(np.float64, copy=False)
+            )
+            compute_normals = getattr(self._mesh, "compute_vertex_normals", None)
+            if callable(compute_normals):
+                compute_normals()
+            self._vis.update_geometry(self._mesh)
+            self._last_mesh_revision = mesh_revision
         self._update_scene_graph(scene_graph_snapshot)
         if not self._has_fitted_view and display_vertices_xyz.size > 0 and mesh_triangles.size > 0:
             self._vis.reset_view_point(True)

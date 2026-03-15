@@ -27,6 +27,7 @@
 #include "string_tools.h"
 #include "os_specific.h"
 #include "macros.h"
+#include "PlatformCompat.h"
 
 #include <cctype>
 #include <string>
@@ -39,6 +40,39 @@
 
 #if (defined (UNIX) || defined(CYGWIN)) && !defined(ANDROID)
 #include <wordexp.h>
+#endif
+
+#ifdef _WIN32
+static int vasprintf(char** buffer, const char* format, va_list args)
+{
+  va_list args_copy;
+  va_copy(args_copy, args);
+  const int required_length = _vscprintf(format, args_copy);
+  va_end(args_copy);
+  if (required_length < 0) {
+    *buffer = nullptr;
+    return -1;
+  }
+
+  *buffer = static_cast<char*>(std::malloc(static_cast<size_t>(required_length) + 1U));
+  if (*buffer == nullptr) {
+    return -1;
+  }
+
+  const int written = vsnprintf_s(
+    *buffer,
+    static_cast<size_t>(required_length) + 1U,
+    _TRUNCATE,
+    format,
+    args
+  );
+  if (written < 0) {
+    std::free(*buffer);
+    *buffer = nullptr;
+    return -1;
+  }
+  return written;
+}
 #endif
 
 namespace g2o {

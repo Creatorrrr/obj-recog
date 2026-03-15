@@ -84,6 +84,9 @@ def orbslam3_bridge_runtime_library_dirs(*, repo_root: Path | None = None) -> tu
         root / "third_party" / "ORB_SLAM3" / "lib",
         root / "third_party" / "ORB_SLAM3" / "Thirdparty" / "DBoW2" / "lib",
         root / "third_party" / "ORB_SLAM3" / "Thirdparty" / "g2o" / "lib",
+        root / "build" / "opencv-cuda" / "install" / "x64" / "vc17" / "bin",
+        root / "build" / "opencv-cuda" / "install" / "bin",
+        root / "build" / "vcpkg" / "installed" / "x64-windows" / "bin",
     )
     ordered_existing_dirs: list[Path] = []
     seen: set[Path] = set()
@@ -241,8 +244,26 @@ class OrbSlam3Bridge:
             raise RuntimeError(f"ORB-SLAM3 bridge is not running. {stderr}".strip())
 
         packet = encode_frame_packet(frame_gray, timestamp)
-        self._process.stdin.write(packet)
-        self._process.stdin.flush()
+        try:
+            self._process.stdin.write(packet)
+            self._process.stdin.flush()
+        except BrokenPipeError as exc:
+            returncode = self._process.poll()
+            if returncode is None:
+                try:
+                    returncode = self._process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    returncode = None
+            stderr = ""
+            if self._process.stderr is not None:
+                try:
+                    stderr = self._process.stderr.read().decode("utf-8", errors="replace")
+                except Exception:
+                    stderr = ""
+            details = stderr.strip()
+            if returncode is not None:
+                details = f"exit code {returncode}. {details}".strip()
+            raise RuntimeError(f"ORB-SLAM3 bridge terminated while writing frame. {details}".strip()) from exc
         return _read_protocol_response(self._process)
 
     def close(self) -> None:

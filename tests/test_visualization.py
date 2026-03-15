@@ -123,6 +123,7 @@ class _FakeVisualizer:
         self.renderer_updates = 0
         self.window_calls: list[dict[str, int | str]] = []
         self.view_control = _FakeViewControl()
+        self.updated_geometries: list[object] = []
 
     def create_window(self, window_name: str, width: int, height: int, **kwargs) -> bool:
         call = {
@@ -142,6 +143,7 @@ class _FakeVisualizer:
         return _FakeRenderOption()
 
     def update_geometry(self, geometry) -> None:
+        self.updated_geometries.append(geometry)
         return None
 
     def poll_events(self) -> bool:
@@ -1083,6 +1085,19 @@ def test_open3d_viewer_applies_expected_initial_camera_on_first_mesh() -> None:
     np.testing.assert_allclose(viewer._vis.view_control.front, np.array([-0.58, 0.48, 0.66]))
     np.testing.assert_allclose(viewer._vis.view_control.up, np.array([0.0, 1.0, 0.0]))
     assert viewer._vis.view_control.zoom == pytest.approx(0.68)
+
+
+def test_open3d_viewer_skips_mesh_upload_when_revision_is_unchanged() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D())
+    vertices = np.array([[0.0, 0.0, 1.0], [0.2, 0.0, 1.0], [0.0, 0.2, 1.0]], dtype=np.float32)
+    triangles = np.array([[0, 1, 2]], dtype=np.int32)
+    colors = np.array([[1.0, 0.0, 0.0]] * 3, dtype=np.float32)
+
+    viewer.update(vertices, triangles, colors, None, 4)
+    viewer.update(vertices, triangles, colors, None, 4)
+
+    mesh_updates = [geometry for geometry in viewer._vis.updated_geometries if geometry is viewer._mesh]
+    assert len(mesh_updates) == 1
 
 
 def test_runtime_window_position_uses_primary_frame_size_grid() -> None:

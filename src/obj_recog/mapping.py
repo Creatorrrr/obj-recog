@@ -40,6 +40,7 @@ class MeshMapUpdate:
     trajectory_xyz: np.ndarray
     segment_id: int
     loop_closure_applied: bool
+    mesh_revision: int | None = None
 
     @property
     def dense_map_points_xyz(self) -> np.ndarray:
@@ -248,6 +249,7 @@ class TsdfMeshMapBuilder:
         self._cached_triangles = np.empty((0, 3), dtype=np.int32)
         self._cached_base_vertex_colors = np.empty((0, 3), dtype=np.float32)
         self._cached_vertex_colors = np.empty((0, 3), dtype=np.float32)
+        self._mesh_revision = 0
 
     def _trim_window(self) -> bool:
         trimmed = False
@@ -304,10 +306,23 @@ class TsdfMeshMapBuilder:
         triangles: np.ndarray,
         vertex_colors: np.ndarray,
     ) -> None:
+        previous_vertices = self._cached_vertices
+        previous_triangles = self._cached_triangles
+        previous_colors = self._cached_vertex_colors
         self._cached_vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
         self._cached_triangles = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
         self._cached_base_vertex_colors = np.asarray(vertex_colors, dtype=np.float32).reshape(-1, 3)
-        self._recolor_cached_mesh()
+        self._recolor_cached_mesh(update_revision=False)
+        geometry_changed = (
+            previous_vertices.shape != self._cached_vertices.shape
+            or previous_triangles.shape != self._cached_triangles.shape
+            or previous_colors.shape != self._cached_vertex_colors.shape
+            or not np.array_equal(previous_vertices, self._cached_vertices)
+            or not np.array_equal(previous_triangles, self._cached_triangles)
+            or not np.array_equal(previous_colors, self._cached_vertex_colors)
+        )
+        if geometry_changed:
+            self._mesh_revision += 1
 
     def _world_to_camera(self, points_xyz: np.ndarray, camera_pose_world: np.ndarray) -> np.ndarray:
         points_xyz = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
@@ -320,13 +335,26 @@ class TsdfMeshMapBuilder:
         )
         return (pose_inv @ homogeneous.T).T[:, :3].astype(np.float32, copy=False)
 
-    def _recolor_cached_mesh(self) -> None:
+    def _recolor_cached_mesh(self, *, update_revision: bool = True) -> None:
         if self._cached_vertices.size == 0 or self._cached_base_vertex_colors.size == 0:
-            self._cached_vertex_colors = self._cached_base_vertex_colors.copy()
+            updated_colors = self._cached_base_vertex_colors.copy()
+            colors_changed = (
+                self._cached_vertex_colors.shape != updated_colors.shape
+                or not np.array_equal(self._cached_vertex_colors, updated_colors)
+            )
+            self._cached_vertex_colors = updated_colors
+            if colors_changed and update_revision:
+                self._mesh_revision += 1
             return
         base_colors = self._cached_base_vertex_colors.astype(np.float32, copy=True)
         if not self._segmentation_observations:
+            colors_changed = (
+                self._cached_vertex_colors.shape != base_colors.shape
+                or not np.array_equal(self._cached_vertex_colors, base_colors)
+            )
             self._cached_vertex_colors = base_colors
+            if colors_changed and update_revision:
+                self._mesh_revision += 1
             return
 
         weighted_colors = np.zeros_like(base_colors, dtype=np.float32)
@@ -363,7 +391,14 @@ class TsdfMeshMapBuilder:
         if np.any(colored_mask):
             overlay_colors = weighted_colors[colored_mask] / weights[colored_mask, None]
             base_colors[colored_mask] = (base_colors[colored_mask] * 0.55) + (overlay_colors * 0.45)
-        self._cached_vertex_colors = np.clip(base_colors, 0.0, 1.0)
+        updated_colors = np.clip(base_colors, 0.0, 1.0)
+        colors_changed = (
+            self._cached_vertex_colors.shape != updated_colors.shape
+            or not np.array_equal(self._cached_vertex_colors, updated_colors)
+        )
+        self._cached_vertex_colors = updated_colors
+        if colors_changed and update_revision:
+            self._mesh_revision += 1
 
     def _integrate_keyframe(self, keyframe: _TsdfKeyframe, pose_world: np.ndarray) -> None:
         rgbd = self._to_rgbd(keyframe.frame_bgr, keyframe.depth_map)
@@ -417,6 +452,9 @@ class TsdfMeshMapBuilder:
             self._cached_vertex_colors.copy(),
         )
 
+    def current_mesh_revision(self) -> int:
+        return int(self._mesh_revision)
+
     def update(
         self,
         *,
@@ -465,6 +503,7 @@ class TsdfMeshMapBuilder:
             trajectory_xyz=trajectory_xyz,
             segment_id=self._segment_id,
             loop_closure_applied=bool(slam_result.loop_closure_applied),
+            mesh_revision=int(self._mesh_revision),
         )
 
 

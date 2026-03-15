@@ -203,17 +203,19 @@ class LivingRoomEpisodeRunner:
             return None
         return float(np.nanmedian(crop[valid]))
 
-    def _goal_visually_reached(self, *, artifacts) -> bool:
+    def _target_detection_summary(self, *, artifacts) -> dict[str, float | str | None] | None:
         target_label = getattr(self._scene_spec, "semantic_target_class", "")
         detections = list(getattr(artifacts, "detections", []) or [])
         depth_map = np.asarray(getattr(artifacts, "depth_map", np.empty((0, 0))), dtype=np.float32)
         frame_shape = np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape
         if len(frame_shape) < 2:
-            return False
+            return None
         frame_height, frame_width = int(frame_shape[0]), int(frame_shape[1])
         if frame_height <= 0 or frame_width <= 0:
-            return False
+            return None
 
+        best_summary = None
+        best_score = (-1.0, -1.0)
         for detection in detections:
             if not self._label_matches_target(
                 detection_label=getattr(detection, "label", ""),
@@ -226,14 +228,43 @@ class LivingRoomEpisodeRunner:
             area_ratio = float(bbox_width * bbox_height) / float(max(1, frame_width * frame_height))
             bbox_center_x = x1 + (bbox_width * 0.5)
             center_offset_ratio = abs(bbox_center_x - (frame_width * 0.5)) / float(max(1.0, frame_width * 0.5))
-            median_depth_m = self._bbox_depth_m(depth_map, (x1, y1, x2, y2))
-            if median_depth_m is not None:
-                if median_depth_m <= 2.5 and area_ratio >= 0.08 and center_offset_ratio <= 0.35:
-                    return True
-                continue
-            if area_ratio >= 0.22 and center_offset_ratio <= 0.25:
-                return True
-        return False
+            if bbox_center_x < (frame_width * 0.4):
+                horizontal_position = "left"
+            elif bbox_center_x > (frame_width * 0.6):
+                horizontal_position = "right"
+            else:
+                horizontal_position = "center"
+            confidence = float(getattr(detection, "confidence", 0.0))
+            summary = {
+                "label": str(getattr(detection, "label", "")),
+                "confidence": confidence,
+                "area_ratio": area_ratio,
+                "center_offset_ratio": center_offset_ratio,
+                "horizontal_position": horizontal_position,
+                "median_depth_m": self._bbox_depth_m(depth_map, (x1, y1, x2, y2)),
+            }
+            score = (area_ratio, confidence)
+            if score > best_score:
+                best_score = score
+                best_summary = summary
+        return best_summary
+
+    def _goal_visually_reached(self, *, artifacts) -> bool:
+        target_detection = self._target_detection_summary(artifacts=artifacts)
+        if target_detection is None:
+            return False
+        median_depth_m = target_detection.get("median_depth_m")
+        area_ratio_value = target_detection.get("area_ratio", 0.0)
+        center_offset_value = target_detection.get("center_offset_ratio", 1.0)
+        area_ratio = 0.0 if area_ratio_value is None else float(area_ratio_value)
+        center_offset_ratio = 1.0 if center_offset_value is None else float(center_offset_value)
+        if median_depth_m is not None:
+            return bool(
+                float(median_depth_m) <= 2.5
+                and area_ratio >= 0.08
+                and center_offset_ratio <= 0.35
+            )
+        return bool(area_ratio >= 0.22 and center_offset_ratio <= 0.25)
 
     def _target_visible_in_artifacts(self, *, artifacts) -> bool:
         target_label = getattr(self._scene_spec, "semantic_target_class", "")
@@ -350,6 +381,7 @@ class LivingRoomEpisodeRunner:
                 "converged" if self._state.selfcal_step_index >= len(self._selfcal_actions) else "pending"
             ),
             tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
+            target_detection=self._target_detection_summary(artifacts=artifacts),
         )
         try:
             schedule = self._planner.plan(context=context)
@@ -476,6 +508,11 @@ class LivingRoomEpisodeRunner:
                             "visible_graph_relations": list(prompt.perception.visible_graph_relations),
                             "reconstruction_summary": dict(prompt.perception.reconstruction_summary),
                             "depth_summary": dict(prompt.perception.depth_summary),
+                            "target_detection": (
+                                None
+                                if prompt.perception.target_detection is None
+                                else dict(prompt.perception.target_detection)
+                            ),
                             "calibration_status": prompt.perception.calibration_status,
                             "tracking_status": prompt.perception.tracking_status,
                             "memory": {

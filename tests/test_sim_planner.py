@@ -218,6 +218,43 @@ def test_planner_context_uses_current_target_visibility_over_memory() -> None:
     assert context.memory.target_memory is None
 
 
+def test_planner_context_includes_target_detection_summary_when_target_is_visible() -> None:
+    context = build_planner_context(
+        phase=EpisodePhase.REASSESS,
+        frame_index=14,
+        detections=[
+            Detection(
+                xyxy=(2, 1, 12, 10),
+                class_id=1,
+                label="tv_panel",
+                confidence=0.91,
+                color=(255, 0, 0),
+            )
+        ],
+        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
+        reconstruction_summary={"mesh_vertices": 1500, "tracked_points": 520},
+        depth_summary={"min_depth_m": 0.8, "median_depth_m": 2.0},
+        recent_actions=("turn_left:6",),
+        target_label="tv_panel",
+        calibration_status="converged",
+        tracking_status="TRACKING",
+        target_detection={
+            "label": "tv_panel",
+            "confidence": 0.91,
+            "area_ratio": 0.12,
+            "center_offset_ratio": 0.08,
+            "horizontal_position": "center",
+            "median_depth_m": 1.9,
+        },
+    )
+    prompt = planner_prompt_from_context(context)
+
+    assert context.perception.target_detection is not None
+    assert context.perception.target_detection["horizontal_position"] == "center"
+    assert '"target_detection"' in prompt
+    assert '"median_depth_m": 1.9' in prompt
+
+
 def test_planner_context_excludes_floor_and_ceiling_from_nonvisible_memory() -> None:
     context = build_planner_context(
         phase=EpisodePhase.REASSESS,
