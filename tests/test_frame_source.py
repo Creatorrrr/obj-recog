@@ -368,7 +368,7 @@ def test_process_frame_runtime_sim_mode_marks_benchmark_valid_runtime_sources() 
     assert artifacts.perception_diagnostics is not None
     assert artifacts.perception_diagnostics.perception_mode == "runtime"
     assert artifacts.perception_diagnostics.detection_source == "runtime"
-    assert artifacts.perception_diagnostics.depth_source == "runtime"
+    assert artifacts.perception_diagnostics.depth_source == "runtime_midas"
     assert artifacts.perception_diagnostics.pose_source == "runtime"
     assert artifacts.perception_diagnostics.gt_target_visible is False
     assert artifacts.perception_diagnostics.benchmark_valid is True

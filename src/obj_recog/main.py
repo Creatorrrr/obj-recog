@@ -51,8 +51,16 @@ from obj_recog.situation_explainer import (
     SituationExplanationWorker,
     build_explanation_snapshot,
 )
+from obj_recog.temporal_stereo import TemporalStereoDepthEstimator
 from obj_recog.tracking import PoseTracker
-from obj_recog.types import DepthDiagnostics, Detection, FrameArtifacts, PerceptionDiagnostics, SegmentationResult
+from obj_recog.types import (
+    DepthDiagnostics,
+    Detection,
+    FrameArtifacts,
+    PerceptionDiagnostics,
+    SegmentationResult,
+    TemporalStereoDiagnostics,
+)
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
     Open3DMeshViewer,
@@ -464,6 +472,7 @@ def process_frame(
     calibration: CalibrationResult | None = None,
     calibration_source: str = "disabled/approx",
     *,
+    temporal_stereo_estimator=None,
     slam_bridge=None,
     tracker=None,
     frame_packet: FramePacket | None = None,
@@ -497,7 +506,7 @@ def process_frame(
         used_detection_fallback = True
 
     packet_depth_map = None if frame_packet is None else frame_packet.depth_map
-    depth_map = (
+    provisional_depth_map = (
         packet_depth_map
         if (
             prefer_frame_packet_ground_truth
@@ -507,9 +516,9 @@ def process_frame(
         and packet_depth_map is not None
         else depth_estimator.estimate(inference_frame)
     )
-    if depth_map.shape != frame_bgr.shape[:2]:
-        depth_map = resize_image(
-            depth_map,
+    if provisional_depth_map.shape != frame_bgr.shape[:2]:
+        provisional_depth_map = resize_image(
+            provisional_depth_map,
             (frame_bgr.shape[1], frame_bgr.shape[0]),
             interpolation=cv2.INTER_CUBIC,
             cv2_module=cv2,
@@ -527,6 +536,72 @@ def process_frame(
     else:
         intrinsics = intrinsics_for_frame(frame_bgr.shape[1], frame_bgr.shape[0])
     depth_profile = resolve_depth_profile(config.depth_profile)
+    packet_pose_available = frame_packet is not None and frame_packet.pose_world_gt is not None
+    if prefer_frame_packet_ground_truth and packet_pose_available:
+        slam_result = _slam_result_from_frame_packet(frame_packet)
+    elif slam_bridge is not None:
+        if timestamp_sec is None:
+            raise RuntimeError("SLAM bridge requires a real frame timestamp in seconds")
+        slam_gray = resize_for_slam(
+            frame_bgr,
+            config.slam_width,
+            config.slam_height,
+            cv2_module=cv2,
+            prefer_cuda=prefer_opencv_cuda,
+        )
+        slam_result = slam_bridge.track(slam_gray, float(timestamp_sec))
+    elif tracker is not None:
+        tracking_result = tracker.update(
+            frame_bgr=frame_bgr,
+            depth_map=provisional_depth_map,
+            intrinsics=intrinsics,
+        )
+        slam_result = _legacy_tracking_to_slam_result(tracking_result, frame_index=frame_index)
+    else:
+        raise RuntimeError("process_frame requires either slam_bridge or tracker")
+
+    if assist_frame_packet_ground_truth and packet_pose_available:
+        slam_result = _slam_result_from_frame_packet(frame_packet)
+
+    temporal_stereo_diagnostics = None
+    depth_map = provisional_depth_map
+    if (
+        temporal_stereo_estimator is not None
+        and str(getattr(config, "temporal_stereo", "off")) == "on"
+        and packet_depth_map is None
+        and not prefer_frame_packet_ground_truth
+        and not assist_frame_packet_ground_truth
+        and not prefer_frame_packet_depth_sensor
+        and slam_bridge is not None
+        and bool(getattr(slam_result, "tracking_ok", False))
+    ):
+        temporal_stereo_result = temporal_stereo_estimator.estimate(
+            frame_bgr=frame_bgr,
+            provisional_depth_map=provisional_depth_map,
+            slam_result=slam_result,
+            intrinsics=intrinsics,
+            detections=detections,
+        )
+        temporal_stereo_diagnostics = TemporalStereoDiagnostics(
+            enabled=bool(getattr(getattr(temporal_stereo_result, "diagnostics", None), "enabled", True)),
+            applied=bool(getattr(getattr(temporal_stereo_result, "diagnostics", None), "applied", False)),
+            reference_keyframe_id=getattr(getattr(temporal_stereo_result, "diagnostics", None), "reference_keyframe_id", None),
+            coverage_ratio=float(getattr(getattr(temporal_stereo_result, "diagnostics", None), "coverage_ratio", 0.0)),
+            median_disparity_px=float(
+                getattr(getattr(temporal_stereo_result, "diagnostics", None), "median_disparity_px", 0.0)
+            ),
+            fit_sample_count=int(getattr(getattr(temporal_stereo_result, "diagnostics", None), "fit_sample_count", 0)),
+            fit_rmse=(
+                None
+                if getattr(getattr(temporal_stereo_result, "diagnostics", None), "fit_rmse", None) is None
+                else float(getattr(getattr(temporal_stereo_result, "diagnostics", None), "fit_rmse"))
+            ),
+            fallback_reason=getattr(getattr(temporal_stereo_result, "diagnostics", None), "fallback_reason", None),
+        )
+        depth_map = np.asarray(
+            getattr(temporal_stereo_result, "fused_depth_map", provisional_depth_map),
+            dtype=np.float32,
+        )
     if getattr(map_builder, "requires_point_cloud", True):
         if device_is_cuda(resolved_device):
             points_xyz, point_colors, _point_pixels = depth_to_point_cloud_torch(
@@ -551,32 +626,6 @@ def process_frame(
     else:
         points_xyz = np.empty((0, 3), dtype=np.float32)
         map_point_colors = np.empty((0, 3), dtype=np.float32)
-    packet_pose_available = frame_packet is not None and frame_packet.pose_world_gt is not None
-    if prefer_frame_packet_ground_truth and packet_pose_available:
-        slam_result = _slam_result_from_frame_packet(frame_packet)
-    elif slam_bridge is not None:
-        if timestamp_sec is None:
-            raise RuntimeError("SLAM bridge requires a real frame timestamp in seconds")
-        slam_gray = resize_for_slam(
-            frame_bgr,
-            config.slam_width,
-            config.slam_height,
-            cv2_module=cv2,
-            prefer_cuda=prefer_opencv_cuda,
-        )
-        slam_result = slam_bridge.track(slam_gray, float(timestamp_sec))
-    elif tracker is not None:
-        tracking_result = tracker.update(
-            frame_bgr=frame_bgr,
-            depth_map=depth_map,
-            intrinsics=intrinsics,
-        )
-        slam_result = _legacy_tracking_to_slam_result(tracking_result, frame_index=frame_index)
-    else:
-        raise RuntimeError("process_frame requires either slam_bridge or tracker")
-
-    if assist_frame_packet_ground_truth and packet_pose_available:
-        slam_result = _slam_result_from_frame_packet(frame_packet)
 
     target_label = None
     if frame_packet is not None and getattr(frame_packet, "scenario_state", None) is not None:
@@ -597,13 +646,20 @@ def process_frame(
         detection_source = "runtime+fallback"
     else:
         detection_source = "runtime"
+    runtime_depth_source = "runtime_midas"
+    if temporal_stereo_diagnostics is not None:
+        runtime_depth_source = (
+            "runtime_temporal_stereo_fused"
+            if temporal_stereo_diagnostics.applied
+            else "runtime_midas_fallback"
+        )
     depth_source = (
         "ground_truth"
         if (prefer_frame_packet_ground_truth or assist_frame_packet_ground_truth) and packet_depth_map is not None
         else (
             "sensor"
             if prefer_frame_packet_depth_sensor and packet_depth_map is not None
-            else "runtime"
+            else runtime_depth_source
         )
     )
     pose_source = (
@@ -761,7 +817,29 @@ def process_frame(
         depth_diagnostics=depth_diagnostics,
         perception_diagnostics=perception_diagnostics,
         mesh_revision=(None if mesh_revision is None else int(mesh_revision)),
+        temporal_stereo_diagnostics=temporal_stereo_diagnostics,
     )
+    if (
+        temporal_stereo_estimator is not None
+        and slam_bridge is not None
+        and bool(getattr(slam_result, "keyframe_inserted", False))
+    ):
+        slam_gray = resize_for_slam(
+            frame_bgr,
+            config.slam_width,
+            config.slam_height,
+            cv2_module=cv2,
+            prefer_cuda=prefer_opencv_cuda,
+        )
+        update_cache = getattr(temporal_stereo_estimator, "update_keyframe_cache", None)
+        if callable(update_cache):
+            update_cache(
+                keyframe_id=slam_result.keyframe_id,
+                frame_bgr=frame_bgr,
+                frame_gray=slam_gray,
+                pose_world=np.asarray(slam_result.pose_world, dtype=np.float32),
+                intrinsics=intrinsics,
+            )
     return artifacts, list(detections)
 
 def window_is_visible(cv2_module, window_name: str) -> bool:
@@ -945,6 +1023,7 @@ def run(
     cv2_module=None,
     detector_factory=ObjectDetector,
     depth_estimator_factory=DepthEstimator,
+    temporal_stereo_factory=TemporalStereoDepthEstimator,
     tracker_factory=PoseTracker,
     map_builder_factory=LocalMapBuilder,
     slam_bridge_factory=None,
@@ -1042,6 +1121,7 @@ def run(
     use_frame_packet_ground_truth = False
     assist_frame_packet_ground_truth = False
     prefer_frame_packet_depth_sensor = False
+    temporal_stereo_estimator = None
 
     def _default_sim_frame_source(current_config: AppConfig):
         run_stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1076,6 +1156,21 @@ def run(
             camera_session=current_session,
             time_source=_live_frame_timestamp,
             frame_reader=read_camera_frame,
+        )
+
+    def _create_temporal_stereo_estimator():
+        if not use_slam_bridge or str(getattr(config, "temporal_stereo", "off")) != "on":
+            return None
+        return _call_factory_compat(
+            temporal_stereo_factory,
+            cv2_module=cv2,
+            max_keyframes=4,
+            max_rotation_deg=15.0,
+            stereo_width=384,
+            min_coverage_ratio=0.08,
+            min_median_disparity_px=1.0,
+            min_fit_samples=500,
+            max_fit_rmse=0.35,
         )
 
     def _handle_object_window_mouse(event, x, y, _flags, _param) -> None:
@@ -1435,6 +1530,7 @@ def run(
             )
         if bool(getattr(map_builder, "requires_slam_keyframes", False)) and slam_bridge is None:
             raise RuntimeError(_tsdf_requires_orbslam3_message())
+        temporal_stereo_estimator = _create_temporal_stereo_estimator()
         if config.graph_enabled:
             scene_graph_memory = scene_graph_memory_factory(
                 graph_max_visible_nodes=config.graph_max_visible_nodes,
@@ -1547,6 +1643,7 @@ def run(
                         )
                     )
                     map_builder.reset()
+                    temporal_stereo_estimator = _create_temporal_stereo_estimator()
                     restarted_stream = True
                 cached_detections = []
                 latest_explanation_request_id = None
@@ -1599,6 +1696,7 @@ def run(
                 frame_bgr=frame_bgr,
                 detector=detector,
                 depth_estimator=depth_estimator,
+                temporal_stereo_estimator=temporal_stereo_estimator,
                 slam_bridge=slam_bridge,
                 tracker=tracker,
                 map_builder=map_builder,
@@ -1774,6 +1872,7 @@ def run(
                 depth_diagnostics=artifacts.depth_diagnostics,
                 depth_debug_level=depth_debug_level,
                 perception_diagnostics=artifacts.perception_diagnostics,
+                temporal_stereo_diagnostics=artifacts.temporal_stereo_diagnostics,
                 cv2_module=cv2,
             )
             _imshow_runtime_window(

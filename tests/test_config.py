@@ -40,6 +40,7 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     assert config.camera_calibration is None
     assert config.slam_vocabulary == expected_vocabulary
     assert config.explanation_enabled is True
+    assert config.temporal_stereo == "on"
 
 
 def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -70,6 +71,8 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
             "9001",
             "--camera-calibration",
             "/tmp/camera.yaml",
+            "--temporal-stereo",
+            "off",
         ]
     )
 
@@ -88,6 +91,7 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
     assert config.unity_host == "127.0.0.2"
     assert config.unity_port == 9001
     assert config.camera_calibration == "/tmp/camera.yaml"
+    assert config.temporal_stereo == "off"
 
 
 def test_parse_config_defaults_sim_calibration_from_repo(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -203,6 +207,9 @@ def test_parser_rejects_invalid_choices() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--sim-open3d-view", "sideways"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--temporal-stereo", "auto"])
 
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:

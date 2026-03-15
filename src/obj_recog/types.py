@@ -60,6 +60,18 @@ class PerceptionDiagnostics:
     benchmark_valid: bool
 
 
+@dataclass(frozen=True, slots=True)
+class TemporalStereoDiagnostics:
+    enabled: bool
+    applied: bool
+    reference_keyframe_id: int | None
+    coverage_ratio: float
+    median_disparity_px: float
+    fit_sample_count: int
+    fit_rmse: float | None
+    fallback_reason: str | None
+
+
 @dataclass(slots=True)
 class FrameArtifacts:
     frame_bgr: np.ndarray
@@ -88,6 +100,7 @@ class FrameArtifacts:
     median_reprojection_error: float | None = None
     depth_diagnostics: DepthDiagnostics | None = None
     perception_diagnostics: PerceptionDiagnostics | None = None
+    temporal_stereo_diagnostics: TemporalStereoDiagnostics | None = None
     scene_graph_snapshot: SceneGraphSnapshot | None = None
     visible_graph_nodes: list[GraphNode] = field(default_factory=list)
     visible_graph_edges: list[GraphEdge] = field(default_factory=list)
