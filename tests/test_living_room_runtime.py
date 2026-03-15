@@ -61,6 +61,37 @@ class _FakeSensorBackend:
         )
 
 
+class _AsyncFakeSensorBackend(_FakeSensorBackend):
+    def __init__(self, *, pending_polls: int = 1) -> None:
+        super().__init__()
+        self._pending_polls = int(pending_polls)
+        self._remaining_pending_polls = 0
+        self._pending_frame: SensorFrame | None = None
+        self._waiting = False
+
+    def submit_action(self, command) -> None:
+        self.apply_calls.append((command.primitive.value, float(command.value)))
+        self._frame_index += 1
+        self._pending_frame = self._frame()
+        self._remaining_pending_polls = self._pending_polls
+        self._waiting = True
+
+    def poll_action_frame(self, *, timeout_sec: float | None = 0.0) -> SensorFrame | None:
+        _ = timeout_sec
+        if not self._waiting:
+            return None
+        if self._remaining_pending_polls > 0:
+            self._remaining_pending_polls -= 1
+            return None
+        frame = self._pending_frame
+        self._pending_frame = None
+        self._waiting = False
+        return frame
+
+    def is_waiting_for_frame(self) -> bool:
+        return self._waiting
+
+
 def _config(**overrides: object) -> AppConfig:
     values = dict(
         camera_index=0,
@@ -405,6 +436,32 @@ def test_living_room_runtime_forwards_planner_actions_to_backend(tmp_path: Path)
 
     assert ("move_forward", 0.12) in backend.apply_calls
     assert any(primitive == "turn_right" for primitive, _value in backend.apply_calls)
+
+
+def test_living_room_runtime_promotes_async_backend_frame_without_reprocessing_stale_frame(tmp_path: Path) -> None:
+    backend = _AsyncFakeSensorBackend(pending_polls=1)
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_FakePlanner([]),
+        sensor_backend=backend,
+    )
+
+    packet = runner.next_frame()
+    assert packet is not None
+
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+
+    assert runner.is_waiting_for_frame() is True
+    assert runner.next_frame(timeout_sec=0.0) is None
+
+    next_packet = runner.next_frame(timeout_sec=0.0)
+
+    assert next_packet is not None
+    assert runner.is_waiting_for_frame() is False
+    assert runner._state.frame_index == 1
+    assert next_packet.timestamp_sec == pytest.approx(0.5)
+    assert backend.apply_calls == [("camera_pan_left", 6.0)]
 
 
 def test_living_room_runtime_exposes_target_memory_on_first_planner_turn(tmp_path: Path) -> None:

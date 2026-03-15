@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import json
 import math
@@ -78,8 +79,11 @@ class UnityRgbSensorBackend:
     ) -> None:
         self._client = client
         self._frame_counter = 0
+        self._action_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="unity-rgb")
+        self._pending_frame_future: Future[SensorFrame] | None = None
 
     def reset_episode(self, *, scene_spec) -> SensorFrame:
+        self._clear_pending_frame_future()
         self._frame_counter = 0
         frame = self._client.reset_episode(scenario_id=str(scene_spec.scene_id))
         return SensorFrame(
@@ -97,8 +101,57 @@ class UnityRgbSensorBackend:
             frame_bgr=np.asarray(frame.frame_bgr, dtype=np.uint8),
         )
 
+    def submit_action(self, command: UnityActionCommand) -> None:
+        if self.is_waiting_for_frame():
+            raise RuntimeError("Unity RGB backend already has an in-flight action")
+        self._frame_counter += 1
+        frame_index = int(self._frame_counter)
+        self._pending_frame_future = self._action_executor.submit(
+            self._request_sensor_frame,
+            command,
+            frame_index,
+        )
+
+    def poll_action_frame(self, *, timeout_sec: float | None = 0.0) -> SensorFrame | None:
+        future = self._pending_frame_future
+        if future is None:
+            return None
+        resolved_timeout = 0.0 if timeout_sec is None else max(0.0, float(timeout_sec))
+        try:
+            frame = future.result(timeout=resolved_timeout)
+        except FutureTimeoutError:
+            return None
+        except Exception as exc:
+            self._pending_frame_future = None
+            raise RuntimeError("Unity RGB action request failed") from exc
+        self._pending_frame_future = None
+        return frame
+
+    def is_waiting_for_frame(self) -> bool:
+        return self._pending_frame_future is not None
+
     def close(self) -> None:
-        self._client.close()
+        try:
+            self._clear_pending_frame_future()
+            self._client.close()
+        finally:
+            self._action_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _request_sensor_frame(self, command: UnityActionCommand, frame_index: int) -> SensorFrame:
+        frame = self._client.apply_action(command)
+        return SensorFrame(
+            frame_index=int(frame_index),
+            timestamp_sec=float(frame.timestamp_sec),
+            frame_bgr=np.asarray(frame.frame_bgr, dtype=np.uint8),
+        )
+
+    def _clear_pending_frame_future(self) -> None:
+        future = self._pending_frame_future
+        if future is None:
+            return
+        if not future.done():
+            future.cancel()
+        self._pending_frame_future = None
 
 
 class LivingRoomEpisodeRunner:
@@ -614,6 +667,8 @@ class LivingRoomEpisodeRunner:
         self._active_schedule_executed_steps = []
 
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
+        if self._latest_sensor_frame is None and self.is_waiting_for_frame():
+            self._promote_pending_sensor_frame(timeout_sec=timeout_sec)
         _ = timeout_sec
         if self._closed or self._latest_sensor_frame is None:
             return None
@@ -641,12 +696,12 @@ class LivingRoomEpisodeRunner:
 
         next_command = self._select_next_command(artifacts=artifacts)
         self._previous_observation_state = current_state
-        self._latest_sensor_frame = self._sensor_backend.apply_action(next_command)
-        self._state.frame_index += 1
-        self._state.elapsed_sec += 1.0 / max(self._camera_rig.fps, 1e-6)
-        self._write_selfcalibration_artifact()
-        self._write_planner_turns_artifact()
-        self._write_episode_report()
+        submit_action = getattr(self._sensor_backend, "submit_action", None)
+        if callable(submit_action):
+            self._latest_sensor_frame = None
+            submit_action(next_command)
+            return
+        self._commit_sensor_frame(self._sensor_backend.apply_action(next_command))
 
     def close(self) -> None:
         self._closed = True
@@ -891,6 +946,27 @@ class LivingRoomEpisodeRunner:
             ),
             encoding="utf-8",
         )
+
+    def is_waiting_for_frame(self) -> bool:
+        waiting_getter = getattr(self._sensor_backend, "is_waiting_for_frame", None)
+        return bool(callable(waiting_getter) and waiting_getter())
+
+    def _promote_pending_sensor_frame(self, *, timeout_sec: float | None) -> None:
+        poll_action_frame = getattr(self._sensor_backend, "poll_action_frame", None)
+        if not callable(poll_action_frame):
+            return
+        sensor_frame = poll_action_frame(timeout_sec=timeout_sec)
+        if sensor_frame is None:
+            return
+        self._commit_sensor_frame(sensor_frame)
+
+    def _commit_sensor_frame(self, sensor_frame: SensorFrame) -> None:
+        self._latest_sensor_frame = sensor_frame
+        self._state.frame_index += 1
+        self._state.elapsed_sec += 1.0 / max(self._camera_rig.fps, 1e-6)
+        self._write_selfcalibration_artifact()
+        self._write_planner_turns_artifact()
+        self._write_episode_report()
 
 
 SimulationFrameSource = LivingRoomEpisodeRunner

@@ -43,6 +43,16 @@ class _FakeCV2:
         self.destroyed = True
 
 
+class _CountingCV2(_FakeCV2):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waitkey_calls = 0
+
+    def waitKey(self, delay: int) -> int:
+        self.waitkey_calls += 1
+        return super().waitKey(delay)
+
+
 class _FakeViewer:
     def __init__(self) -> None:
         self.closed = False
@@ -52,6 +62,16 @@ class _FakeViewer:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _CountingViewer(_FakeViewer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_calls = 0
+
+    def update(self, *_args, **_kwargs) -> bool:
+        self.update_calls += 1
+        return True
 
 
 class _FakeEnvironmentViewer:
@@ -84,6 +104,32 @@ class _FakeFrameSource:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _PendingFrameSource(_FakeFrameSource):
+    def __init__(self, packets: list[FramePacket]) -> None:
+        super().__init__([])
+        self._packets = list(packets)
+        self._waiting = False
+        self._stage = 0
+
+    def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
+        _ = timeout_sec
+        if self._stage == 0:
+            self._stage = 1
+            return self._packets.pop(0)
+        if self._stage == 1:
+            self._waiting = True
+            self._stage = 2
+            return None
+        if self._stage == 2:
+            self._waiting = False
+            self._stage = 3
+            return self._packets.pop(0)
+        return None
+
+    def is_waiting_for_frame(self) -> bool:
+        return self._waiting
 
 
 class _CountingDetector:
@@ -517,3 +563,46 @@ def test_run_sim_mode_records_runtime_observation_after_segments_and_scene_graph
     assert recorded_artifacts.segments[0].label == "floor"
     assert recorded_artifacts.scene_graph_snapshot is not None
     assert scene_graph_memory.update_calls[0][1][0].label == "floor"
+
+
+def test_run_sim_mode_waits_for_pending_frame_without_treating_it_as_eof(tmp_path: Path) -> None:
+    slam_vocabulary, calibration = _write_runtime_files(tmp_path)
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        detection_interval=1,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+        camera_calibration=calibration,
+        slam_vocabulary=slam_vocabulary,
+    )
+    source = _PendingFrameSource([_packet(0.0), _packet(0.5)])
+    fake_cv2 = _CountingCV2()
+    viewer = _CountingViewer()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_kwargs: _CountingDetector(),
+        depth_estimator_factory=lambda **_kwargs: _CountingDepthEstimator(),
+        tracker_factory=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("tracker should not be used")),
+        slam_bridge_factory=_FakeSlamBridgeFactory(),
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: viewer,
+        environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+    )
+
+    assert len(source.runtime_observations) == 2
+    assert viewer.update_calls >= 3
+    assert fake_cv2.waitkey_calls >= 3
+    assert source.closed is True

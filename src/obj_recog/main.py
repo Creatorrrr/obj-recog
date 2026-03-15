@@ -1130,9 +1130,12 @@ def run(
     cached_segmentation: SegmentationResult | None = None
     segmentation_frame_metadata: OrderedDict[int, dict[str, object]] = OrderedDict()
     frame_index = 0
+    frame_timeout_sec = 0.05 if config.input_source == "sim" else 1.0
     last_frame_time = 0.0
     slam_time_origin = None
     object_window_has_been_visible = False
+    last_artifacts = None
+    last_frame_packet = None
 
     try:
         if config.input_source == "sim":
@@ -1361,8 +1364,31 @@ def run(
             slam_time_origin = time_source()
 
         while True:
-            frame_packet = None if frame_source is None else frame_source.next_frame(timeout_sec=1.0)
+            frame_packet = None if frame_source is None else frame_source.next_frame(timeout_sec=frame_timeout_sec)
             if frame_packet is None:
+                sim_frame_pending = bool(
+                    config.input_source == "sim"
+                    and frame_source is not None
+                    and callable(getattr(frame_source, "is_waiting_for_frame", None))
+                    and frame_source.is_waiting_for_frame()
+                )
+                if sim_frame_pending:
+                    environment_viewer_active = True
+                    if environment_viewer is not None and last_frame_packet is not None:
+                        scenario_state = getattr(last_frame_packet, "scenario_state", None)
+                        if scenario_state is not None:
+                            environment_viewer_active = bool(environment_viewer.update(scenario_state))
+                    reconstruction_viewer_active = True
+                    if viewer is not None and last_artifacts is not None:
+                        reconstruction_viewer_active = _update_viewer(viewer, last_artifacts)
+                    viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
+                    key = cv2.waitKey(1) & 0xFF
+                    window_visible = window_is_visible(cv2, "Object Recognition")
+                    object_window_has_been_visible = object_window_has_been_visible or window_visible
+                    window_closed = object_window_has_been_visible and not window_visible
+                    if key == ord("q") or not viewer_active or window_closed:
+                        break
+                    continue
                 restarted_stream = False
                 if (
                     config.input_source != "sim"
@@ -1473,6 +1499,8 @@ def run(
                 effective_device=effective_device,
                 cv2_module=cv2,
             )
+            last_artifacts = artifacts
+            last_frame_packet = frame_packet
             if frame_index == 0:
                 debug_log("first runtime frame processed")
 
