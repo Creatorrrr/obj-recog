@@ -792,6 +792,83 @@ def test_living_room_runtime_writes_enhanced_planner_turn_payload(tmp_path: Path
     assert payload["prompt"]["recent_searches"][0]["likely_blocked"] is True
 
 
+def test_living_room_runtime_rejects_contradictory_batches_with_escape_fallback(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(
+                    ActionStep(ActionPrimitive.TURN_LEFT, 6.0, intent="scan left"),
+                    ActionStep(ActionPrimitive.TURN_RIGHT, 6.0, intent="scan right"),
+                ),
+                rationale="contradictory",
+                model="fake-planner",
+                issued_at_frame=0,
+                situation_summary="Confused plan",
+                behavior_mode="scan",
+            )
+        ]
+    )
+    backend = _FakeSensorBackend()
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=backend,
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, depth_m=0.4, camera_pose_world=np.eye(4, dtype=np.float32)),
+    )
+
+    assert backend.apply_calls
+    assert backend.apply_calls[0][0] in {"move_backward", "strafe_left", "strafe_right"}
+    assert runner.current_schedule is not None
+    assert runner.current_schedule.behavior_mode == "escape"
+    assert runner.current_schedule.safety_flags is not None
+    assert runner.current_schedule.safety_flags.replan_reason == "contradictory_actions"
+
+
+def test_living_room_runtime_pauses_translation_when_tracking_risk_is_high(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12, intent="advance"),),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+                situation_summary="Move ahead",
+                behavior_mode="approach",
+            )
+        ]
+    )
+    backend = _FakeSensorBackend()
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=backend,
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, slam_tracking_state="LOST"),
+    )
+
+    assert backend.apply_calls[0] == ("pause", 0.5)
+    assert runner._latest_planner_schedule is not None
+    assert runner._latest_planner_schedule.safety_flags is not None
+    assert runner._latest_planner_schedule.safety_flags.replan_reason == "tracking_risk"
+
+
 def test_simulation_runtime_uses_living_room_scene_and_resets_backend(tmp_path: Path) -> None:
     backend = _FakeSensorBackend()
     runtime = LivingRoomSimulationRuntime(

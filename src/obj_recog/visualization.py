@@ -134,6 +134,7 @@ def runtime_window_position(
         "Object Recognition": (left_x, top_y),
         "Environment Model": (right_x, top_y),
         "Situation Explanation": (left_x, bottom_y),
+        "Planner Overview": (left_x, bottom_y),
         "3D Reconstruction": (right_x, bottom_y),
     }
     return positions.get(str(window_name), (left_x, top_y))
@@ -647,11 +648,7 @@ def render_explanation_panel(
     wrap_width = max(64, int((canvas.shape[1] - reserved_scroll_width) / 14))
     request_lines = wrap_explanation_text(str(request_context or ""), width=wrap_width, max_lines=None)
     response_lines = wrap_explanation_text(text, width=wrap_width, max_lines=None)
-    body_lines = (
-        ["LLM request", *request_lines, "", "LLM response", *response_lines]
-        if request_lines
-        else response_lines
-    )
+    body_lines = response_lines
     if not body_lines:
         if str(status) == ExplanationStatus.DISABLED:
             body_lines = ["OPENAI_API_KEY가 없어 상황 설명 기능이 비활성화되었습니다."]
@@ -675,9 +672,9 @@ def render_explanation_panel(
         max_lines=None,
     )
     if planner_request_lines:
-        planner_request_lines = ["Planner request", *planner_request_lines]
+        planner_request_lines = ["Raw request", *planner_request_lines]
     else:
-        planner_request_lines = ["Planner request not available yet."]
+        planner_request_lines = ["Raw request not available yet."]
 
     planner_response_lines = wrap_explanation_text(
         str(planner_response_text or ""),
@@ -685,9 +682,9 @@ def render_explanation_panel(
         max_lines=None,
     )
     if planner_response_lines:
-        planner_response_lines = ["Planner response", *planner_response_lines]
+        planner_response_lines = ["Raw response", *planner_response_lines]
     else:
-        planner_response_lines = ["Planner response not available yet."]
+        planner_response_lines = ["Raw response not available yet."]
 
     body_lines = {
         "explanation": list(body_lines),
@@ -711,9 +708,9 @@ def render_explanation_panel(
     y += 8
 
     tab_specs = (
-        ("explanation", "Explain"),
-        ("planner_request", "Planner Req"),
-        ("planner_response", "Planner Resp"),
+        ("explanation", "Summary"),
+        ("planner_request", "Raw Request"),
+        ("planner_response", "Raw Response"),
     )
     tab_rects: dict[str, tuple[int, int, int, int]] = {}
     get_text_size = getattr(cv2, "getTextSize", None)

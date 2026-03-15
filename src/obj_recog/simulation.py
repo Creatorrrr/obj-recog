@@ -21,7 +21,9 @@ from obj_recog.sim_protocol import (
     HiddenWorldState,
     PlannerActionEffectSummary,
     PlannerNavigationAffordances,
+    PlannerNavigationSectorObservation,
     PlannerReconstructionBrief,
+    PlannerSafetyFlags,
     PlannerSearchOutcome,
     RobotPose,
     SensorFrame,
@@ -316,6 +318,94 @@ class LivingRoomEpisodeRunner:
             return None
         return float(np.nanpercentile(valid, 30))
 
+    @staticmethod
+    def _direction_from_action_text(action_text: str) -> str | None:
+        text = str(action_text or "")
+        if "strafe_left" in text or "turn_left" in text or "camera_pan_left" in text:
+            return "left"
+        if "strafe_right" in text or "turn_right" in text or "camera_pan_right" in text:
+            return "right"
+        if "move_backward" in text:
+            return "rear"
+        if "move_forward" in text:
+            return "front"
+        return None
+
+    def _recently_failed_directions(self) -> tuple[str, ...]:
+        directions: list[str] = []
+        for effect in self._recent_action_effects[-4:]:
+            if not effect.likely_blocked:
+                continue
+            direction = self._direction_from_action_text(effect.action)
+            if direction:
+                directions.append(direction)
+        for search in self._completed_search_history[-4:]:
+            if not search.likely_blocked:
+                continue
+            for action in search.executed_actions:
+                direction = self._direction_from_action_text(action)
+                if direction:
+                    directions.append(direction)
+                    break
+        return tuple(dict.fromkeys(directions))
+
+    def _navigation_sector_map(
+        self,
+        *,
+        depth_map: np.ndarray,
+        rear_clearance_m: float | None,
+        recently_failed_directions: tuple[str, ...],
+    ) -> tuple[PlannerNavigationSectorObservation, ...]:
+        failed = set(recently_failed_directions)
+        sector_specs = (
+            ("left", (0.00, 0.22), (0.45, 0.95)),
+            ("front-left", (0.18, 0.42), (0.42, 0.90)),
+            ("front", (0.35, 0.65), (0.42, 0.95)),
+            ("front-right", (0.58, 0.82), (0.42, 0.90)),
+            ("right", (0.78, 1.00), (0.45, 0.95)),
+        )
+        sectors: list[PlannerNavigationSectorObservation] = []
+        for sector_name, x_bounds, y_bounds in sector_specs:
+            clearance_m = self._sector_clearance(depth_map, x_bounds=x_bounds, y_bounds=y_bounds)
+            traversable = clearance_m is not None and clearance_m >= 0.95
+            obstacle_likelihood = 1.0
+            frontier_score = 0.0
+            if clearance_m is not None:
+                obstacle_likelihood = float(np.clip(1.0 - (float(clearance_m) / 2.5), 0.0, 1.0))
+                frontier_score = float(np.clip(float(clearance_m) / 2.5, 0.0, 1.0))
+            sectors.append(
+                PlannerNavigationSectorObservation(
+                    sector=sector_name,
+                    clearance_m=clearance_m,
+                    traversable=bool(traversable),
+                    obstacle_likelihood=obstacle_likelihood,
+                    frontier_score=frontier_score,
+                    recently_failed=sector_name in failed or (
+                        sector_name.startswith("front") and "front" in failed
+                    ),
+                )
+            )
+        for sector_name in ("rear-left", "rear", "rear-right"):
+            sectors.append(
+                PlannerNavigationSectorObservation(
+                    sector=sector_name,
+                    clearance_m=rear_clearance_m,
+                    traversable=rear_clearance_m is not None and rear_clearance_m >= 0.95,
+                    obstacle_likelihood=(
+                        1.0
+                        if rear_clearance_m is None
+                        else float(np.clip(1.0 - (float(rear_clearance_m) / 2.5), 0.0, 1.0))
+                    ),
+                    frontier_score=(
+                        0.0
+                        if rear_clearance_m is None
+                        else float(np.clip(float(rear_clearance_m) / 2.5, 0.0, 1.0))
+                    ),
+                    recently_failed=sector_name in failed or "rear" in failed,
+                )
+            )
+        return tuple(sectors)
+
     def _navigation_affordances_summary(self, *, artifacts) -> PlannerNavigationAffordances:
         depth_map = np.asarray(getattr(artifacts, "depth_map", np.empty((0, 0))), dtype=np.float32)
         forward_clearance_m = self._sector_clearance(depth_map, x_bounds=(0.35, 0.65), y_bounds=(0.45, 0.95))
@@ -327,10 +417,12 @@ class LivingRoomEpisodeRunner:
         rear_clearance_m = None
         if isinstance(previous_affordances, PlannerNavigationAffordances):
             rear_clearance_m = previous_affordances.forward_clearance_m
+        recently_failed_directions = self._recently_failed_directions()
         direction_scores = {
             "front": -1.0 if forward_clearance_m is None else float(forward_clearance_m),
             "left": -1.0 if left_clearance_m is None else float(left_clearance_m),
             "right": -1.0 if right_clearance_m is None else float(right_clearance_m),
+            "rear": -1.0 if rear_clearance_m is None else float(rear_clearance_m),
         }
         candidate_open_directions = tuple(
             direction
@@ -352,6 +444,11 @@ class LivingRoomEpisodeRunner:
             best_exploration_direction = candidate_open_directions[0]
         else:
             best_exploration_direction = max(direction_scores.items(), key=lambda item: item[1])[0]
+        sector_map = self._navigation_sector_map(
+            depth_map=depth_map,
+            rear_clearance_m=rear_clearance_m,
+            recently_failed_directions=recently_failed_directions,
+        )
         return PlannerNavigationAffordances(
             forward_clearance_m=forward_clearance_m,
             left_clearance_m=left_clearance_m,
@@ -361,6 +458,8 @@ class LivingRoomEpisodeRunner:
             candidate_open_directions=candidate_open_directions,
             dead_end_likelihood=float(np.clip(dead_end_likelihood, 0.0, 1.0)),
             best_exploration_direction=best_exploration_direction,
+            sector_map=sector_map,
+            recently_failed_directions=recently_failed_directions,
         )
 
     def _observation_state_from_artifacts(self, *, artifacts) -> dict[str, object]:
@@ -488,6 +587,19 @@ class LivingRoomEpisodeRunner:
         frontier_directions = ()
         if isinstance(navigation_affordances, PlannerNavigationAffordances):
             frontier_directions = tuple(navigation_affordances.candidate_open_directions[:3])
+            explored_directions = tuple(
+                item.sector for item in navigation_affordances.sector_map if item.clearance_m is not None
+            )
+            unexplored_directions = tuple(
+                item.sector
+                for item in navigation_affordances.sector_map
+                if item.clearance_m is None or item.frontier_score >= 0.45
+            )
+            recently_failed_directions = tuple(navigation_affordances.recently_failed_directions)
+        else:
+            explored_directions = ()
+            unexplored_directions = ()
+            recently_failed_directions = ()
         return PlannerReconstructionBrief(
             pose_delta_m=pose_delta_m,
             yaw_delta_deg=yaw_delta_deg,
@@ -495,6 +607,9 @@ class LivingRoomEpisodeRunner:
             mesh_triangle_count=int(observation_state["mesh_triangle_count"]),
             mesh_growth_delta=int(mesh_growth_delta),
             frontier_directions=frontier_directions,
+            explored_directions=explored_directions,
+            unexplored_directions=unexplored_directions,
+            recently_failed_directions=recently_failed_directions,
         )
 
     @staticmethod
@@ -716,6 +831,122 @@ class LivingRoomEpisodeRunner:
         self._latest_sensor_frame = None
         self._write_episode_report()
 
+    @staticmethod
+    def _contains_contradictory_steps(steps: tuple[ActionStep, ...]) -> bool:
+        primitives = {step.primitive for step in steps}
+        contradictory_pairs = (
+            {ActionPrimitive.TURN_LEFT, ActionPrimitive.TURN_RIGHT},
+            {ActionPrimitive.CAMERA_PAN_LEFT, ActionPrimitive.CAMERA_PAN_RIGHT},
+            {ActionPrimitive.STRAFE_LEFT, ActionPrimitive.STRAFE_RIGHT},
+        )
+        return any(pair.issubset(primitives) for pair in contradictory_pairs)
+
+    @staticmethod
+    def _tracking_risk(tracking_status: str) -> str:
+        normalized = str(tracking_status or "").upper()
+        if normalized in {"TRACKING", "RELOCALIZED"}:
+            return "low"
+        if normalized in {"LOST", "UNKNOWN"}:
+            return "high"
+        return "medium"
+
+    def _escape_steps(self, *, observation_state: dict[str, object]) -> tuple[ActionStep, ...]:
+        affordances = observation_state.get("navigation_affordances")
+        best_direction = None
+        if isinstance(affordances, PlannerNavigationAffordances):
+            best_direction = affordances.best_exploration_direction
+        translation_step = (
+            ActionStep(ActionPrimitive.STRAFE_LEFT, 0.12, intent="escape toward left opening")
+            if best_direction == "left"
+            else ActionStep(ActionPrimitive.STRAFE_RIGHT, 0.12, intent="escape toward right opening")
+            if best_direction == "right"
+            else ActionStep(ActionPrimitive.MOVE_BACKWARD, 0.12, intent="back out of blocked state")
+        )
+        turn_step = (
+            ActionStep(ActionPrimitive.TURN_LEFT, 6.0, intent="reorient toward safer view")
+            if best_direction != "right"
+            else ActionStep(ActionPrimitive.TURN_RIGHT, 6.0, intent="reorient toward safer view")
+        )
+        pan_step = (
+            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 6.0, intent="confirm escape corridor")
+            if best_direction != "right"
+            else ActionStep(ActionPrimitive.CAMERA_PAN_RIGHT, 6.0, intent="confirm escape corridor")
+        )
+        return (translation_step, turn_step, pan_step)
+
+    def _validated_schedule(
+        self,
+        *,
+        schedule: ActionSchedule,
+        observation_state: dict[str, object],
+        context,
+    ) -> ActionSchedule:
+        affordances = observation_state.get("navigation_affordances")
+        front_blocked = bool(
+            isinstance(affordances, PlannerNavigationAffordances) and affordances.front_blocked
+        )
+        dead_end_risk = float(
+            0.0
+            if not isinstance(affordances, PlannerNavigationAffordances)
+            else affordances.dead_end_likelihood
+        )
+        tracking_risk = self._tracking_risk(observation_state.get("tracking_status", "UNKNOWN"))
+        if self._contains_contradictory_steps(tuple(schedule.steps)):
+            return ActionSchedule(
+                steps=self._escape_steps(observation_state=observation_state),
+                rationale="planner returned contradictory actions; use escape fallback",
+                model=f"{schedule.model}/validated",
+                issued_at_frame=schedule.issued_at_frame,
+                situation_summary=schedule.situation_summary or "Contradictory actions rejected; executing escape fallback.",
+                behavior_mode="escape",
+                goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                safety_flags=PlannerSafetyFlags(
+                    front_blocked=front_blocked,
+                    dead_end_risk=dead_end_risk,
+                    tracking_risk=tracking_risk,
+                    replan_reason="contradictory_actions",
+                ),
+                confidence=0.0 if schedule.confidence is None else float(schedule.confidence),
+            )
+        if tracking_risk == "high" and any(
+            step.primitive in {ActionPrimitive.MOVE_FORWARD, ActionPrimitive.STRAFE_LEFT, ActionPrimitive.STRAFE_RIGHT}
+            for step in schedule.steps
+        ):
+            return ActionSchedule(
+                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5, intent="tracking unstable; pause"),),
+                rationale="tracking risk too high for aggressive translation",
+                model=f"{schedule.model}/validated",
+                issued_at_frame=schedule.issued_at_frame,
+                situation_summary=schedule.situation_summary or "Tracking is unstable; pausing to reassess.",
+                behavior_mode="scan",
+                goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                safety_flags=PlannerSafetyFlags(
+                    front_blocked=front_blocked,
+                    dead_end_risk=dead_end_risk,
+                    tracking_risk=tracking_risk,
+                    replan_reason="tracking_risk",
+                ),
+                confidence=0.0 if schedule.confidence is None else float(schedule.confidence),
+            )
+        if schedule.safety_flags is None:
+            schedule = ActionSchedule(
+                steps=tuple(schedule.steps),
+                rationale=schedule.rationale,
+                model=schedule.model,
+                issued_at_frame=schedule.issued_at_frame,
+                situation_summary=schedule.situation_summary,
+                behavior_mode=schedule.behavior_mode,
+                goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                safety_flags=PlannerSafetyFlags(
+                    front_blocked=front_blocked,
+                    dead_end_risk=dead_end_risk,
+                    tracking_risk=tracking_risk,
+                    replan_reason="model_response",
+                ),
+                confidence=schedule.confidence,
+            )
+        return schedule
+
     def _select_next_command(self, *, artifacts) -> UnityActionCommand:
         if self._state.phase == EpisodePhase.SELF_CALIBRATING:
             step = self._advance_self_calibration()
@@ -774,6 +1005,7 @@ class LivingRoomEpisodeRunner:
             segments=list(getattr(artifacts, "segments", []) or []),
             depth_map=depth_map,
             frame_shape=tuple(np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape[:2]),
+            camera_pose_world=np.asarray(getattr(artifacts, "camera_pose_world", np.empty((0, 0))), dtype=np.float32),
             navigation_affordances=observation_state.get("navigation_affordances"),
             reconstruction_brief=reconstruction_brief,
             recent_action_effects=tuple(self._recent_action_effects),
@@ -786,15 +1018,31 @@ class LivingRoomEpisodeRunner:
             },
         )
         try:
-            schedule = self._planner.plan(context=context)
+            try:
+                schedule = self._planner.plan(
+                    context=context,
+                    frame_bgr=np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3))), dtype=np.uint8),
+                )
+            except TypeError:
+                schedule = self._planner.plan(context=context)
         except Exception as exc:
             schedule = ActionSchedule(
                 steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
                 rationale=f"planner unavailable; pause and reassess ({exc})",
                 model="planner_error",
                 issued_at_frame=self._state.frame_index,
+                situation_summary=f"Planner unavailable: {exc}",
+                behavior_mode="scan",
+                safety_flags=PlannerSafetyFlags(
+                    front_blocked=False,
+                    dead_end_risk=0.0,
+                    tracking_risk="unknown",
+                    replan_reason="planner_error",
+                ),
+                confidence=0.0,
             )
         self._latest_planner_context = context
+        schedule = self._validated_schedule(schedule=schedule, observation_state=observation_state, context=context)
         truncated_steps = tuple(schedule.steps[:batch_step_limit])
         if truncated_steps != schedule.steps:
             schedule = ActionSchedule(
@@ -802,6 +1050,11 @@ class LivingRoomEpisodeRunner:
                 rationale=schedule.rationale,
                 model=schedule.model,
                 issued_at_frame=schedule.issued_at_frame,
+                situation_summary=schedule.situation_summary,
+                behavior_mode=schedule.behavior_mode,
+                goal_hypothesis=schedule.goal_hypothesis,
+                safety_flags=schedule.safety_flags,
+                confidence=schedule.confidence,
             )
         if not schedule.steps:
             schedule = ActionSchedule(
@@ -809,6 +1062,23 @@ class LivingRoomEpisodeRunner:
                 rationale="planner returned no safe actions; pause and reassess",
                 model=getattr(self._planner, "model", "fallback"),
                 issued_at_frame=self._state.frame_index,
+                situation_summary="Planner returned no safe actions.",
+                behavior_mode="scan",
+                goal_hypothesis=context.goal_estimate,
+                safety_flags=PlannerSafetyFlags(
+                    front_blocked=bool(
+                        context.perception.navigation_affordances is not None
+                        and context.perception.navigation_affordances.front_blocked
+                    ),
+                    dead_end_risk=float(
+                        0.0
+                        if context.perception.navigation_affordances is None
+                        else context.perception.navigation_affordances.dead_end_likelihood
+                    ),
+                    tracking_risk="high" if context.perception.tracking_status != "TRACKING" else "low",
+                    replan_reason="empty_schedule",
+                ),
+                confidence=0.0,
             )
         self._latest_planner_schedule = schedule
         self._current_schedule = schedule
@@ -826,9 +1096,29 @@ class LivingRoomEpisodeRunner:
                 "prompt": context,
                 "schedule": {
                     "rationale": schedule.rationale,
+                    "situation_summary": schedule.situation_summary,
+                    "behavior_mode": schedule.behavior_mode,
                     "model": schedule.model,
+                    "goal_hypothesis": None
+                    if schedule.goal_hypothesis is None
+                    else {
+                        "status": schedule.goal_hypothesis.status,
+                        "bearing_hint": schedule.goal_hypothesis.bearing_hint,
+                        "distance_hint": schedule.goal_hypothesis.distance_hint,
+                        "evidence": list(schedule.goal_hypothesis.evidence_sources),
+                        "confidence": float(schedule.goal_hypothesis.confidence),
+                    },
+                    "safety_flags": None
+                    if schedule.safety_flags is None
+                    else {
+                        "front_blocked": bool(schedule.safety_flags.front_blocked),
+                        "dead_end_risk": float(schedule.safety_flags.dead_end_risk),
+                        "tracking_risk": schedule.safety_flags.tracking_risk,
+                        "replan_reason": schedule.safety_flags.replan_reason,
+                    },
+                    "confidence": schedule.confidence,
                     "steps": [
-                        {"primitive": step.primitive.value, "value": step.value}
+                        {"primitive": step.primitive.value, "value": step.value, "intent": step.intent}
                         for step in schedule.steps
                     ],
                 },
@@ -877,14 +1167,19 @@ class LivingRoomEpisodeRunner:
         chunk_value = math.copysign(limit, float(step.value))
         residual_value = float(step.value) - chunk_value
         updated_steps = list(self._current_schedule.steps)
-        updated_steps[cursor] = ActionStep(step.primitive, residual_value)
+        updated_steps[cursor] = ActionStep(step.primitive, residual_value, intent=step.intent)
         self._current_schedule = ActionSchedule(
             steps=tuple(updated_steps),
             rationale=self._current_schedule.rationale,
             model=self._current_schedule.model,
             issued_at_frame=self._current_schedule.issued_at_frame,
+            situation_summary=self._current_schedule.situation_summary,
+            behavior_mode=self._current_schedule.behavior_mode,
+            goal_hypothesis=self._current_schedule.goal_hypothesis,
+            safety_flags=self._current_schedule.safety_flags,
+            confidence=self._current_schedule.confidence,
         )
-        return ActionStep(step.primitive, chunk_value)
+        return ActionStep(step.primitive, chunk_value, intent=step.intent)
 
     def _write_selfcalibration_artifact(self) -> None:
         payload = {

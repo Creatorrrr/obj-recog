@@ -84,16 +84,85 @@ def _planner_response_text_from_frame_packet(frame_packet: FramePacket | None) -
         {
             "primitive": getattr(getattr(step, "primitive", None), "value", getattr(step, "primitive", "")),
             "value": float(getattr(step, "value", 0.0)),
+            "intent": str(getattr(step, "intent", "")),
         }
         for step in tuple(getattr(schedule, "steps", ()) or ())
     ]
     payload = {
         "rationale": str(getattr(schedule, "rationale", "")),
+        "situation_summary": str(getattr(schedule, "situation_summary", "")),
+        "behavior_mode": str(getattr(schedule, "behavior_mode", "")),
         "model": str(getattr(schedule, "model", "")),
         "issued_at_frame": int(getattr(schedule, "issued_at_frame", 0)),
+        "goal_hypothesis": (
+            None
+            if getattr(schedule, "goal_hypothesis", None) is None
+            else {
+                "status": str(getattr(schedule.goal_hypothesis, "status", "")),
+                "bearing_hint": getattr(schedule.goal_hypothesis, "bearing_hint", None),
+                "distance_hint": getattr(schedule.goal_hypothesis, "distance_hint", None),
+                "evidence": list(getattr(schedule.goal_hypothesis, "evidence_sources", ()) or ()),
+                "confidence": float(getattr(schedule.goal_hypothesis, "confidence", 0.0)),
+            }
+        ),
+        "safety_flags": (
+            None
+            if getattr(schedule, "safety_flags", None) is None
+            else {
+                "front_blocked": bool(getattr(schedule.safety_flags, "front_blocked", False)),
+                "dead_end_risk": float(getattr(schedule.safety_flags, "dead_end_risk", 0.0)),
+                "tracking_risk": str(getattr(schedule.safety_flags, "tracking_risk", "")),
+                "replan_reason": str(getattr(schedule.safety_flags, "replan_reason", "")),
+            }
+        ),
+        "confidence": None if getattr(schedule, "confidence", None) is None else float(schedule.confidence),
         "steps": steps,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _planner_summary_text_from_frame_packet(frame_packet: FramePacket | None) -> str:
+    if frame_packet is None or getattr(frame_packet, "planner_schedule", None) is None:
+        return ""
+    schedule = frame_packet.planner_schedule
+    goal_hypothesis = getattr(schedule, "goal_hypothesis", None)
+    safety_flags = getattr(schedule, "safety_flags", None)
+    summary_lines = [
+        str(getattr(schedule, "situation_summary", "") or getattr(schedule, "rationale", "")).strip(),
+        f"Behavior mode: {str(getattr(schedule, 'behavior_mode', '') or 'scan')}",
+    ]
+    if goal_hypothesis is not None:
+        evidence = ", ".join(str(item) for item in tuple(getattr(goal_hypothesis, "evidence_sources", ()) or ()))
+        summary_lines.append(
+            "Goal hypothesis: "
+            + f"{str(getattr(goal_hypothesis, 'status', 'unknown'))}"
+            + f" | bearing={getattr(goal_hypothesis, 'bearing_hint', None)}"
+            + f" | distance={getattr(goal_hypothesis, 'distance_hint', None)}"
+            + f" | confidence={float(getattr(goal_hypothesis, 'confidence', 0.0)):.2f}"
+        )
+        if evidence:
+            summary_lines.append(f"Evidence: {evidence}")
+    if safety_flags is not None:
+        summary_lines.append(
+            "Safety: "
+            + f"front_blocked={bool(getattr(safety_flags, 'front_blocked', False))}, "
+            + f"dead_end_risk={float(getattr(safety_flags, 'dead_end_risk', 0.0)):.2f}, "
+            + f"tracking_risk={str(getattr(safety_flags, 'tracking_risk', 'unknown'))}, "
+            + f"replan_reason={str(getattr(safety_flags, 'replan_reason', ''))}"
+        )
+    summary_lines.append("Planned steps:")
+    for index, step in enumerate(tuple(getattr(schedule, "steps", ()) or ()), start=1):
+        summary_lines.append(
+            f"{index}. "
+            + f"{getattr(getattr(step, 'primitive', None), 'value', getattr(step, 'primitive', ''))} "
+            + f"{float(getattr(step, 'value', 0.0)):.2f}"
+            + (f" | {str(getattr(step, 'intent', ''))}" if str(getattr(step, "intent", "")).strip() else "")
+        )
+    return "\n".join(line for line in summary_lines if str(line).strip())
+
+
+def _explanation_window_name(*, input_source: str) -> str:
+    return "Planner Overview" if str(input_source) == "sim" else "Situation Explanation"
 
 
 def _tsdf_requires_orbslam3_message() -> str:
@@ -898,12 +967,13 @@ def run(
     calibration = None
     runtime_settings_path = config.camera_calibration
     explanation_api_key = os.getenv("OPENAI_API_KEY")
-    sim_explanation_enabled = bool(
-        config.explanation_enabled and (config.input_source != "sim" or bool(explanation_api_key))
-    )
-    explanation_status = (
-        ExplanationStatus.IDLE if sim_explanation_enabled else None
-    )
+    sim_explanation_enabled = bool(config.explanation_enabled)
+    if not sim_explanation_enabled:
+        explanation_status = None
+    elif config.input_source == "sim":
+        explanation_status = ExplanationStatus.IDLE
+    else:
+        explanation_status = ExplanationStatus.IDLE if bool(explanation_api_key) else ExplanationStatus.DISABLED
     explanation_result = ExplanationResult(
         text="",
         status=ExplanationStatus.IDLE,
@@ -937,6 +1007,7 @@ def run(
         "down_rect": None,
         "tab_rects": {},
     }
+    explanation_window_name = _explanation_window_name(input_source=config.input_source)
     explanation_mouse_callback_registered = False
     explanation_panel_mouse_callback_registered = False
     depth_debug_level = "basic"
@@ -1241,32 +1312,36 @@ def run(
             except Exception as exc:
                 debug_log(f"segmentation disabled ({exc})")
         if sim_explanation_enabled:
-            api_key = explanation_api_key
-            if not api_key:
-                explanation_status = ExplanationStatus.DISABLED
+            if config.input_source == "sim":
+                explanation_status = ExplanationStatus.IDLE
+                explanation_refresh_status = "planner_core"
             else:
-                try:
-                    debug_log("explanation init start")
-                    explainer_factory = situation_explainer_factory or OpenAISituationExplainer
-                    explainer = explainer_factory(
-                        model=config.explanation_model,
-                        timeout_sec=config.explanation_timeout_sec,
-                        api_key=api_key,
-                        cv2_module=cv2,
-                    )
-                    explanation_worker = explanation_worker_factory(explainer=explainer)
-                    debug_log("explanation init done")
-                except Exception as exc:
-                    explanation_status = ExplanationStatus.ERROR
-                    explanation_result = ExplanationResult(
-                        text="",
-                        status=ExplanationStatus.ERROR,
-                        latency_ms=None,
-                        model=config.explanation_model,
-                        error_message=str(exc),
-                    )
-                    explanation_refresh_status = "failed"
-                    debug_log(f"explanation disabled ({exc})")
+                api_key = explanation_api_key
+                if not api_key:
+                    explanation_status = ExplanationStatus.DISABLED
+                else:
+                    try:
+                        debug_log("explanation init start")
+                        explainer_factory = situation_explainer_factory or OpenAISituationExplainer
+                        explainer = explainer_factory(
+                            model=config.explanation_model,
+                            timeout_sec=config.explanation_timeout_sec,
+                            api_key=api_key,
+                            cv2_module=cv2,
+                        )
+                        explanation_worker = explanation_worker_factory(explainer=explainer)
+                        debug_log("explanation init done")
+                    except Exception as exc:
+                        explanation_status = ExplanationStatus.ERROR
+                        explanation_result = ExplanationResult(
+                            text="",
+                            status=ExplanationStatus.ERROR,
+                            latency_ms=None,
+                            model=config.explanation_model,
+                            error_message=str(exc),
+                        )
+                        explanation_refresh_status = "failed"
+                        debug_log(f"explanation disabled ({exc})")
         if validation_probe is not None and hasattr(validation_probe, "on_start"):
             validation_probe.on_start(
                 explanation_api_available=bool(sim_explanation_enabled and explanation_api_key)
@@ -1473,6 +1548,26 @@ def run(
                 break
             latest_planner_request_context = _planner_request_context_from_frame_packet(frame_packet)
             latest_planner_response_text = _planner_response_text_from_frame_packet(frame_packet)
+            if config.input_source == "sim" and sim_explanation_enabled:
+                planner_summary_text = _planner_summary_text_from_frame_packet(frame_packet)
+                if planner_summary_text.strip():
+                    explanation_result = ExplanationResult(
+                        text=planner_summary_text,
+                        status=ExplanationStatus.READY,
+                        latency_ms=None,
+                        model=str(
+                            getattr(
+                                getattr(frame_packet, "planner_schedule", None),
+                                "model",
+                                getattr(frame_packet, "planner_context", None) or config.sim_planner_model,
+                            )
+                        ),
+                        error_message=None,
+                    )
+                    explanation_status = ExplanationStatus.READY
+                    explanation_refresh_status = "planner_core"
+                    latest_explanation_request_context = latest_planner_request_context
+                    latest_explanation_timestamp = time.strftime("%H:%M:%S")
             frame_bgr = np.asarray(frame_packet.frame_bgr, dtype=np.uint8)
             frame_timestamp_sec = frame_packet.timestamp_sec
             artifacts, cached_detections = process_frame(
@@ -1672,11 +1767,12 @@ def run(
                     frame_width=overlay.shape[1],
                     frame_height=overlay.shape[0],
                 )
-                if sim_explanation_enabled
+                if sim_explanation_enabled and config.input_source != "sim" and explanation_worker is not None
                 else None
             )
             if (
                 sim_explanation_enabled
+                and config.input_source != "sim"
                 and not explanation_mouse_callback_registered
                 and callable(getattr(cv2, "setMouseCallback", None))
             ):
@@ -1700,7 +1796,11 @@ def run(
                         model=explanation_result.model or config.explanation_model,
                         latency_ms=explanation_result.latency_ms,
                         timestamp_label=latest_explanation_timestamp,
-                        request_context=latest_explanation_request_context,
+                        request_context=(
+                            latest_explanation_request_context
+                            if config.input_source != "sim"
+                            else ""
+                        ),
                         planner_request_context=latest_planner_request_context,
                         planner_response_text=latest_planner_response_text,
                         active_tab=active_tab,
@@ -1737,7 +1837,7 @@ def run(
                     explanation_panel_state["tab_rects"] = {}
                 _imshow_runtime_window(
                     cv2,
-                    "Situation Explanation",
+                    explanation_window_name,
                     panel,
                     primary_width=int(config.width),
                     primary_height=int(config.height),
@@ -1747,7 +1847,7 @@ def run(
                     not explanation_panel_mouse_callback_registered
                     and callable(getattr(cv2, "setMouseCallback", None))
                 ):
-                    cv2.setMouseCallback("Situation Explanation", _handle_explanation_window_mouse)
+                    cv2.setMouseCallback(explanation_window_name, _handle_explanation_window_mouse)
                     explanation_panel_mouse_callback_registered = True
             reconstruction_viewer_active = _update_viewer(viewer, artifacts)
             viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
@@ -1816,11 +1916,11 @@ def run(
                     "detailed": "off",
                 }[depth_debug_level]
 
-            if explanation_button_state["pending_toggle"]:
+            if config.input_source != "sim" and explanation_button_state["pending_toggle"]:
                 explanation_button_state["pending_toggle"] = False
                 _toggle_explanation_auto_refresh(artifacts, toggled_at=now)
 
-            if key == ord("e"):
+            if config.input_source != "sim" and key == ord("e"):
                 _toggle_explanation_auto_refresh(artifacts, toggled_at=now)
 
             if key == ord("q") or not viewer_active or window_closed:
@@ -1828,6 +1928,7 @@ def run(
 
             if (
                 explanation_auto_refresh_enabled
+                and config.input_source != "sim"
                 and explanation_worker is not None
                 and explanation_worker.is_idle()
                 and (

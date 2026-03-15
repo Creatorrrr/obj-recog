@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 from collections import Counter
@@ -17,12 +18,16 @@ from obj_recog.sim_protocol import (
     PlannerActionEffectSummary,
     PlannerConstraintSummary,
     PlannerContext,
+    PlannerNavigationSectorObservation,
     PlannerGoalEstimate,
     PlannerMemoryObservation,
     PlannerMemorySnapshot,
     PlannerNavigationAffordances,
     PlannerObjectObservation,
     PlannerReconstructionBrief,
+    PlannerSafetyFlags,
+    PlannerSceneEdgeObservation,
+    PlannerSceneNodeObservation,
     PlannerSearchOutcome,
     PlannerSegmentObservation,
 )
@@ -30,27 +35,28 @@ from obj_recog.types import Detection, PanopticSegment
 
 
 _PLANNER_SYSTEM_INSTRUCTIONS = (
-    "You are a navigation planner for a wheeled indoor robot operating from egocentric RGB, depth, "
-    "segmentation, scene-graph, and short-term memory summaries. "
-    "Return JSON only with keys rationale and steps. "
-    "Each step must include primitive and value. "
+    "You are a multimodal navigation planner for a wheeled indoor robot operating from the current egocentric RGB image, "
+    "depth-derived navigation sectors, segmentation summaries, scene-graph memory, and short-term action history. "
+    "Return JSON only. "
     "Use only planner-visible evidence from the prompt. Never invent hidden coordinates, authored scene truth, "
     "or unseen furniture. "
     "Allowed primitives: "
     + ", ".join(item.value for item in ActionPrimitive)
     + ". "
     "Behavior modes: "
-    "If goal_estimate.status is visible, center the target first and then approach it. "
+    "If goal_hypothesis.status is visible, center the target first and then approach it. "
     "Do not mix opposing left/right turns or camera pans in the same batch unless the target is already centered. "
-    "If goal_estimate.status is remembered, search using the remembered bearing and avoid repeating a recently "
+    "If goal_hypothesis.status is remembered, search using the remembered bearing and avoid repeating a recently "
     "failed batch when better options exist. "
-    "If goal_estimate.status is inferred, infer promising target regions from visible cues such as chairs, sofas, "
+    "If goal_hypothesis.status is inferred, infer promising target regions from visible cues such as chairs, sofas, "
     "walls, consoles, shelves, cabinets, open floor, and visible relations. "
-    "If recent_action_effects or navigation_affordances indicate blockage, dead end, or no progress, switch to "
+    "If recent_action_effects or navigation_map indicate blockage, dead end, or no progress, switch to "
     "escape mode: include backward or strafe motion plus turn and camera pan, and do not repeat pure forward pushes. "
     "Favor short committed batches of 2 to 4 low-level actions over oscillating. "
     "Use camera pans to confirm visibility, but pair them with translation or heading change when recent pure scans failed. "
-    "Respect constraints.allowed_primitives and constraints.tracking_safe_limits."
+    "Respect constraints.allowed_primitives and constraints.tracking_safe_limits. "
+    "Output keys must be exactly situation_summary, goal_hypothesis, behavior_mode, steps, safety_flags, confidence. "
+    "Each step must include primitive, value, and intent."
 )
 
 _TV_CUE_LABELS = {
@@ -210,6 +216,31 @@ def _bbox_depth_m(depth_map: np.ndarray | None, xyxy: tuple[int, int, int, int])
     return float(np.nanmedian(crop[valid]))
 
 
+def _distance_bucket(depth_m: float | None) -> str | None:
+    if depth_m is None:
+        return None
+    if float(depth_m) <= 1.5:
+        return "near"
+    if float(depth_m) <= 3.5:
+        return "mid"
+    return "far"
+
+
+def _relative_xyz(
+    *,
+    world_centroid: np.ndarray | None,
+    camera_pose_world: np.ndarray | None,
+) -> tuple[float, float, float] | None:
+    centroid = np.asarray(world_centroid, dtype=np.float32)
+    pose = np.asarray(camera_pose_world, dtype=np.float32)
+    if centroid.shape != (3,) or pose.shape != (4, 4):
+        return None
+    pose_inv = np.linalg.inv(pose)
+    homogeneous = np.concatenate((centroid, np.array([1.0], dtype=np.float32)))
+    camera_xyz = pose_inv @ homogeneous
+    return tuple(round(float(value), 3) for value in camera_xyz[:3])
+
+
 def _direction_from_center(center_x_ratio: float) -> str:
     if center_x_ratio <= 0.18:
         return "left"
@@ -255,16 +286,18 @@ def _object_observations_from_detections(
         )
         center_x_ratio = ((x1 + x2) * 0.5) / float(max(1, frame_width))
         confidence = float(getattr(detection, "confidence", 0.0))
+        depth_m = _bbox_depth_m(depth_map, (x1, y1, x2, y2))
         observation = PlannerObjectObservation(
             label=str(getattr(detection, "label", "")),
             confidence=confidence,
             direction=_direction_from_center(center_x_ratio),
             bbox_area_ratio=area_ratio,
-            depth_m=_bbox_depth_m(depth_map, (x1, y1, x2, y2)),
+            depth_m=depth_m,
             is_target_match=_label_matches_target(
                 detection_label=getattr(detection, "label", ""),
                 target_label=target_label,
             ),
+            distance_bucket=_distance_bucket(depth_m),
         )
         observations.append((area_ratio, confidence, observation))
     observations.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -321,6 +354,69 @@ def _segment_observations_from_segments(
     return tuple(item[1] for item in observations[:max(1, int(limit))])
 
 
+def _scene_node_observations(
+    *,
+    scene_graph_snapshot: SceneGraphSnapshot | None,
+    limit: int = 12,
+) -> tuple[PlannerSceneNodeObservation, ...]:
+    if scene_graph_snapshot is None:
+        return ()
+    visible_ids = set(scene_graph_snapshot.visible_node_ids)
+    observations: list[PlannerSceneNodeObservation] = []
+    for node in scene_graph_snapshot.nodes:
+        if node.id == "ego":
+            continue
+        if node.id not in visible_ids and str(node.state) == "visible":
+            continue
+        relative_xyz = _relative_xyz(
+            world_centroid=node.world_centroid,
+            camera_pose_world=scene_graph_snapshot.camera_pose_world,
+        )
+        depth_m = None if relative_xyz is None else max(0.0, float(relative_xyz[2]))
+        observations.append(
+            PlannerSceneNodeObservation(
+                label=str(node.label),
+                kind=str(node.type),
+                state=str(node.state),
+                bearing=node.last_seen_direction,
+                distance_bucket=_distance_bucket(depth_m),
+                confidence=float(node.confidence),
+                relative_xyz=relative_xyz,
+            )
+        )
+    observations.sort(
+        key=lambda item: (
+            0 if item.state == "visible" else 1,
+            0 if item.kind == "object" else 1,
+            -float(item.confidence),
+        )
+    )
+    return tuple(observations[: max(1, int(limit))])
+
+
+def _scene_edge_observations(
+    *,
+    scene_graph_snapshot: SceneGraphSnapshot | None,
+    limit: int = 16,
+) -> tuple[PlannerSceneEdgeObservation, ...]:
+    if scene_graph_snapshot is None:
+        return ()
+    node_labels = {node.id: str(node.label) for node in scene_graph_snapshot.nodes}
+    observations = [
+        PlannerSceneEdgeObservation(
+            source_label=node_labels.get(edge.source, str(edge.source)),
+            target_label=node_labels.get(edge.target, str(edge.target)),
+            relation=str(edge.relation),
+            confidence=float(edge.confidence),
+            source_kind=str(edge.source_kind),
+            distance_bucket=edge.distance_bucket,
+        )
+        for edge in scene_graph_snapshot.edges
+    ]
+    observations.sort(key=lambda item: (-float(item.confidence), item.relation))
+    return tuple(observations[: max(1, int(limit))])
+
+
 def _sector_clearance(depth_map: np.ndarray | None, *, x_bounds: tuple[float, float], y_bounds: tuple[float, float]) -> float | None:
     depth = np.asarray(depth_map, dtype=np.float32)
     if depth.ndim != 2 or depth.size == 0:
@@ -337,11 +433,50 @@ def _sector_clearance(depth_map: np.ndarray | None, *, x_bounds: tuple[float, fl
     return float(np.nanpercentile(valid, 30))
 
 
+def _sector_specs() -> tuple[tuple[str, tuple[float, float], tuple[float, float]], ...]:
+    return (
+        ("left", (0.00, 0.22), (0.45, 0.95)),
+        ("front-left", (0.18, 0.42), (0.42, 0.90)),
+        ("front", (0.35, 0.65), (0.42, 0.95)),
+        ("front-right", (0.58, 0.82), (0.42, 0.90)),
+        ("right", (0.78, 1.00), (0.45, 0.95)),
+    )
+
+
+def _sector_map_from_depth(
+    *,
+    depth_map: np.ndarray | None,
+    recent_failures: Iterable[str] = (),
+) -> tuple[PlannerNavigationSectorObservation, ...]:
+    failed = {str(item) for item in recent_failures if str(item)}
+    observations: list[PlannerNavigationSectorObservation] = []
+    for sector_name, x_bounds, y_bounds in _sector_specs():
+        clearance_m = _sector_clearance(depth_map, x_bounds=x_bounds, y_bounds=y_bounds)
+        traversable = clearance_m is not None and clearance_m >= 0.95
+        obstacle_likelihood = 1.0
+        frontier_score = 0.0
+        if clearance_m is not None:
+            obstacle_likelihood = float(np.clip(1.0 - (float(clearance_m) / 2.5), 0.0, 1.0))
+            frontier_score = float(np.clip(float(clearance_m) / 2.5, 0.0, 1.0))
+        observations.append(
+            PlannerNavigationSectorObservation(
+                sector=sector_name,
+                clearance_m=clearance_m,
+                traversable=bool(traversable),
+                obstacle_likelihood=obstacle_likelihood,
+                frontier_score=frontier_score,
+                recently_failed=sector_name in failed,
+            )
+        )
+    return tuple(observations)
+
+
 def _default_navigation_affordances(
     *,
     depth_map: np.ndarray | None,
     segment_observations: Iterable[PlannerSegmentObservation],
 ) -> PlannerNavigationAffordances:
+    sector_map = _sector_map_from_depth(depth_map=depth_map)
     forward_clearance_m = _sector_clearance(depth_map, x_bounds=(0.35, 0.65), y_bounds=(0.45, 0.95))
     left_clearance_m = _sector_clearance(depth_map, x_bounds=(0.0, 0.35), y_bounds=(0.45, 0.95))
     right_clearance_m = _sector_clearance(depth_map, x_bounds=(0.65, 1.0), y_bounds=(0.45, 0.95))
@@ -381,6 +516,8 @@ def _default_navigation_affordances(
         candidate_open_directions=candidate_open_directions,
         dead_end_likelihood=float(np.clip(dead_end_likelihood, 0.0, 1.0)),
         best_exploration_direction=best_exploration_direction,
+        sector_map=sector_map,
+        recently_failed_directions=(),
     )
 
 
@@ -395,6 +532,21 @@ def _default_reconstruction_brief(
     frontier_directions = ()
     if navigation_affordances is not None:
         frontier_directions = tuple(navigation_affordances.candidate_open_directions[:3])
+    explored_directions = ()
+    unexplored_directions = ()
+    recently_failed_directions = ()
+    if navigation_affordances is not None:
+        explored_directions = tuple(
+            item.sector
+            for item in navigation_affordances.sector_map
+            if item.clearance_m is not None
+        )
+        unexplored_directions = tuple(
+            item.sector
+            for item in navigation_affordances.sector_map
+            if item.clearance_m is None or item.frontier_score >= 0.45
+        )
+        recently_failed_directions = tuple(navigation_affordances.recently_failed_directions)
     return PlannerReconstructionBrief(
         pose_delta_m=None,
         yaw_delta_deg=None,
@@ -402,6 +554,9 @@ def _default_reconstruction_brief(
         mesh_triangle_count=mesh_triangle_count,
         mesh_growth_delta=mesh_growth_delta,
         frontier_directions=frontier_directions,
+        explored_directions=explored_directions,
+        unexplored_directions=unexplored_directions,
+        recently_failed_directions=recently_failed_directions,
     )
 
 
@@ -452,6 +607,7 @@ def _goal_estimate_from_context(
             bearing_hint=str(target_detection.get("horizontal_position") or "front"),
             distance_hint=distance_hint,
             evidence_sources=("target_detection",),
+            confidence=0.95,
         )
 
     if memory.target_memory is not None:
@@ -463,6 +619,7 @@ def _goal_estimate_from_context(
             bearing_hint=memory.target_memory.last_seen_direction,
             distance_hint=None if memory.target_memory.age_frames <= 6 else "stale_memory",
             evidence_sources=tuple(evidence_sources),
+            confidence=0.72 if memory.target_memory.age_frames <= 6 else 0.5,
         )
 
     object_items = tuple(object_observations)
@@ -525,6 +682,7 @@ def _goal_estimate_from_context(
             bearing_hint=_most_common_direction(cue_directions),
             distance_hint=distance_hint,
             evidence_sources=tuple(dict.fromkeys(evidence_sources)),
+            confidence=0.58 if len(evidence_sources) == 1 else 0.66,
         )
 
     return PlannerGoalEstimate(
@@ -536,6 +694,7 @@ def _goal_estimate_from_context(
         ),
         distance_hint=None,
         evidence_sources=(),
+        confidence=0.2,
     )
 
 
@@ -589,6 +748,7 @@ def build_planner_context(
     segments: Iterable[PanopticSegment] = (),
     depth_map: np.ndarray | None = None,
     frame_shape: tuple[int, int] | None = None,
+    camera_pose_world: np.ndarray | None = None,
     object_observations: Iterable[PlannerObjectObservation] = (),
     segment_observations: Iterable[PlannerSegmentObservation] = (),
     navigation_affordances: PlannerNavigationAffordances | None = None,
@@ -602,6 +762,7 @@ def build_planner_context(
 ) -> PlannerContext:
     detections_tuple = tuple(detections)
     segments_tuple = tuple(segments)
+    frame_height, frame_width = _frame_shape_from_inputs(frame_shape=frame_shape, depth_map=depth_map)
     visible_detections = tuple(str(item.label) for item in detections_tuple)
 
     graph_visible_segments = {
@@ -618,6 +779,8 @@ def build_planner_context(
         f"{edge.source}->{edge.relation}->{edge.target}"
         for edge in ((scene_graph_snapshot.visible_edges if scene_graph_snapshot is not None else ()) or ())
     )
+    scene_node_observations = _scene_node_observations(scene_graph_snapshot=scene_graph_snapshot)
+    scene_edge_observations = _scene_edge_observations(scene_graph_snapshot=scene_graph_snapshot)
     resolved_object_observations = tuple(object_observations) or _object_observations_from_detections(
         detections=detections_tuple,
         depth_map=depth_map,
@@ -675,12 +838,21 @@ def build_planner_context(
             structural_segments=resolved_segment_observations,
             navigation_affordances=resolved_navigation_affordances,
             reconstruction_brief=resolved_reconstruction_brief,
+            frame_size=(frame_height, frame_width),
+            scene_nodes=scene_node_observations,
+            scene_edges=scene_edge_observations,
         ),
         memory=memory,
         goal_estimate=resolved_goal_estimate,
         recent_action_effects=tuple(recent_action_effects)[-4:],
         constraints=resolved_constraints,
         recent_actions=tuple(str(item) for item in recent_actions),
+        image_metadata={
+            "width": int(frame_width),
+            "height": int(frame_height),
+            "channels": 3,
+            "source": "current_rgb_frame",
+        },
     )
 
 
@@ -724,40 +896,99 @@ def _memory_prompt_payload(memory: PlannerMemorySnapshot) -> dict[str, object]:
     }
 
 
-def planner_prompt_from_context(context: PlannerContext) -> str:
+def _goal_hypothesis_payload(goal_estimate: PlannerGoalEstimate) -> dict[str, object]:
+    return {
+        "status": goal_estimate.status,
+        "bearing_hint": goal_estimate.bearing_hint,
+        "distance_hint": goal_estimate.distance_hint,
+        "evidence": list(goal_estimate.evidence_sources),
+        "confidence": float(goal_estimate.confidence),
+    }
+
+
+def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
     navigation_affordances = context.perception.navigation_affordances
     reconstruction_brief = context.perception.reconstruction_brief
     memory_payload = _memory_prompt_payload(context.memory)
-    payload = {
+    return {
+        "request_type": "multimodal_planner_core",
         "phase": context.phase.value,
-        "frame_index": context.frame_index,
-        "goal": {
-            "description": context.goal_description,
-            "target_label": context.target_label,
-        },
-        "goal_description": context.goal_description,
+        "frame_index": int(context.frame_index),
+        "image_metadata": dict(context.image_metadata),
         "visible_detections": list(context.perception.visible_detections),
         "visible_segments": list(context.perception.visible_segments),
         "visible_graph_relations": list(context.perception.visible_graph_relations),
-        "reconstruction_summary": dict(context.perception.reconstruction_summary),
-        "depth_summary": dict(context.perception.depth_summary),
         "target_detection": (
             None
             if context.perception.target_detection is None
             else dict(context.perception.target_detection)
         ),
-        "calibration_status": context.perception.calibration_status,
-        "tracking_status": context.perception.tracking_status,
+        "goal_estimate": {
+            "status": context.goal_estimate.status,
+            "bearing_hint": context.goal_estimate.bearing_hint,
+            "distance_hint": context.goal_estimate.distance_hint,
+            "evidence_sources": list(context.goal_estimate.evidence_sources),
+            "confidence": float(context.goal_estimate.confidence),
+        },
+        "robot_state": {
+            "tracking_status": context.perception.tracking_status,
+            "calibration_status": context.perception.calibration_status,
+            "recent_actions": list(context.recent_actions),
+            "recent_action_effects": [
+                {
+                    "action": item.action,
+                    "estimated_motion": item.estimated_motion,
+                    "clearance_change": item.clearance_change,
+                    "target_evidence_change": item.target_evidence_change,
+                    "likely_blocked": bool(item.likely_blocked),
+                }
+                for item in context.recent_action_effects
+            ],
+        },
+        "goal": {
+            "description": context.goal_description,
+            "target_label": context.target_label,
+            "goal_hypothesis": _goal_hypothesis_payload(context.goal_estimate),
+            "target_detection": (
+                None
+                if context.perception.target_detection is None
+                else dict(context.perception.target_detection)
+            ),
+        },
+        "visible_objects": [
+            {
+                "label": item.label,
+                "confidence": float(item.confidence),
+                "direction": item.direction,
+                "distance_bucket": item.distance_bucket,
+                "bbox_area_ratio": float(item.bbox_area_ratio),
+                "depth_m": item.depth_m,
+                "relative_xyz": item.relative_xyz,
+                "is_target_match": bool(item.is_target_match),
+            }
+            for item in context.perception.objects
+        ],
         "objects": [
             {
                 "label": item.label,
                 "confidence": float(item.confidence),
                 "direction": item.direction,
+                "distance_bucket": item.distance_bucket,
                 "bbox_area_ratio": float(item.bbox_area_ratio),
                 "depth_m": item.depth_m,
+                "relative_xyz": item.relative_xyz,
                 "is_target_match": bool(item.is_target_match),
             }
             for item in context.perception.objects
+        ],
+        "structural_segments": [
+            {
+                "label": item.label,
+                "coverage_ratio": float(item.coverage_ratio),
+                "dominant_direction": item.dominant_direction,
+                "opening_hint": item.opening_hint,
+            }
+            for item in context.perception.structural_segments
         ],
         "segments": [
             {
@@ -768,19 +999,72 @@ def planner_prompt_from_context(context: PlannerContext) -> str:
             }
             for item in context.perception.structural_segments
         ],
-        "graph": {
-            "visible_relations": list(context.perception.visible_graph_relations),
-            "visible_landmarks": list(context.perception.visible_segments),
-            "memory_landmarks": [
+        "scene_graph": {
+            "visible_nodes": [
                 {
                     "label": item.label,
                     "kind": item.kind,
-                    "last_seen_direction": item.last_seen_direction,
-                    "age_frames": int(item.age_frames),
+                    "state": item.state,
+                    "bearing": item.bearing,
+                    "distance_bucket": item.distance_bucket,
+                    "confidence": float(item.confidence),
+                    "relative_xyz": item.relative_xyz,
                 }
-                for item in context.memory.nonvisible_observations
+                for item in context.perception.scene_nodes
+                if item.state == "visible"
             ],
+            "memory_nodes": [
+                {
+                    "label": item.label,
+                    "kind": item.kind,
+                    "state": item.state,
+                    "bearing": item.bearing,
+                    "distance_bucket": item.distance_bucket,
+                    "confidence": float(item.confidence),
+                    "relative_xyz": item.relative_xyz,
+                }
+                for item in context.perception.scene_nodes
+                if item.state != "visible"
+            ],
+            "visible_edges": [
+                {
+                    "source_label": item.source_label,
+                    "target_label": item.target_label,
+                    "relation": item.relation,
+                    "confidence": float(item.confidence),
+                    "source_kind": item.source_kind,
+                    "distance_bucket": item.distance_bucket,
+                }
+                for item in context.perception.scene_edges
+            ],
+            "visible_relations": list(context.perception.visible_graph_relations),
         },
+        "navigation_map": (
+            None
+            if navigation_affordances is None
+            else {
+                "forward_clearance_m": navigation_affordances.forward_clearance_m,
+                "left_clearance_m": navigation_affordances.left_clearance_m,
+                "right_clearance_m": navigation_affordances.right_clearance_m,
+                "rear_clearance_m": navigation_affordances.rear_clearance_m,
+                "front_blocked": bool(navigation_affordances.front_blocked),
+                "candidate_open_directions": list(navigation_affordances.candidate_open_directions),
+                "dead_end_likelihood": float(navigation_affordances.dead_end_likelihood),
+                "best_exploration_direction": navigation_affordances.best_exploration_direction,
+                "sector_map": [
+                    {
+                        "sector": item.sector,
+                        "clearance_m": item.clearance_m,
+                        "traversable": bool(item.traversable),
+                        "obstacle_likelihood": float(item.obstacle_likelihood),
+                        "frontier_score": float(item.frontier_score),
+                        "recently_failed": bool(item.recently_failed),
+                    }
+                    for item in navigation_affordances.sector_map
+                ],
+                "recently_failed_directions": list(navigation_affordances.recently_failed_directions),
+            }
+        ),
         "navigation_affordances": (
             None
             if navigation_affordances is None
@@ -793,6 +1077,18 @@ def planner_prompt_from_context(context: PlannerContext) -> str:
                 "candidate_open_directions": list(navigation_affordances.candidate_open_directions),
                 "dead_end_likelihood": float(navigation_affordances.dead_end_likelihood),
                 "best_exploration_direction": navigation_affordances.best_exploration_direction,
+                "sector_map": [
+                    {
+                        "sector": item.sector,
+                        "clearance_m": item.clearance_m,
+                        "traversable": bool(item.traversable),
+                        "obstacle_likelihood": float(item.obstacle_likelihood),
+                        "frontier_score": float(item.frontier_score),
+                        "recently_failed": bool(item.recently_failed),
+                    }
+                    for item in navigation_affordances.sector_map
+                ],
+                "recently_failed_directions": list(navigation_affordances.recently_failed_directions),
             }
         ),
         "reconstruction": (
@@ -805,14 +1101,11 @@ def planner_prompt_from_context(context: PlannerContext) -> str:
                 "mesh_triangle_count": int(reconstruction_brief.mesh_triangle_count),
                 "mesh_growth_delta": int(reconstruction_brief.mesh_growth_delta),
                 "frontier_directions": list(reconstruction_brief.frontier_directions),
+                "explored_directions": list(reconstruction_brief.explored_directions),
+                "unexplored_directions": list(reconstruction_brief.unexplored_directions),
+                "recently_failed_directions": list(reconstruction_brief.recently_failed_directions),
             }
         ),
-        "goal_estimate": {
-            "status": context.goal_estimate.status,
-            "bearing_hint": context.goal_estimate.bearing_hint,
-            "distance_hint": context.goal_estimate.distance_hint,
-            "evidence_sources": list(context.goal_estimate.evidence_sources),
-        },
         "memory": memory_payload,
         "recent_action_effects": [
             {
@@ -825,16 +1118,47 @@ def planner_prompt_from_context(context: PlannerContext) -> str:
             for item in context.recent_action_effects
         ],
         "recent_searches": memory_payload["recent_searches"],
+        "target_hypotheses": [_goal_hypothesis_payload(context.goal_estimate)],
         "constraints": {
             "allowed_primitives": list(context.constraints.allowed_primitives),
             "tracking_safe_limits": dict(context.constraints.tracking_safe_limits),
             "batch_step_limit": int(context.constraints.batch_step_limit),
             "replan_frame_budget": int(context.constraints.replan_frame_budget),
             "notes": list(context.constraints.notes),
+            "hidden_scene_truth_policy": "forbidden",
         },
-        "recent_actions": list(context.recent_actions),
+        "legacy_summary": {
+            "visible_detections": list(context.perception.visible_detections),
+            "visible_segments": list(context.perception.visible_segments),
+            "visible_graph_relations": list(context.perception.visible_graph_relations),
+            "depth_summary": dict(context.perception.depth_summary),
+            "reconstruction_summary": dict(context.perception.reconstruction_summary),
+            "recent_searches": memory_payload["recent_searches"],
+        },
     }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def planner_prompt_from_context(context: PlannerContext) -> str:
+    return json.dumps(_planner_request_payload(context), ensure_ascii=False, sort_keys=True)
+
+
+def _encode_frame_as_data_url(frame_bgr: np.ndarray) -> str:
+    import cv2
+
+    ok, encoded = cv2.imencode(".jpg", np.asarray(frame_bgr, dtype=np.uint8))
+    if not ok:
+        raise RuntimeError("failed to encode planner frame")
+    payload = base64.b64encode(encoded.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{payload}"
+
+
+def _planner_input_content(*, context: PlannerContext, frame_bgr: np.ndarray | None) -> list[dict[str, object]]:
+    content: list[dict[str, object]] = [
+        {"type": "input_text", "text": planner_prompt_from_context(context)}
+    ]
+    if frame_bgr is not None and np.asarray(frame_bgr).size > 0:
+        content.append({"type": "input_image", "image_url": _encode_frame_as_data_url(np.asarray(frame_bgr, dtype=np.uint8))})
+    return content
 
 
 class OpenAILivingRoomPlanner:
@@ -861,12 +1185,12 @@ class OpenAILivingRoomPlanner:
     def model(self) -> str:
         return self._model
 
-    def plan(self, *, context: PlannerContext) -> ActionSchedule:
+    def plan(self, *, context: PlannerContext, frame_bgr: np.ndarray | None = None) -> ActionSchedule:
         request_kwargs = dict(
             model=self._model,
             instructions=_PLANNER_SYSTEM_INSTRUCTIONS,
-            input=[{"role": "user", "content": [{"type": "input_text", "text": planner_prompt_from_context(context)}]}],
-            max_output_tokens=320,
+            input=[{"role": "user", "content": _planner_input_content(context=context, frame_bgr=frame_bgr)}],
+            max_output_tokens=420,
             timeout=self._timeout_sec,
             text={
                 "format": {
@@ -877,7 +1201,29 @@ class OpenAILivingRoomPlanner:
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "rationale": {"type": "string"},
+                            "situation_summary": {"type": "string"},
+                            "goal_hypothesis": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["visible", "remembered", "inferred", "unknown"],
+                                    },
+                                    "bearing_hint": {"type": ["string", "null"]},
+                                    "distance_hint": {"type": ["string", "null"]},
+                                    "evidence": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "confidence": {"type": "number"},
+                                },
+                                "required": ["status", "bearing_hint", "distance_hint", "evidence", "confidence"],
+                            },
+                            "behavior_mode": {
+                                "type": "string",
+                                "enum": ["approach", "reacquire", "infer", "escape", "scan"],
+                            },
                             "steps": {
                                 "type": "array",
                                 "items": {
@@ -889,12 +1235,32 @@ class OpenAILivingRoomPlanner:
                                             "enum": [item.value for item in ActionPrimitive],
                                         },
                                         "value": {"type": "number"},
+                                        "intent": {"type": "string"},
                                     },
-                                    "required": ["primitive", "value"],
+                                    "required": ["primitive", "value", "intent"],
                                 },
                             },
+                            "safety_flags": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "front_blocked": {"type": "boolean"},
+                                    "dead_end_risk": {"type": "number"},
+                                    "tracking_risk": {"type": "string"},
+                                    "replan_reason": {"type": "string"},
+                                },
+                                "required": ["front_blocked", "dead_end_risk", "tracking_risk", "replan_reason"],
+                            },
+                            "confidence": {"type": "number"},
                         },
-                        "required": ["rationale", "steps"],
+                        "required": [
+                            "situation_summary",
+                            "goal_hypothesis",
+                            "behavior_mode",
+                            "steps",
+                            "safety_flags",
+                            "confidence",
+                        ],
                     },
                 },
                 "verbosity": "low",
@@ -909,12 +1275,29 @@ class OpenAILivingRoomPlanner:
                 ActionStep(
                     primitive=ActionPrimitive(str(item["primitive"])),
                     value=float(item["value"]),
+                    intent=str(item.get("intent") or ""),
                 )
                 for item in list(payload.get("steps") or [])
             ),
-            rationale=str(payload.get("rationale") or ""),
+            rationale=str(payload.get("situation_summary") or ""),
             model=self._model,
             issued_at_frame=context.frame_index,
+            situation_summary=str(payload.get("situation_summary") or ""),
+            behavior_mode=str(payload.get("behavior_mode") or "scan"),
+            goal_hypothesis=PlannerGoalEstimate(
+                status=str((payload.get("goal_hypothesis") or {}).get("status") or "unknown"),
+                bearing_hint=(payload.get("goal_hypothesis") or {}).get("bearing_hint"),
+                distance_hint=(payload.get("goal_hypothesis") or {}).get("distance_hint"),
+                evidence_sources=tuple(str(item) for item in list((payload.get("goal_hypothesis") or {}).get("evidence") or [])),
+                confidence=float((payload.get("goal_hypothesis") or {}).get("confidence") or 0.0),
+            ),
+            safety_flags=PlannerSafetyFlags(
+                front_blocked=bool((payload.get("safety_flags") or {}).get("front_blocked")),
+                dead_end_risk=float((payload.get("safety_flags") or {}).get("dead_end_risk") or 0.0),
+                tracking_risk=str((payload.get("safety_flags") or {}).get("tracking_risk") or "unknown"),
+                replan_reason=str((payload.get("safety_flags") or {}).get("replan_reason") or ""),
+            ),
+            confidence=float(payload.get("confidence") or 0.0),
         )
 
 
