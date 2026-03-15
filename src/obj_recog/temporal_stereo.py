@@ -365,11 +365,13 @@ class TemporalStereoDepthEstimator:
         rectified_reference = cv2.remap(reference_gray, map2_x, map2_y, cv2.INTER_LINEAR)
 
         matcher = self._build_matcher(cv2, image_width=image_size[0])
-        disparity_left = matcher.compute(rectified_current, rectified_reference).astype(np.float32) / 16.0
-        disparity_right = matcher.compute(rectified_reference, rectified_current).astype(np.float32) / 16.0
+        disparity_left_raw = matcher.compute(rectified_current, rectified_reference)
+        disparity_right_raw = matcher.compute(rectified_reference, rectified_current)
         if hasattr(cv2, "filterSpeckles"):
-            cv2.filterSpeckles(disparity_left, 0.0, 128, 1.0)
-            cv2.filterSpeckles(disparity_right, 0.0, 128, 1.0)
+            cv2.filterSpeckles(disparity_left_raw, 0, 128, 16)
+            cv2.filterSpeckles(disparity_right_raw, 0, 128, 16)
+        disparity_left = disparity_left_raw.astype(np.float32) / 16.0
+        disparity_right = disparity_right_raw.astype(np.float32) / 16.0
 
         consistency_mask = self._left_right_consistency_mask(disparity_left, disparity_right)
         valid_mask = consistency_mask & np.isfinite(disparity_left) & (disparity_left > 0.0)

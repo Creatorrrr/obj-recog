@@ -138,3 +138,78 @@ def test_estimate_fuses_stereo_depth_when_matching_succeeds(monkeypatch) -> None
     assert result.diagnostics.reference_keyframe_id == 7
     assert np.allclose(result.fused_depth_map[:, :4], 4.0)
     assert np.allclose(result.fused_depth_map[:, 4:6], 4.0, atol=1e-3)
+
+
+def test_compute_stereo_depth_filters_raw_sgbm_disparity_before_float_conversion(monkeypatch) -> None:
+    class _FakeMatcher:
+        def compute(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+            return np.full(left.shape, 32, dtype=np.int16)
+
+    class _FakeCv2:
+        COLOR_BGR2GRAY = 0
+        CALIB_ZERO_DISPARITY = 0
+        CV_32FC1 = 5
+        INTER_LINEAR = 1
+
+        def __init__(self) -> None:
+            self.filter_speckles_dtypes: list[np.dtype] = []
+
+        def cvtColor(self, image: np.ndarray, _code: int) -> np.ndarray:
+            return np.asarray(image[..., 0], dtype=np.uint8)
+
+        def stereoRectify(self, *_args, **_kwargs):
+            identity = np.eye(3, dtype=np.float64)
+            projection = np.array(
+                [
+                    [8.0, 0.0, 4.0, 0.0],
+                    [0.0, 8.0, 4.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ],
+                dtype=np.float64,
+            )
+            q = np.eye(4, dtype=np.float64)
+            return identity, identity, projection, projection, q, None, None, None, None
+
+        def initUndistortRectifyMap(self, *_args, **_kwargs):
+            map_x = np.zeros((8, 8), dtype=np.float32)
+            map_y = np.zeros((8, 8), dtype=np.float32)
+            return map_x, map_y
+
+        def remap(self, image: np.ndarray, _map_x: np.ndarray, _map_y: np.ndarray, _interpolation: int) -> np.ndarray:
+            return image
+
+        def filterSpeckles(self, image: np.ndarray, _new_value: float, _max_speckle_size: int, _max_diff: float) -> None:
+            self.filter_speckles_dtypes.append(image.dtype)
+            assert image.dtype == np.int16
+
+        def reprojectImageTo3D(self, disparity: np.ndarray, _q: np.ndarray) -> np.ndarray:
+            points = np.zeros(disparity.shape + (3,), dtype=np.float32)
+            points[..., 2] = np.where(disparity > 0.0, 2.0, 0.0)
+            return points
+
+        def resize(self, image: np.ndarray, _size: tuple[int, int], interpolation: int) -> np.ndarray:
+            assert interpolation == self.INTER_LINEAR
+            return image
+
+    fake_cv2 = _FakeCv2()
+    estimator = TemporalStereoDepthEstimator(cv2_module=fake_cv2)
+    estimator.update_keyframe_cache(
+        keyframe_id=5,
+        frame_bgr=np.full((8, 8, 3), 90, dtype=np.uint8),
+        frame_gray=np.full((8, 8), 90, dtype=np.uint8),
+        pose_world=np.eye(4, dtype=np.float32),
+        intrinsics=_intrinsics(),
+    )
+    current_pose_world = np.eye(4, dtype=np.float32)
+    current_pose_world[0, 3] = 0.1
+    monkeypatch.setattr(estimator, "_build_matcher", lambda *_args, **_kwargs: _FakeMatcher())
+
+    result = estimator._compute_stereo_depth(
+        frame_bgr=np.full((8, 8, 3), 127, dtype=np.uint8),
+        reference=estimator._keyframes[0],
+        current_pose_world=current_pose_world,
+        intrinsics=_intrinsics(),
+    )
+
+    assert result is not None
+    assert fake_cv2.filter_speckles_dtypes == [np.dtype(np.int16), np.dtype(np.int16)]
