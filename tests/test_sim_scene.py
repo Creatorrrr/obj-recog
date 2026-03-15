@@ -32,18 +32,37 @@ def test_living_room_scene_places_hidden_goal_in_front_of_tv() -> None:
     tv_panel = next(item for item in scene.objects if item.object_id == "tv_panel")
     goal = np.asarray(scene.hidden_goal_pose_xyz, dtype=np.float32)
 
-    assert goal[0] == tv_panel.center_xyz[0]
+    assert goal[0] == pytest.approx(tv_panel.center_xyz[0], abs=1e-6)
     assert math.isclose(float(goal[2]) - tv_panel.center_xyz[2], 1.25, rel_tol=0.0, abs_tol=1e-6)
 
 
-def test_living_room_scene_targets_tv_from_far_side_of_same_room() -> None:
+def test_living_room_scene_starts_hidden_from_tv_on_far_side_of_room() -> None:
     scene = build_living_room_scene_spec()
+    tv_panel = next(item for item in scene.objects if item.object_id == "tv_panel")
+    start_xz = np.asarray([scene.start_pose.x, scene.start_pose.z], dtype=np.float32)
+    tv_xz = np.asarray([tv_panel.center_xyz[0], tv_panel.center_xyz[2]], dtype=np.float32)
+    direction_to_tv = tv_xz - start_xz
+    distance_to_tv = float(np.linalg.norm(direction_to_tv))
+    heading = np.asarray(
+        [
+            math.sin(math.radians(scene.start_pose.yaw_deg)),
+            math.cos(math.radians(scene.start_pose.yaw_deg)),
+        ],
+        dtype=np.float32,
+    )
+    heading_alignment = float(np.dot(direction_to_tv / distance_to_tv, heading))
 
     assert scene.semantic_target_class == "tv"
     assert "TV" in scene.goal_description
-    assert math.isclose(scene.start_pose.x, 2.15, rel_tol=0.0, abs_tol=1e-6)
-    assert scene.start_pose.z > 1.8
-    assert scene.start_pose.yaw_deg == 180.0
+    assert scene.start_pose == scene.start_pose.__class__(
+        x=-2.4,
+        y=1.25,
+        z=1.95,
+        yaw_deg=0.0,
+        camera_pan_deg=0.0,
+    )
+    assert distance_to_tv > 5.5
+    assert heading_alignment < 0.0
 
 
 def test_living_room_scene_builds_multi_component_furniture() -> None:

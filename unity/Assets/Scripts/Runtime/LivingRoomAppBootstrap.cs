@@ -359,11 +359,12 @@ namespace ObjRecog.UnitySim
 
             Vector3 goalPosition = FlattenToGround(televisionPosition + (roomFacingDirection * goalStandOffM), groundHeight);
             Vector3 spawnPosition = ResolveTelevisionSpawnPosition(television, livingRoomRoot, roomFacingDirection, groundHeight);
+            Vector3 awayFromTelevision = FlattenDirection(spawnPosition - televisionPosition);
+            Vector3 spawnLookTarget = awayFromTelevision.sqrMagnitude > 0.001f
+                ? spawnPosition + awayFromTelevision
+                : ResolveTelevisionSpawnLookTarget(livingRoomRoot, televisionPosition, spawnPosition);
             spawnAnchor.position = spawnPosition;
-            spawnAnchor.rotation = LookToward(
-                spawnPosition,
-                ResolveTelevisionSpawnLookTarget(livingRoomRoot, televisionPosition, spawnPosition)
-            );
+            spawnAnchor.rotation = LookToward(spawnPosition, spawnLookTarget);
             goalAnchor.position = goalPosition;
             goalAnchor.rotation = LookToward(goalPosition, televisionPosition);
             return true;
