@@ -8,7 +8,7 @@ import pytest
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.sim_planner import OpenAILivingRoomPlanner
-from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, SensorFrame
+from obj_recog.sim_protocol import ActionSchedule, CommandKind, MotionCommand, SensorFrame
 from obj_recog.simulation import LivingRoomEpisodeRunner
 
 
@@ -44,20 +44,27 @@ def _artifacts(_packet: FramePacket):
         "Artifacts",
         (),
         {
-            "detections": [
-                type(
-                    "Det",
-                    (),
-                    {
-                        "label": "dining_table",
-                    },
-                )()
-            ],
+            "frame_bgr": np.full((12, 16, 3), 120, dtype=np.uint8),
+            "detections": [_detection(label="tv")],
             "segments": [],
             "scene_graph_snapshot": None,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
+            "mesh_triangles": np.empty((0, 3), dtype=np.int32),
             "depth_map": np.full((12, 16), 1.7, dtype=np.float32),
             "slam_tracking_state": "TRACKING",
+            "camera_pose_world": np.eye(4, dtype=np.float32),
+        },
+    )()
+
+
+def _detection(*, label: str):
+    return type(
+        "Det",
+        (),
+        {
+            "label": label,
+            "xyxy": (2, 2, 8, 8),
+            "confidence": 0.92,
         },
     )()
 
@@ -69,9 +76,21 @@ class _FixedPlanner:
     def plan(self, *, context) -> ActionSchedule:
         self.calls += 1
         return ActionSchedule(
-            steps=(
-                ActionStep(ActionPrimitive.MOVE_FORWARD, 0.5),
-                ActionStep(ActionPrimitive.TURN_LEFT, 12.0),
+            commands=(
+                MotionCommand(
+                    kind=CommandKind.TRANSLATE,
+                    direction="forward",
+                    mode="distance_m",
+                    value=0.5,
+                    intent="advance carefully",
+                ),
+                MotionCommand(
+                    kind=CommandKind.ROTATE_BODY,
+                    direction="left",
+                    mode="angle_deg",
+                    value=12.0,
+                    intent="face target",
+                ),
             ),
             rationale="advance carefully toward the visible TV",
             model="fake-planner",
@@ -100,7 +119,7 @@ def test_real_llm_planner_returns_a_valid_schedule_in_episode_loop(tmp_path) -> 
         sensor_backend=_StaticSensorBackend(),
     )
 
-    for _ in range(8):
+    for _ in range(24):
         packet = runner.next_frame()
         assert packet is not None
         runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
@@ -108,10 +127,10 @@ def test_real_llm_planner_returns_a_valid_schedule_in_episode_loop(tmp_path) -> 
             break
 
     assert runner.current_schedule is not None
-    assert runner.current_schedule.steps
+    assert runner.current_schedule.commands
 
 
-def test_episode_runner_executes_only_one_llm_step_before_replanning(tmp_path) -> None:
+def test_episode_runner_executes_one_planner_command_batch_before_replanning(tmp_path) -> None:
     planner = _FixedPlanner()
     backend = _StaticSensorBackend()
     runner = LivingRoomEpisodeRunner(
@@ -133,19 +152,15 @@ def test_episode_runner_executes_only_one_llm_step_before_replanning(tmp_path) -
         sensor_backend=backend,
     )
 
-    for _ in range(6):
+    for _ in range(30):
         packet = runner.next_frame()
         assert packet is not None
         runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
+        if planner.calls >= 2:
+            break
 
-    assert planner.calls == 1
-    assert len(backend.commands) == 6
-    assert backend.commands[-1].primitive is ActionPrimitive.MOVE_FORWARD
-    assert backend.commands[-1].value == pytest.approx(0.12)
-    assert runner.current_schedule is None
-
-    packet = runner.next_frame()
-    assert packet is not None
-    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet))
-
-    assert planner.calls == 2
+    assert planner.calls >= 2
+    assert any(command.translate_forward_m == pytest.approx(0.08) for command in backend.commands)
+    assert runner.current_schedule is not None
+    assert len(runner.current_schedule.commands) == 1
+    assert runner.current_schedule.commands[0].kind is CommandKind.TRANSLATE

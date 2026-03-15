@@ -12,8 +12,12 @@ import cv2
 import numpy as np
 import pytest
 
-from obj_recog.sim_protocol import ActionPrimitive
-from obj_recog.unity_rgb import UnityRgbClient, _resolve_unity_player_launch_path, command_from_step
+from obj_recog.sim_protocol import RigCapabilities, UnityRigDeltaCommand
+from obj_recog.unity_rgb import (
+    UnityRgbClient,
+    _resolve_unity_player_launch_path,
+    rig_capabilities_from_metadata,
+)
 
 
 def _send_message(sock: socket.socket, payload: dict[str, object]) -> None:
@@ -39,7 +43,7 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def test_unity_rgb_client_resets_and_applies_actions() -> None:
+def test_unity_rgb_client_resets_and_applies_rig_delta_commands() -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -53,6 +57,12 @@ def test_unity_rgb_client_resets_and_applies_actions() -> None:
         "timestamp_sec": 1.25,
         "image_encoding": "png",
         "image_bytes_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+        "move_speed_mps": 1.6,
+        "turn_speed_deg_per_sec": 100.0,
+        "camera_yaw_speed_deg_per_sec": 90.0,
+        "camera_pitch_speed_deg_per_sec": 90.0,
+        "camera_yaw_limit_deg": 70.0,
+        "camera_pitch_limit_deg": 55.0,
     }
 
     def _server() -> None:
@@ -68,14 +78,43 @@ def test_unity_rgb_client_resets_and_applies_actions() -> None:
 
     client = UnityRgbClient(host=str(host), port=int(port), timeout_sec=2.0)
     reset_frame = client.reset_episode(scenario_id="living_room_navigation_v1")
-    action_frame = client.apply_action(command_from_step(ActionPrimitive.MOVE_FORWARD, 0.12))
+    action_frame = client.apply_action(
+        UnityRigDeltaCommand(
+            translate_forward_m=0.12,
+            translate_right_m=0.04,
+            body_yaw_deg=8.0,
+            camera_yaw_delta_deg=-4.0,
+            camera_pitch_delta_deg=6.0,
+            pause_sec=0.25,
+        )
+    )
     client.close()
     thread.join(timeout=2.0)
 
     assert received[0] == {"kind": "reset_episode", "scenario_id": "living_room_navigation_v1"}
-    assert received[1] == {"kind": "action", "primitive": "move_forward", "value": 0.12}
+    assert received[1] == {
+        "kind": "rig_delta",
+        "translate_forward_m": 0.12,
+        "translate_right_m": 0.04,
+        "body_yaw_deg": 8.0,
+        "camera_yaw_delta_deg": -4.0,
+        "camera_pitch_delta_deg": 6.0,
+        "pause_sec": 0.25,
+    }
     assert reset_frame.frame_bgr.shape == (6, 8, 3)
     assert action_frame.timestamp_sec == 1.25
+    assert rig_capabilities_from_metadata(action_frame.metadata) == RigCapabilities(
+        move_speed_mps=1.6,
+        turn_speed_deg_per_sec=100.0,
+        camera_yaw_speed_deg_per_sec=90.0,
+        camera_pitch_speed_deg_per_sec=90.0,
+        camera_yaw_limit_deg=70.0,
+        camera_pitch_limit_deg=55.0,
+    )
+
+
+def test_rig_capabilities_from_metadata_requires_complete_payload() -> None:
+    assert rig_capabilities_from_metadata({"move_speed_mps": 1.6}) is None
 
 
 def test_unity_rgb_client_launches_player_in_agent_mode(

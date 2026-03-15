@@ -13,13 +13,14 @@ from pathlib import Path
 import numpy as np
 
 from obj_recog.opencv_runtime import load_cv2
-from obj_recog.sim_protocol import ActionPrimitive, UnityActionCommand
+from obj_recog.sim_protocol import RigCapabilities, UnityRigDeltaCommand
 
 
 @dataclass(frozen=True, slots=True)
 class UnityRgbFrame:
     frame_bgr: np.ndarray
     timestamp_sec: float
+    metadata: dict[str, object] | None = None
 
 
 class UnityRgbClient:
@@ -66,12 +67,16 @@ class UnityRgbClient:
     def reset_episode(self, *, scenario_id: str) -> UnityRgbFrame:
         return self._request_frame({"kind": "reset_episode", "scenario_id": str(scenario_id)})
 
-    def apply_action(self, command: UnityActionCommand) -> UnityRgbFrame:
+    def apply_action(self, command: UnityRigDeltaCommand) -> UnityRgbFrame:
         return self._request_frame(
             {
-                "kind": "action",
-                "primitive": str(command.primitive.value),
-                "value": float(command.value),
+                "kind": "rig_delta",
+                "translate_forward_m": float(command.translate_forward_m),
+                "translate_right_m": float(command.translate_right_m),
+                "body_yaw_deg": float(command.body_yaw_deg),
+                "camera_yaw_delta_deg": float(command.camera_yaw_delta_deg),
+                "camera_pitch_delta_deg": float(command.camera_pitch_delta_deg),
+                "pause_sec": float(command.pause_sec),
             }
         )
 
@@ -166,8 +171,26 @@ def _unity_app_bundle_executable_candidates(player_path: Path) -> tuple[Path, ..
     return tuple(unique_candidates)
 
 
-def command_from_step(primitive: ActionPrimitive, value: float) -> UnityActionCommand:
-    return UnityActionCommand(primitive=primitive, value=float(value))
+def rig_capabilities_from_metadata(metadata: dict[str, object] | None) -> RigCapabilities | None:
+    payload = dict(metadata or {})
+    required_keys = (
+        "move_speed_mps",
+        "turn_speed_deg_per_sec",
+        "camera_yaw_speed_deg_per_sec",
+        "camera_pitch_speed_deg_per_sec",
+        "camera_yaw_limit_deg",
+        "camera_pitch_limit_deg",
+    )
+    if not all(key in payload for key in required_keys):
+        return None
+    return RigCapabilities(
+        move_speed_mps=float(payload["move_speed_mps"]),
+        turn_speed_deg_per_sec=float(payload["turn_speed_deg_per_sec"]),
+        camera_yaw_speed_deg_per_sec=float(payload["camera_yaw_speed_deg_per_sec"]),
+        camera_pitch_speed_deg_per_sec=float(payload["camera_pitch_speed_deg_per_sec"]),
+        camera_yaw_limit_deg=float(payload["camera_yaw_limit_deg"]),
+        camera_pitch_limit_deg=float(payload["camera_pitch_limit_deg"]),
+    )
 
 
 def _send_message(sock: socket.socket, payload: dict[str, object]) -> None:
@@ -213,5 +236,14 @@ def _frame_from_payload(payload: dict[str, object], *, cv2_module=None) -> Unity
         frame_bgr = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
         if frame_bgr is None:
             raise RuntimeError("Unity RGB response contains an invalid PNG payload")
-        return UnityRgbFrame(frame_bgr=np.asarray(frame_bgr, dtype=np.uint8), timestamp_sec=timestamp_sec)
+        metadata = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"kind", "timestamp_sec", "image_encoding", "image_bytes_b64"}
+        }
+        return UnityRgbFrame(
+            frame_bgr=np.asarray(frame_bgr, dtype=np.uint8),
+            timestamp_sec=timestamp_sec,
+            metadata=metadata,
+        )
     raise RuntimeError(f"unsupported Unity RGB image encoding: {encoding}")

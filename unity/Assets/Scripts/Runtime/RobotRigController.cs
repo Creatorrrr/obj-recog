@@ -19,6 +19,8 @@ namespace ObjRecog.UnitySim
         [SerializeField] private float maxCameraPitchDeg = 55.0f;
         [SerializeField] private float moveSpeedMps = 1.6f;
         [SerializeField] private float turnSpeedDegPerSec = 100.0f;
+        [SerializeField] private float cameraYawSpeedDegPerSec = 90.0f;
+        [SerializeField] private float cameraPitchSpeedDegPerSec = 90.0f;
         [SerializeField] private float mousePanSensitivity = 2.4f;
         [SerializeField] private float mousePitchSensitivity = 2.1f;
         [SerializeField] private float cameraNearClipM = 0.2f;
@@ -36,6 +38,12 @@ namespace ObjRecog.UnitySim
         public Transform RobotRoot => robotRoot;
 
         public float CameraHeightM => cameraHeightM;
+        public float MoveSpeedMps => moveSpeedMps;
+        public float TurnSpeedDegPerSec => turnSpeedDegPerSec;
+        public float CameraYawSpeedDegPerSec => cameraYawSpeedDegPerSec;
+        public float CameraPitchSpeedDegPerSec => cameraPitchSpeedDegPerSec;
+        public float CameraYawLimitDeg => maxCameraPanDeg;
+        public float CameraPitchLimitDeg => maxCameraPitchDeg;
 
         public void Configure(
             CharacterController controller,
@@ -114,39 +122,26 @@ namespace ObjRecog.UnitySim
             }
         }
 
-        public void ApplyCommand(string primitive, float value)
+        public void ApplyRigDelta(
+            float translateForwardM,
+            float translateRightM,
+            float bodyYawDeg,
+            float cameraYawDeltaDeg,
+            float cameraPitchDeltaDeg,
+            float pauseSec
+        )
         {
-            switch (primitive)
+            if (pauseSec > 0.0f && Mathf.Approximately(translateForwardM, 0.0f) && Mathf.Approximately(translateRightM, 0.0f)
+                && Mathf.Approximately(bodyYawDeg, 0.0f) && Mathf.Approximately(cameraYawDeltaDeg, 0.0f)
+                && Mathf.Approximately(cameraPitchDeltaDeg, 0.0f))
             {
-                case "move_forward":
-                    MoveLocal(value, 0.0f);
-                    break;
-                case "move_backward":
-                    MoveLocal(-value, 0.0f);
-                    break;
-                case "strafe_left":
-                    MoveLocal(0.0f, -value);
-                    break;
-                case "strafe_right":
-                    MoveLocal(0.0f, value);
-                    break;
-                case "turn_left":
-                    RotateBody(value);
-                    break;
-                case "turn_right":
-                    RotateBody(-value);
-                    break;
-                case "camera_pan_left":
-                    PanCamera(value);
-                    break;
-                case "camera_pan_right":
-                    PanCamera(-value);
-                    break;
-                case "pause":
-                    break;
-                default:
-                    throw new System.InvalidOperationException("Unsupported primitive: " + primitive);
+                return;
             }
+
+            MoveLocal(translateForwardM, translateRightM);
+            RotateBody(bodyYawDeg);
+            PanCamera(cameraYawDeltaDeg);
+            PitchCamera(cameraPitchDeltaDeg);
         }
 
         public void ApplyManualInput(
@@ -160,8 +155,8 @@ namespace ObjRecog.UnitySim
         {
             MoveLocal(forwardAxis * moveSpeedMps * deltaTime, strafeAxis * moveSpeedMps * deltaTime);
             RotateBody(turnAxis * turnSpeedDegPerSec * deltaTime);
-            PanCamera(mousePanAxis * mousePanSensitivity);
-            PitchCamera(-mousePitchAxis * mousePitchSensitivity);
+            PanCamera(mousePanAxis * cameraYawSpeedDegPerSec * deltaTime);
+            PitchCamera(-mousePitchAxis * cameraPitchSpeedDegPerSec * deltaTime);
         }
 
         public void MoveLocal(float forwardMeters, float strafeMeters)

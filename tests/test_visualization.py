@@ -1010,7 +1010,7 @@ def test_render_explanation_panel_supports_planner_tabs_and_returns_tab_metadata
         latency_ms=22.0,
         timestamp_label="12:34:56",
         planner_request_context='{"goal":"tv","mode":"inferred"}',
-        planner_response_text='{"rationale":"scan left","steps":["turn_left","move_forward"]}',
+        planner_response_text='{"behavior_mode":"scan","commands":[{"kind":"rotate_body","direction":"left","mode":"angle_deg","value":12.0}]}',
         active_tab="planner_request",
         cv2_module=fake_cv2,
         unicode_text_renderer=_fake_unicode_renderer,

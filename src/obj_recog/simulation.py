@@ -11,33 +11,53 @@ import numpy as np
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
+from obj_recog.reconstruct import CameraIntrinsics, back_project_pixels, intrinsics_for_frame
 from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context, planner_prompt_from_context
 from obj_recog.sim_protocol import (
-    ActionPrimitive,
     ActionSchedule,
-    ActionStep,
+    CommandKind,
+    ExecutedMacroCommand,
     EpisodePhase,
     EpisodeReport,
     HiddenWorldState,
+    MotionCommand,
     PlannerActionEffectSummary,
+    PlannerCameraState,
     PlannerNavigationAffordances,
     PlannerNavigationSectorObservation,
     PlannerReconstructionBrief,
     PlannerSafetyFlags,
     PlannerSearchOutcome,
-    RobotPose,
+    RigCapabilities,
     SensorFrame,
-    UnityActionCommand,
+    UnityRigDeltaCommand,
 )
-from obj_recog.types import PanopticSegment
 from obj_recog.sim_scene import build_living_room_scene_spec
-from obj_recog.unity_rgb import UnityRgbClient, command_from_step
+from obj_recog.unity_rgb import UnityRgbClient, rig_capabilities_from_metadata
 from obj_recog.unity_vendor_check import validate_unity_vendor_setup
 
 
 SCENARIO_SPECS = {
     "living_room_navigation_v1": build_living_room_scene_spec(),
 }
+
+_BODY_MOTION_TRACKING_STATES = {"TRACKING", "RELOCALIZED"}
+_TARGET_EVIDENCE_REPLAN_STATES = {"appeared", "stronger"}
+_DEFAULT_MICROSTEP_LIMITS = {
+    "translate_distance_m": 0.08,
+    "body_yaw_deg": 4.0,
+    "camera_yaw_deg": 4.0,
+    "camera_pitch_deg": 4.0,
+}
+_DEFAULT_RIG_CAPABILITIES = RigCapabilities(
+    move_speed_mps=1.6,
+    turn_speed_deg_per_sec=100.0,
+    camera_yaw_speed_deg_per_sec=90.0,
+    camera_pitch_speed_deg_per_sec=90.0,
+    camera_yaw_limit_deg=70.0,
+    camera_pitch_limit_deg=55.0,
+)
+_INITIALIZING_RECOVERY_FRAME_THRESHOLD = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,11 +82,28 @@ class CameraRigSpec:
         )
 
 
+@dataclass(slots=True)
+class _ActiveMacroExecution:
+    command: MotionCommand
+    start_state: dict[str, object]
+    requested_translation_m: float = 0.0
+    requested_yaw_deg: float = 0.0
+    target_camera_yaw_deg: float | None = None
+    target_camera_pitch_deg: float | None = None
+    requested_pause_sec: float = 0.0
+    sent_translation_m: float = 0.0
+    sent_yaw_deg: float = 0.0
+    sent_camera_yaw_deg: float = 0.0
+    sent_camera_pitch_deg: float = 0.0
+    microstep_count: int = 0
+    allow_untracked_completion: bool = False
+
+
 class RgbSimulationBackend(Protocol):
     def reset_episode(self, *, scene_spec) -> SensorFrame:
         ...
 
-    def apply_action(self, command: UnityActionCommand) -> SensorFrame:
+    def apply_action(self, command: UnityRigDeltaCommand) -> SensorFrame:
         ...
 
     def close(self) -> None:
@@ -88,22 +125,31 @@ class UnityRgbSensorBackend:
         self._clear_pending_frame_future()
         self._frame_counter = 0
         frame = self._client.reset_episode(scenario_id=str(scene_spec.scene_id))
+        capabilities = rig_capabilities_from_metadata(frame.metadata)
+        if capabilities is None:
+            raise RuntimeError(
+                "Unity RGB player did not advertise rig capabilities during reset_episode. "
+                "This build is likely stale and predates the rig_delta motion protocol. "
+                "Rebuild the Unity player from the current source and try again."
+            )
         return SensorFrame(
             frame_index=0,
             timestamp_sec=float(frame.timestamp_sec),
             frame_bgr=np.asarray(frame.frame_bgr, dtype=np.uint8),
+            metadata=dict(frame.metadata or {}),
         )
 
-    def apply_action(self, command: UnityActionCommand) -> SensorFrame:
+    def apply_action(self, command: UnityRigDeltaCommand) -> SensorFrame:
         self._frame_counter += 1
         frame = self._client.apply_action(command)
         return SensorFrame(
             frame_index=int(self._frame_counter),
             timestamp_sec=float(frame.timestamp_sec),
             frame_bgr=np.asarray(frame.frame_bgr, dtype=np.uint8),
+            metadata=dict(frame.metadata or {}),
         )
 
-    def submit_action(self, command: UnityActionCommand) -> None:
+    def submit_action(self, command: UnityRigDeltaCommand) -> None:
         if self.is_waiting_for_frame():
             raise RuntimeError("Unity RGB backend already has an in-flight action")
         self._frame_counter += 1
@@ -139,12 +185,13 @@ class UnityRgbSensorBackend:
         finally:
             self._action_executor.shutdown(wait=False, cancel_futures=True)
 
-    def _request_sensor_frame(self, command: UnityActionCommand, frame_index: int) -> SensorFrame:
+    def _request_sensor_frame(self, command: UnityRigDeltaCommand, frame_index: int) -> SensorFrame:
         frame = self._client.apply_action(command)
         return SensorFrame(
             frame_index=int(frame_index),
             timestamp_sec=float(frame.timestamp_sec),
             frame_bgr=np.asarray(frame.frame_bgr, dtype=np.uint8),
+            metadata=dict(frame.metadata or {}),
         )
 
     def _clear_pending_frame_future(self) -> None:
@@ -175,18 +222,45 @@ class LivingRoomEpisodeRunner:
         self._report_dir = Path(report_path).parent
         self._report_dir.mkdir(parents=True, exist_ok=True)
         self._latest_sensor_frame = self._sensor_backend.reset_episode(scene_spec=self._scene_spec)
+        self._rig_capabilities = (
+            rig_capabilities_from_metadata(self._latest_sensor_frame.metadata) or _DEFAULT_RIG_CAPABILITIES
+        )
 
         self._state = HiddenWorldState(
             scene_spec=self._scene_spec,
             robot_pose=self._scene_spec.start_pose,
         )
         self._selfcal_actions = (
-            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 6.0),
-            ActionStep(ActionPrimitive.CAMERA_PAN_RIGHT, 6.0),
-            ActionStep(ActionPrimitive.TURN_LEFT, 6.0),
-            ActionStep(ActionPrimitive.TURN_RIGHT, 6.0),
-            ActionStep(ActionPrimitive.MOVE_FORWARD, 0.12),
+            MotionCommand(kind=CommandKind.AIM_CAMERA, yaw_deg=-12.0, pitch_deg=0.0, intent="self-calibrate left"),
+            MotionCommand(kind=CommandKind.AIM_CAMERA, yaw_deg=12.0, pitch_deg=0.0, intent="self-calibrate right"),
+            MotionCommand(kind=CommandKind.AIM_CAMERA, yaw_deg=0.0, pitch_deg=8.0, intent="self-calibrate up"),
+            MotionCommand(
+                kind=CommandKind.ROTATE_BODY,
+                direction="left",
+                mode="angle_deg",
+                value=16.0,
+                intent="self-calibrate turn left",
+            ),
+            MotionCommand(
+                kind=CommandKind.TRANSLATE,
+                direction="forward",
+                mode="distance_m",
+                value=0.32,
+                intent="self-calibrate translation forward",
+            ),
+            MotionCommand(
+                kind=CommandKind.TRANSLATE,
+                direction="right",
+                mode="distance_m",
+                value=0.24,
+                intent="self-calibrate lateral translation",
+            ),
         )
+        self._current_camera_state = PlannerCameraState(
+            yaw_deg=float(getattr(self._scene_spec.start_pose, "camera_pan_deg", 0.0)),
+            pitch_deg=float(getattr(self._scene_spec.start_pose, "camera_pitch_deg", 0.0)),
+        )
+        self._initializing_streak_frames = 0
         self._action_history: list[str] = []
         self._planner_turn_logs: list[dict[str, object]] = []
         self._completed_search_history: list[PlannerSearchOutcome] = []
@@ -194,13 +268,13 @@ class LivingRoomEpisodeRunner:
         self._current_schedule: ActionSchedule | None = None
         self._active_schedule_start_frame: int | None = None
         self._active_schedule_start_observation: dict[str, object] | None = None
-        self._active_schedule_executed_steps: list[str] = []
+        self._active_schedule_executed_commands: list[str] = []
         self._previous_observation_state: dict[str, object] | None = None
-        self._pending_action_step: ActionStep | None = None
+        self._active_macro_execution: _ActiveMacroExecution | None = None
         self._latest_planner_context = None
         self._latest_planner_schedule: ActionSchedule | None = None
         self._closed = False
-        self._executed_schedule_steps = 0
+        self._debug_microstep_trace: list[dict[str, object]] = []
         self._write_selfcalibration_artifact()
         self._write_planner_turns_artifact()
         self._write_episode_report()
@@ -214,22 +288,32 @@ class LivingRoomEpisodeRunner:
         return self._current_schedule
 
     @staticmethod
-    def _tracking_safe_step_limit(primitive: ActionPrimitive) -> float | None:
-        if primitive in {
-            ActionPrimitive.MOVE_FORWARD,
-            ActionPrimitive.MOVE_BACKWARD,
-            ActionPrimitive.STRAFE_LEFT,
-            ActionPrimitive.STRAFE_RIGHT,
-        }:
-            return 0.12
-        if primitive in {
-            ActionPrimitive.TURN_LEFT,
-            ActionPrimitive.TURN_RIGHT,
-            ActionPrimitive.CAMERA_PAN_LEFT,
-            ActionPrimitive.CAMERA_PAN_RIGHT,
-        }:
-            return 6.0
-        return None
+    def _tracking_state_allows_body_motion(tracking_status: str) -> bool:
+        return str(tracking_status or "").upper() in _BODY_MOTION_TRACKING_STATES
+
+    def _bootstrap_body_motion_allowed(self, observation_state: dict[str, object]) -> bool:
+        tracking_status = str(observation_state.get("tracking_status", "UNKNOWN")).upper()
+        if tracking_status != "INITIALIZING":
+            return False
+        if self._state.selfcal_step_index < len(self._selfcal_actions):
+            return False
+        streak_frames = int(observation_state.get("initializing_streak_frames", self._initializing_streak_frames))
+        return streak_frames >= _INITIALIZING_RECOVERY_FRAME_THRESHOLD
+
+    def _body_motion_allowed_for_observation_state(self, observation_state: dict[str, object]) -> bool:
+        return self._tracking_state_allows_body_motion(str(observation_state.get("tracking_status", "UNKNOWN"))) or (
+            self._bootstrap_body_motion_allowed(observation_state)
+        )
+
+    def _update_tracking_recovery_state(self, current_state: dict[str, object]) -> dict[str, object]:
+        tracking_status = str(current_state.get("tracking_status", "UNKNOWN")).upper()
+        if tracking_status == "INITIALIZING":
+            self._initializing_streak_frames += 1
+        else:
+            self._initializing_streak_frames = 0
+        current_state["initializing_streak_frames"] = int(self._initializing_streak_frames)
+        current_state["bootstrap_body_motion_allowed"] = self._bootstrap_body_motion_allowed(current_state)
+        return current_state
 
     @staticmethod
     def _normalize_label(label: object) -> str:
@@ -248,8 +332,58 @@ class LivingRoomEpisodeRunner:
         )
 
     @staticmethod
-    def _format_action_step(step: ActionStep) -> str:
-        return f"{step.primitive.value}:{step.value}"
+    def _camera_intrinsics_for_artifacts(artifacts) -> CameraIntrinsics:
+        intrinsics = getattr(artifacts, "intrinsics", None)
+        if isinstance(intrinsics, CameraIntrinsics):
+            return intrinsics
+        frame_shape = np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape
+        if len(frame_shape) >= 2 and int(frame_shape[0]) > 0 and int(frame_shape[1]) > 0:
+            return intrinsics_for_frame(int(frame_shape[1]), int(frame_shape[0]))
+        return intrinsics_for_frame(640, 360)
+
+    @staticmethod
+    def _clamp_camera_state(
+        yaw_deg: float,
+        pitch_deg: float,
+        rig_capabilities: RigCapabilities,
+    ) -> PlannerCameraState:
+        return PlannerCameraState(
+            yaw_deg=float(np.clip(yaw_deg, -rig_capabilities.camera_yaw_limit_deg, rig_capabilities.camera_yaw_limit_deg)),
+            pitch_deg=float(
+                np.clip(
+                    pitch_deg,
+                    -rig_capabilities.camera_pitch_limit_deg,
+                    rig_capabilities.camera_pitch_limit_deg,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _format_motion_command(command: MotionCommand) -> str:
+        if command.kind in {CommandKind.TRANSLATE, CommandKind.ROTATE_BODY}:
+            return (
+                f"{command.kind.value}:{command.direction or ''}:"
+                f"{command.mode or ''}:{0.0 if command.value is None else float(command.value):.2f}"
+            )
+        if command.kind is CommandKind.AIM_CAMERA:
+            return (
+                f"{command.kind.value}:yaw={0.0 if command.yaw_deg is None else float(command.yaw_deg):.1f}:"
+                f"pitch={0.0 if command.pitch_deg is None else float(command.pitch_deg):.1f}"
+            )
+        return f"{command.kind.value}:{0.0 if command.duration_sec is None else float(command.duration_sec):.2f}"
+
+    def _microstep_limit_for_command(self, command: MotionCommand) -> float:
+        if command.kind is CommandKind.TRANSLATE:
+            return float(_DEFAULT_MICROSTEP_LIMITS["translate_distance_m"])
+        if command.kind is CommandKind.ROTATE_BODY:
+            return float(_DEFAULT_MICROSTEP_LIMITS["body_yaw_deg"])
+        if command.kind is CommandKind.AIM_CAMERA:
+            yaw_remaining = 0.0 if command.yaw_deg is None else abs(float(command.yaw_deg) - self._current_camera_state.yaw_deg)
+            pitch_remaining = 0.0 if command.pitch_deg is None else abs(float(command.pitch_deg) - self._current_camera_state.pitch_deg)
+            if yaw_remaining >= pitch_remaining:
+                return float(_DEFAULT_MICROSTEP_LIMITS["camera_yaw_deg"])
+            return float(_DEFAULT_MICROSTEP_LIMITS["camera_pitch_deg"])
+        return 0.0
 
     @staticmethod
     def _bbox_depth_m(depth_map: np.ndarray, xyxy: tuple[int, int, int, int]) -> float | None:
@@ -321,13 +455,13 @@ class LivingRoomEpisodeRunner:
     @staticmethod
     def _direction_from_action_text(action_text: str) -> str | None:
         text = str(action_text or "")
-        if "strafe_left" in text or "turn_left" in text or "camera_pan_left" in text:
+        if ":left" in text:
             return "left"
-        if "strafe_right" in text or "turn_right" in text or "camera_pan_right" in text:
+        if ":right" in text:
             return "right"
-        if "move_backward" in text:
+        if ":backward" in text:
             return "rear"
-        if "move_forward" in text:
+        if ":forward" in text:
             return "front"
         return None
 
@@ -488,6 +622,10 @@ class LivingRoomEpisodeRunner:
             "mesh_vertex_count": int(np.asarray(getattr(artifacts, "mesh_vertices_xyz", np.empty((0, 3)))).shape[0]),
             "mesh_triangle_count": int(np.asarray(getattr(artifacts, "mesh_triangles", np.empty((0, 3)))).shape[0]),
             "tracking_status": str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
+            "tracked_feature_count": int(getattr(artifacts, "tracked_feature_count", 0)),
+            "median_reprojection_error": getattr(artifacts, "median_reprojection_error", None),
+            "current_camera_state": self._current_camera_state,
+            "camera_intrinsics": self._camera_intrinsics_for_artifacts(artifacts),
         }
 
     def _replan_frame_budget(self) -> int:
@@ -499,6 +637,7 @@ class LivingRoomEpisodeRunner:
         target_label = getattr(self._scene_spec, "semantic_target_class", "")
         detections = list(getattr(artifacts, "detections", []) or [])
         depth_map = np.asarray(getattr(artifacts, "depth_map", np.empty((0, 0))), dtype=np.float32)
+        intrinsics = self._camera_intrinsics_for_artifacts(artifacts)
         frame_shape = np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape
         if len(frame_shape) < 2:
             return None
@@ -527,13 +666,29 @@ class LivingRoomEpisodeRunner:
             else:
                 horizontal_position = "center"
             confidence = float(getattr(detection, "confidence", 0.0))
+            bbox_center_y = y1 + (bbox_height * 0.5)
+            median_depth_m = self._bbox_depth_m(depth_map, (x1, y1, x2, y2))
+            relative_xyz = None
+            center_ray_xyz = None
+            if median_depth_m is not None:
+                center_xy = np.asarray([[bbox_center_x, bbox_center_y]], dtype=np.float32)
+                projected = back_project_pixels(
+                    center_xy,
+                    np.asarray([float(median_depth_m)], dtype=np.float32),
+                    intrinsics,
+                )
+                if projected.shape == (1, 3):
+                    center_ray_xyz = tuple(float(value) for value in projected[0])
+                    relative_xyz = center_ray_xyz
             summary = {
                 "label": str(getattr(detection, "label", "")),
                 "confidence": confidence,
                 "area_ratio": area_ratio,
                 "center_offset_ratio": center_offset_ratio,
                 "horizontal_position": horizontal_position,
-                "median_depth_m": self._bbox_depth_m(depth_map, (x1, y1, x2, y2)),
+                "median_depth_m": median_depth_m,
+                "relative_xyz": relative_xyz,
+                "center_ray_xyz": center_ray_xyz,
             }
             score = (area_ratio, confidence)
             if score > best_score:
@@ -610,6 +765,12 @@ class LivingRoomEpisodeRunner:
             explored_directions=explored_directions,
             unexplored_directions=unexplored_directions,
             recently_failed_directions=recently_failed_directions,
+            tracked_feature_count=int(observation_state.get("tracked_feature_count", 0) or 0),
+            median_reprojection_error=(
+                None
+                if observation_state.get("median_reprojection_error") is None
+                else float(observation_state["median_reprojection_error"])
+            ),
         )
 
     @staticmethod
@@ -647,87 +808,121 @@ class LivingRoomEpisodeRunner:
             return "weaker"
         return "stable"
 
-    def _likely_blocked(
+    @staticmethod
+    def _translate_success_threshold(requested_translation_m: float) -> float:
+        return max(float(requested_translation_m) * 0.6, float(requested_translation_m) - 0.08)
+
+    @staticmethod
+    def _rotate_success_threshold(requested_yaw_deg: float) -> float:
+        return max(float(requested_yaw_deg) * 0.7, float(requested_yaw_deg) - 4.0)
+
+    def _macro_motion_from_states(
         self,
         *,
-        step: ActionStep,
-        previous_state: dict[str, object],
+        start_state: dict[str, object],
         current_state: dict[str, object],
-    ) -> bool:
+    ) -> tuple[float | None, float | None]:
         translation_progress = self._pose_progress_m(
-            previous_state.get("camera_pose_world"),
+            start_state.get("camera_pose_world"),
             current_state.get("camera_pose_world"),
         )
         yaw_delta_deg = self._angle_delta_deg(
-            previous_state.get("yaw_deg"),
+            start_state.get("yaw_deg"),
             current_state.get("yaw_deg"),
         )
-        previous_affordances = previous_state.get("navigation_affordances")
-        current_affordances = current_state.get("navigation_affordances")
-        if step.primitive in {
-            ActionPrimitive.MOVE_FORWARD,
-            ActionPrimitive.MOVE_BACKWARD,
-            ActionPrimitive.STRAFE_LEFT,
-            ActionPrimitive.STRAFE_RIGHT,
-        }:
-            previous_forward = (
-                None
-                if not isinstance(previous_affordances, PlannerNavigationAffordances)
-                else previous_affordances.forward_clearance_m
-            )
-            current_forward = (
-                None
-                if not isinstance(current_affordances, PlannerNavigationAffordances)
-                else current_affordances.forward_clearance_m
-            )
-            if translation_progress is not None and translation_progress < 0.025:
-                if previous_forward is None or previous_forward < 1.0:
-                    return True
-                if current_forward is not None and current_forward <= previous_forward + 0.05:
-                    return True
-        if step.primitive in {ActionPrimitive.TURN_LEFT, ActionPrimitive.TURN_RIGHT}:
-            return yaw_delta_deg is not None and abs(float(yaw_delta_deg)) < 2.0
+        return translation_progress, None if yaw_delta_deg is None else abs(float(yaw_delta_deg))
+
+    def _macro_likely_blocked(
+        self,
+        *,
+        execution: _ActiveMacroExecution,
+        measured_translation_m: float | None,
+        measured_yaw_deg: float | None,
+    ) -> bool:
+        command = execution.command
+        if command.kind is CommandKind.TRANSLATE:
+            if execution.requested_translation_m <= 0.0 or execution.sent_translation_m < (execution.requested_translation_m * 0.5):
+                return False
+            return measured_translation_m is None or float(measured_translation_m) < 0.03
+        if command.kind is CommandKind.ROTATE_BODY:
+            if execution.requested_yaw_deg <= 0.0 or execution.sent_yaw_deg < (execution.requested_yaw_deg * 0.5):
+                return False
+            return measured_yaw_deg is None or float(measured_yaw_deg) < 3.0
         return False
 
-    def _record_recent_action_effect(self, *, current_state: dict[str, object]) -> None:
-        if self._pending_action_step is None or self._previous_observation_state is None:
-            return
-        previous_state = self._previous_observation_state
-        translation_progress = self._pose_progress_m(
-            previous_state.get("camera_pose_world"),
-            current_state.get("camera_pose_world"),
-        )
-        yaw_delta_deg = self._angle_delta_deg(
-            previous_state.get("yaw_deg"),
-            current_state.get("yaw_deg"),
-        )
-        estimated_motion_parts = []
-        if translation_progress is not None:
-            estimated_motion_parts.append(f"translation={translation_progress:.2f}m")
-        if yaw_delta_deg is not None:
-            estimated_motion_parts.append(f"yaw={yaw_delta_deg:+.1f}deg")
+    def _record_macro_effect(
+        self,
+        *,
+        executed_macro: ExecutedMacroCommand,
+        start_state: dict[str, object],
+        current_state: dict[str, object],
+    ) -> None:
+        estimated_motion_parts: list[str] = []
+        if executed_macro.measured_translation_m is not None:
+            estimated_motion_parts.append(f"translation={float(executed_macro.measured_translation_m):.2f}m")
+        if executed_macro.measured_yaw_deg is not None:
+            estimated_motion_parts.append(f"yaw={float(executed_macro.measured_yaw_deg):+.1f}deg")
+        if executed_macro.command.kind is CommandKind.AIM_CAMERA:
+            estimated_motion_parts.append(
+                f"camera=yaw{self._current_camera_state.yaw_deg:+.1f}/pitch{self._current_camera_state.pitch_deg:+.1f}"
+            )
+        if executed_macro.command.kind is CommandKind.PAUSE:
+            estimated_motion_parts.append(f"pause={float(executed_macro.command.duration_sec or 0.0):.2f}s")
         if not estimated_motion_parts:
             estimated_motion_parts.append("pose_unavailable")
         effect = PlannerActionEffectSummary(
-            action=self._format_action_step(self._pending_action_step),
+            action=self._format_motion_command(executed_macro.command),
             estimated_motion=", ".join(estimated_motion_parts),
             clearance_change=self._clearance_change_text(
-                previous_state.get("navigation_affordances"),
+                start_state.get("navigation_affordances"),
                 current_state.get("navigation_affordances"),
             ),
-            target_evidence_change=self._target_evidence_change_text(
-                previous_state.get("target_detection"),
-                current_state.get("target_detection"),
-            ),
-            likely_blocked=self._likely_blocked(
-                step=self._pending_action_step,
-                previous_state=previous_state,
-                current_state=current_state,
-            ),
+            target_evidence_change=executed_macro.target_evidence_change,
+            likely_blocked=bool(not executed_macro.completed and executed_macro.aborted),
+            aborted=bool(executed_macro.aborted),
         )
         self._recent_action_effects.append(effect)
         self._recent_action_effects = self._recent_action_effects[-4:]
-        self._pending_action_step = None
+        self._action_history.append(effect.action)
+        self._action_history = self._action_history[-8:]
+        self._active_schedule_executed_commands.append(effect.action)
+
+    def _finalize_active_macro_execution(
+        self,
+        *,
+        current_state: dict[str, object],
+        completed: bool,
+        aborted: bool,
+    ) -> ExecutedMacroCommand | None:
+        execution = self._active_macro_execution
+        if execution is None:
+            return None
+        measured_translation_m, measured_yaw_deg = self._macro_motion_from_states(
+            start_state=execution.start_state,
+            current_state=current_state,
+        )
+        target_evidence_change = self._target_evidence_change_text(
+            execution.start_state.get("target_detection"),
+            current_state.get("target_detection"),
+        )
+        executed_macro = ExecutedMacroCommand(
+            command=execution.command,
+            measured_translation_m=measured_translation_m,
+            measured_yaw_deg=measured_yaw_deg,
+            completed=bool(completed),
+            aborted=bool(aborted),
+            microstep_count=int(execution.microstep_count),
+            target_evidence_change=target_evidence_change,
+            pose_progress_m=measured_translation_m,
+            intent=str(execution.command.intent or ""),
+        )
+        self._record_macro_effect(
+            executed_macro=executed_macro,
+            start_state=execution.start_state,
+            current_state=current_state,
+        )
+        self._active_macro_execution = None
+        return executed_macro
 
     def _finalize_completed_search(self, *, artifacts) -> None:
         if self._active_schedule_start_frame is None:
@@ -767,7 +962,7 @@ class LivingRoomEpisodeRunner:
             PlannerSearchOutcome(
                 start_frame=int(self._active_schedule_start_frame),
                 end_frame=int(self._state.frame_index),
-                executed_actions=tuple(self._active_schedule_executed_steps),
+                executed_actions=tuple(self._active_schedule_executed_commands),
                 target_visible_after_search=self._target_visible_in_artifacts(artifacts=artifacts),
                 tracking_status=str(getattr(artifacts, "slam_tracking_state", "UNKNOWN")),
                 entered_new_view=entered_new_view,
@@ -779,7 +974,7 @@ class LivingRoomEpisodeRunner:
         self._completed_search_history = self._completed_search_history[-4:]
         self._active_schedule_start_frame = None
         self._active_schedule_start_observation = None
-        self._active_schedule_executed_steps = []
+        self._active_schedule_executed_commands = []
 
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
         if self._latest_sensor_frame is None and self.is_waiting_for_frame():
@@ -788,11 +983,21 @@ class LivingRoomEpisodeRunner:
         if self._closed or self._latest_sensor_frame is None:
             return None
         sensor_frame = self._latest_sensor_frame
+        latest_tracking_status = (
+            "UNKNOWN"
+            if self._previous_observation_state is None
+            else str(self._previous_observation_state.get("tracking_status", "UNKNOWN"))
+        )
         return FramePacket(
             frame_bgr=np.asarray(sensor_frame.frame_bgr, dtype=np.uint8),
             timestamp_sec=float(sensor_frame.timestamp_sec),
+            intrinsics_gt=intrinsics_for_frame(
+                int(np.asarray(sensor_frame.frame_bgr).shape[1]),
+                int(np.asarray(sensor_frame.frame_bgr).shape[0]),
+            ),
             planner_context=self._latest_planner_context,
             planner_schedule=self._latest_planner_schedule,
+            tracking_state=latest_tracking_status,
             calibration_source="self_calibration/converged"
             if self._state.selfcal_step_index >= len(self._selfcal_actions)
             else "self_calibration/pending",
@@ -803,13 +1008,14 @@ class LivingRoomEpisodeRunner:
         if self._closed or self._latest_sensor_frame is None:
             return
         current_state = self._observation_state_from_artifacts(artifacts=artifacts)
-        self._record_recent_action_effect(current_state=current_state)
+        current_state = self._update_tracking_recovery_state(current_state)
+        self._update_active_macro_execution(current_state=current_state)
         if self._goal_visually_reached(artifacts=artifacts):
             self._previous_observation_state = current_state
             self._mark_goal_completed()
             return
 
-        next_command = self._select_next_command(artifacts=artifacts)
+        next_command = self._select_next_command(artifacts=artifacts, current_state=current_state)
         self._previous_observation_state = current_state
         submit_action = getattr(self._sensor_backend, "submit_action", None)
         if callable(submit_action):
@@ -828,18 +1034,49 @@ class LivingRoomEpisodeRunner:
     def _mark_goal_completed(self) -> None:
         self._state.mission_succeeded = True
         self._state.phase = EpisodePhase.SUCCEEDED
+        self._current_schedule = None
+        self._active_macro_execution = None
         self._latest_sensor_frame = None
         self._write_episode_report()
 
     @staticmethod
-    def _contains_contradictory_steps(steps: tuple[ActionStep, ...]) -> bool:
-        primitives = {step.primitive for step in steps}
-        contradictory_pairs = (
-            {ActionPrimitive.TURN_LEFT, ActionPrimitive.TURN_RIGHT},
-            {ActionPrimitive.CAMERA_PAN_LEFT, ActionPrimitive.CAMERA_PAN_RIGHT},
-            {ActionPrimitive.STRAFE_LEFT, ActionPrimitive.STRAFE_RIGHT},
-        )
-        return any(pair.issubset(primitives) for pair in contradictory_pairs)
+    def _serialize_motion_command(command: MotionCommand) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "kind": command.kind.value,
+            "intent": str(command.intent or ""),
+        }
+        if command.kind in {CommandKind.TRANSLATE, CommandKind.ROTATE_BODY}:
+            payload["direction"] = command.direction
+            payload["mode"] = command.mode
+            payload["value"] = command.value
+        elif command.kind is CommandKind.AIM_CAMERA:
+            payload["yaw_deg"] = command.yaw_deg
+            payload["pitch_deg"] = command.pitch_deg
+        else:
+            payload["duration_sec"] = command.duration_sec
+        return payload
+
+    @staticmethod
+    def _contains_contradictory_commands(commands: tuple[MotionCommand, ...]) -> bool:
+        rotate_directions = {
+            str(command.direction)
+            for command in commands
+            if command.kind is CommandKind.ROTATE_BODY and str(command.direction or "").strip()
+        }
+        if {"left", "right"}.issubset(rotate_directions):
+            return True
+        aim_signs = set()
+        for command in commands:
+            if command.kind is not CommandKind.AIM_CAMERA or command.yaw_deg is None:
+                continue
+            if float(abs(command.yaw_deg)) < 4.0:
+                continue
+            aim_signs.add("right" if float(command.yaw_deg) > 0.0 else "left")
+        return len(aim_signs) > 1
+
+    @staticmethod
+    def _commands_include_body_motion(commands: tuple[MotionCommand, ...]) -> bool:
+        return any(command.kind in {CommandKind.TRANSLATE, CommandKind.ROTATE_BODY} for command in commands)
 
     @staticmethod
     def _tracking_risk(tracking_status: str) -> str:
@@ -850,29 +1087,168 @@ class LivingRoomEpisodeRunner:
             return "high"
         return "medium"
 
-    def _escape_steps(self, *, observation_state: dict[str, object]) -> tuple[ActionStep, ...]:
+    def _bootstrap_tracking_recovery_commands(
+        self,
+        *,
+        observation_state: dict[str, object],
+    ) -> tuple[MotionCommand, ...]:
+        affordances = observation_state.get("navigation_affordances")
+        best_direction = None
+        left_clearance = None
+        right_clearance = None
+        front_clearance = None
+        rear_clearance = None
+        if isinstance(affordances, PlannerNavigationAffordances):
+            best_direction = affordances.best_exploration_direction
+            left_clearance = affordances.left_clearance_m
+            right_clearance = affordances.right_clearance_m
+            front_clearance = affordances.forward_clearance_m
+            rear_clearance = affordances.rear_clearance_m
+
+        translate_direction = "forward"
+        translate_value = 0.32
+        if best_direction in {"left", "front-left", "rear-left"} and (left_clearance is None or left_clearance >= 0.7):
+            translate_direction = "left"
+            translate_value = 0.24
+        elif best_direction in {"right", "front-right", "rear-right"} and (
+            right_clearance is None or right_clearance >= 0.7
+        ):
+            translate_direction = "right"
+            translate_value = 0.24
+        elif front_clearance is not None and front_clearance >= 0.9:
+            translate_direction = "forward"
+            translate_value = 0.32
+        elif left_clearance is not None and right_clearance is not None:
+            if left_clearance >= right_clearance and left_clearance >= 0.65:
+                translate_direction = "left"
+                translate_value = 0.24
+            elif right_clearance >= 0.65:
+                translate_direction = "right"
+                translate_value = 0.24
+            elif rear_clearance is not None and rear_clearance >= 0.7:
+                translate_direction = "backward"
+                translate_value = 0.24
+
+        if "right" in str(best_direction or "") or translate_direction == "right":
+            rotate_direction = "right"
+            aim_yaw = 14.0
+        else:
+            rotate_direction = "left"
+            aim_yaw = -14.0
+
+        return (
+            MotionCommand(
+                kind=CommandKind.TRANSLATE,
+                direction=translate_direction,
+                mode="distance_m",
+                value=translate_value,
+                intent="create monocular parallax for tracking bootstrap",
+            ),
+            MotionCommand(
+                kind=CommandKind.ROTATE_BODY,
+                direction=rotate_direction,
+                mode="angle_deg",
+                value=16.0,
+                intent="add body yaw change while tracking bootstraps",
+            ),
+            MotionCommand(
+                kind=CommandKind.AIM_CAMERA,
+                yaw_deg=aim_yaw,
+                pitch_deg=0.0,
+                intent="stabilize view along the bootstrap motion corridor",
+            ),
+        )
+
+    def _escape_commands(self, *, observation_state: dict[str, object]) -> tuple[MotionCommand, ...]:
         affordances = observation_state.get("navigation_affordances")
         best_direction = None
         if isinstance(affordances, PlannerNavigationAffordances):
             best_direction = affordances.best_exploration_direction
-        translation_step = (
-            ActionStep(ActionPrimitive.STRAFE_LEFT, 0.12, intent="escape toward left opening")
+        if not self._body_motion_allowed_for_observation_state(observation_state):
+            return (
+                MotionCommand(
+                    kind=CommandKind.AIM_CAMERA,
+                    yaw_deg=-12.0 if best_direction != "right" else 12.0,
+                    pitch_deg=0.0,
+                    intent="scan safer corridor while tracking recovers",
+                ),
+                MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.4, intent="tracking unstable; reassess"),
+            )
+        translate_direction = (
+            "left"
             if best_direction == "left"
-            else ActionStep(ActionPrimitive.STRAFE_RIGHT, 0.12, intent="escape toward right opening")
+            else "right"
             if best_direction == "right"
-            else ActionStep(ActionPrimitive.MOVE_BACKWARD, 0.12, intent="back out of blocked state")
+            else "backward"
         )
-        turn_step = (
-            ActionStep(ActionPrimitive.TURN_LEFT, 6.0, intent="reorient toward safer view")
-            if best_direction != "right"
-            else ActionStep(ActionPrimitive.TURN_RIGHT, 6.0, intent="reorient toward safer view")
+        rotate_direction = "left" if best_direction != "right" else "right"
+        aim_yaw = -12.0 if best_direction != "right" else 12.0
+        return (
+            MotionCommand(
+                kind=CommandKind.TRANSLATE,
+                direction=translate_direction,
+                mode="distance_m",
+                value=0.16,
+                intent="escape blocked pose",
+            ),
+            MotionCommand(
+                kind=CommandKind.ROTATE_BODY,
+                direction=rotate_direction,
+                mode="angle_deg",
+                value=12.0,
+                intent="reorient toward safer view",
+            ),
+            MotionCommand(
+                kind=CommandKind.AIM_CAMERA,
+                yaw_deg=aim_yaw,
+                pitch_deg=0.0,
+                intent="confirm escape corridor",
+            ),
         )
-        pan_step = (
-            ActionStep(ActionPrimitive.CAMERA_PAN_LEFT, 6.0, intent="confirm escape corridor")
-            if best_direction != "right"
-            else ActionStep(ActionPrimitive.CAMERA_PAN_RIGHT, 6.0, intent="confirm escape corridor")
-        )
-        return (translation_step, turn_step, pan_step)
+
+    def _sanitize_command(self, command: MotionCommand, *, observation_state: dict[str, object]) -> MotionCommand | None:
+        intent = str(command.intent or "")
+        allow_body_motion = self._body_motion_allowed_for_observation_state(observation_state)
+        if command.kind is CommandKind.TRANSLATE:
+            if not allow_body_motion:
+                return None
+            direction = str(command.direction or "")
+            mode = str(command.mode or "")
+            if direction not in {"forward", "backward", "left", "right"}:
+                return None
+            if mode not in {"distance_m", "hold_sec"}:
+                return None
+            if mode == "distance_m":
+                value = min(abs(float(command.value or 0.0)), 0.72)
+            else:
+                max_hold_sec = 0.72 / max(float(self._rig_capabilities.move_speed_mps), 1e-6)
+                value = min(abs(float(command.value or 0.0)), max_hold_sec)
+            if value <= 1e-6:
+                return None
+            return MotionCommand(kind=CommandKind.TRANSLATE, direction=direction, mode=mode, value=value, intent=intent)
+        if command.kind is CommandKind.ROTATE_BODY:
+            if not allow_body_motion:
+                return None
+            direction = str(command.direction or "")
+            mode = str(command.mode or "")
+            if direction not in {"left", "right"}:
+                return None
+            if mode not in {"angle_deg", "hold_sec"}:
+                return None
+            if mode == "angle_deg":
+                value = min(abs(float(command.value or 0.0)), 36.0)
+            else:
+                max_hold_sec = 36.0 / max(float(self._rig_capabilities.turn_speed_deg_per_sec), 1e-6)
+                value = min(abs(float(command.value or 0.0)), max_hold_sec)
+            if value <= 1e-6:
+                return None
+            return MotionCommand(kind=CommandKind.ROTATE_BODY, direction=direction, mode=mode, value=value, intent=intent)
+        if command.kind is CommandKind.AIM_CAMERA:
+            yaw_deg = float(np.clip(float(command.yaw_deg or 0.0), -70.0, 70.0))
+            pitch_deg = float(np.clip(float(command.pitch_deg or 0.0), -55.0, 55.0))
+            return MotionCommand(kind=CommandKind.AIM_CAMERA, yaw_deg=yaw_deg, pitch_deg=pitch_deg, intent=intent)
+        duration_sec = max(0.0, float(command.duration_sec or 0.0))
+        return MotionCommand(kind=CommandKind.PAUSE, duration_sec=duration_sec, intent=intent)
 
     def _validated_schedule(
         self,
@@ -891,9 +1267,17 @@ class LivingRoomEpisodeRunner:
             else affordances.dead_end_likelihood
         )
         tracking_risk = self._tracking_risk(observation_state.get("tracking_status", "UNKNOWN"))
-        if self._contains_contradictory_steps(tuple(schedule.steps)):
+        commands = tuple(
+            command
+            for command in (
+                self._sanitize_command(command, observation_state=observation_state)
+                for command in tuple(schedule.commands or ())
+            )
+            if command is not None
+        )[:3]
+        if self._contains_contradictory_commands(commands):
             return ActionSchedule(
-                steps=self._escape_steps(observation_state=observation_state),
+                commands=self._escape_commands(observation_state=observation_state),
                 rationale="planner returned contradictory actions; use escape fallback",
                 model=f"{schedule.model}/validated",
                 issued_at_frame=schedule.issued_at_frame,
@@ -909,11 +1293,19 @@ class LivingRoomEpisodeRunner:
                 confidence=0.0 if schedule.confidence is None else float(schedule.confidence),
             )
         if tracking_risk == "high" and any(
-            step.primitive in {ActionPrimitive.MOVE_FORWARD, ActionPrimitive.STRAFE_LEFT, ActionPrimitive.STRAFE_RIGHT}
-            for step in schedule.steps
+            command.kind in {CommandKind.TRANSLATE, CommandKind.ROTATE_BODY}
+            for command in tuple(schedule.commands or ())
         ):
             return ActionSchedule(
-                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5, intent="tracking unstable; pause"),),
+                commands=(
+                    MotionCommand(
+                        kind=CommandKind.AIM_CAMERA,
+                        yaw_deg=float(self._current_camera_state.yaw_deg),
+                        pitch_deg=float(self._current_camera_state.pitch_deg),
+                        intent="hold camera while tracking recovers",
+                    ),
+                    MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="tracking unstable; pause"),
+                ),
                 rationale="tracking risk too high for aggressive translation",
                 model=f"{schedule.model}/validated",
                 issued_at_frame=schedule.issued_at_frame,
@@ -928,9 +1320,32 @@ class LivingRoomEpisodeRunner:
                 ),
                 confidence=0.0 if schedule.confidence is None else float(schedule.confidence),
             )
+        if self._bootstrap_body_motion_allowed(observation_state) and not self._commands_include_body_motion(commands):
+            bootstrap_commands = self._bootstrap_tracking_recovery_commands(observation_state=observation_state)
+            return ActionSchedule(
+                commands=bootstrap_commands,
+                rationale="tracking is still initializing after self-calibration; force bootstrap parallax motion",
+                model=f"{schedule.model}/validated",
+                issued_at_frame=schedule.issued_at_frame,
+                situation_summary=(
+                    schedule.situation_summary
+                    or "Tracking remained in INITIALIZING after self-calibration; executing bootstrap motion."
+                ),
+                behavior_mode="escape",
+                goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                safety_flags=PlannerSafetyFlags(
+                    front_blocked=front_blocked,
+                    dead_end_risk=dead_end_risk,
+                    tracking_risk=tracking_risk,
+                    replan_reason="tracking_bootstrap",
+                ),
+                confidence=0.0 if schedule.confidence is None else float(schedule.confidence),
+            )
+        if not commands:
+            commands = (MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="empty schedule fallback"),)
         if schedule.safety_flags is None:
             schedule = ActionSchedule(
-                steps=tuple(schedule.steps),
+                commands=commands,
                 rationale=schedule.rationale,
                 model=schedule.model,
                 issued_at_frame=schedule.issued_at_frame,
@@ -945,38 +1360,288 @@ class LivingRoomEpisodeRunner:
                 ),
                 confidence=schedule.confidence,
             )
+        elif commands != tuple(schedule.commands):
+            schedule = ActionSchedule(
+                commands=commands,
+                rationale=schedule.rationale,
+                model=schedule.model,
+                issued_at_frame=schedule.issued_at_frame,
+                situation_summary=schedule.situation_summary,
+                behavior_mode=schedule.behavior_mode,
+                goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                safety_flags=schedule.safety_flags,
+                confidence=schedule.confidence,
+            )
         return schedule
 
-    def _select_next_command(self, *, artifacts) -> UnityActionCommand:
-        if self._state.phase == EpisodePhase.SELF_CALIBRATING:
-            step = self._advance_self_calibration()
-        elif self._state.phase in {EpisodePhase.PERCEIVE_AND_PLAN, EpisodePhase.REASSESS}:
-            self._plan_next_schedule(artifacts=artifacts)
-            step = self._consume_schedule_step()
-        elif self._state.phase == EpisodePhase.EXECUTING_SCHEDULE:
-            step = self._consume_schedule_step()
+    def _start_macro_execution(
+        self,
+        *,
+        command: MotionCommand,
+        current_state: dict[str, object],
+    ) -> _ActiveMacroExecution:
+        execution = _ActiveMacroExecution(command=command, start_state=dict(current_state))
+        tracking_status = str(current_state.get("tracking_status", "UNKNOWN"))
+        execution.allow_untracked_completion = (
+            command.kind in {CommandKind.TRANSLATE, CommandKind.ROTATE_BODY}
+            and not self._tracking_state_allows_body_motion(tracking_status)
+            and self._body_motion_allowed_for_observation_state(current_state)
+        )
+        if command.kind is CommandKind.TRANSLATE:
+            execution.requested_translation_m = (
+                float(command.value or 0.0) * float(self._rig_capabilities.move_speed_mps)
+                if str(command.mode) == "hold_sec"
+                else float(command.value or 0.0)
+            )
+        elif command.kind is CommandKind.ROTATE_BODY:
+            execution.requested_yaw_deg = (
+                float(command.value or 0.0) * float(self._rig_capabilities.turn_speed_deg_per_sec)
+                if str(command.mode) == "hold_sec"
+                else float(command.value or 0.0)
+            )
+        elif command.kind is CommandKind.AIM_CAMERA:
+            target_state = self._clamp_camera_state(
+                float(command.yaw_deg or 0.0),
+                float(command.pitch_deg or 0.0),
+                self._rig_capabilities,
+            )
+            execution.target_camera_yaw_deg = target_state.yaw_deg
+            execution.target_camera_pitch_deg = target_state.pitch_deg
         else:
-            step = ActionStep(ActionPrimitive.PAUSE, 0.5)
-        self._action_history.append(self._format_action_step(step))
-        self._pending_action_step = step
-        return command_from_step(step.primitive, step.value)
+            execution.requested_pause_sec = float(command.duration_sec or 0.0)
+        return execution
 
-    def _advance_self_calibration(self) -> ActionStep:
-        if self._state.selfcal_step_index >= len(self._selfcal_actions):
-            self._state.phase = EpisodePhase.PERCEIVE_AND_PLAN
-            return ActionStep(ActionPrimitive.PAUSE, 0.5)
-        step = self._selfcal_actions[self._state.selfcal_step_index]
-        self._state.selfcal_step_index += 1
-        if self._state.selfcal_step_index >= len(self._selfcal_actions):
-            self._state.phase = EpisodePhase.PERCEIVE_AND_PLAN
-        return step
+    def _append_microstep_trace(self, *, command: MotionCommand, rig_delta: UnityRigDeltaCommand) -> None:
+        self._debug_microstep_trace.append(
+            {
+                "frame_index": int(self._state.frame_index),
+                "command": self._serialize_motion_command(command),
+                "rig_delta": {
+                    "translate_forward_m": float(rig_delta.translate_forward_m),
+                    "translate_right_m": float(rig_delta.translate_right_m),
+                    "body_yaw_deg": float(rig_delta.body_yaw_deg),
+                    "camera_yaw_delta_deg": float(rig_delta.camera_yaw_delta_deg),
+                    "camera_pitch_delta_deg": float(rig_delta.camera_pitch_delta_deg),
+                    "pause_sec": float(rig_delta.pause_sec),
+                },
+            }
+        )
+        self._debug_microstep_trace = self._debug_microstep_trace[-128:]
 
-    def _plan_next_schedule(self, *, artifacts) -> None:
+    def _next_microstep_delta_for_active_macro(self) -> UnityRigDeltaCommand | None:
+        execution = self._active_macro_execution
+        if execution is None:
+            return None
+        command = execution.command
+        rig_delta = UnityRigDeltaCommand()
+        if command.kind is CommandKind.TRANSLATE:
+            remaining_m = max(0.0, float(execution.requested_translation_m) - float(execution.sent_translation_m))
+            if remaining_m <= 1e-6:
+                return None
+            chunk_m = min(float(_DEFAULT_MICROSTEP_LIMITS["translate_distance_m"]), remaining_m)
+            execution.sent_translation_m += chunk_m
+            if command.direction == "forward":
+                rig_delta = UnityRigDeltaCommand(translate_forward_m=chunk_m)
+            elif command.direction == "backward":
+                rig_delta = UnityRigDeltaCommand(translate_forward_m=-chunk_m)
+            elif command.direction == "left":
+                rig_delta = UnityRigDeltaCommand(translate_right_m=-chunk_m)
+            else:
+                rig_delta = UnityRigDeltaCommand(translate_right_m=chunk_m)
+        elif command.kind is CommandKind.ROTATE_BODY:
+            remaining_deg = max(0.0, float(execution.requested_yaw_deg) - float(execution.sent_yaw_deg))
+            if remaining_deg <= 1e-6:
+                return None
+            chunk_deg = min(float(_DEFAULT_MICROSTEP_LIMITS["body_yaw_deg"]), remaining_deg)
+            execution.sent_yaw_deg += chunk_deg
+            rig_delta = UnityRigDeltaCommand(body_yaw_deg=chunk_deg if command.direction == "left" else -chunk_deg)
+        elif command.kind is CommandKind.AIM_CAMERA:
+            target_yaw_deg = float(
+                execution.target_camera_yaw_deg
+                if execution.target_camera_yaw_deg is not None
+                else self._current_camera_state.yaw_deg
+            )
+            target_pitch_deg = float(
+                execution.target_camera_pitch_deg
+                if execution.target_camera_pitch_deg is not None
+                else self._current_camera_state.pitch_deg
+            )
+            yaw_remaining_deg = target_yaw_deg - float(self._current_camera_state.yaw_deg)
+            pitch_remaining_deg = target_pitch_deg - float(self._current_camera_state.pitch_deg)
+            yaw_step_deg = (
+                0.0
+                if abs(yaw_remaining_deg) <= 0.25
+                else math.copysign(
+                    min(float(_DEFAULT_MICROSTEP_LIMITS["camera_yaw_deg"]), abs(yaw_remaining_deg)),
+                    yaw_remaining_deg,
+                )
+            )
+            pitch_step_deg = (
+                0.0
+                if abs(pitch_remaining_deg) <= 0.25
+                else math.copysign(
+                    min(float(_DEFAULT_MICROSTEP_LIMITS["camera_pitch_deg"]), abs(pitch_remaining_deg)),
+                    pitch_remaining_deg,
+                )
+            )
+            if abs(yaw_step_deg) <= 1e-6 and abs(pitch_step_deg) <= 1e-6:
+                return None
+            execution.sent_camera_yaw_deg += abs(yaw_step_deg)
+            execution.sent_camera_pitch_deg += abs(pitch_step_deg)
+            self._current_camera_state = self._clamp_camera_state(
+                self._current_camera_state.yaw_deg + yaw_step_deg,
+                self._current_camera_state.pitch_deg + pitch_step_deg,
+                self._rig_capabilities,
+            )
+            rig_delta = UnityRigDeltaCommand(
+                camera_yaw_delta_deg=yaw_step_deg,
+                camera_pitch_delta_deg=pitch_step_deg,
+            )
+        else:
+            if execution.microstep_count > 0:
+                return None
+            rig_delta = UnityRigDeltaCommand(pause_sec=float(execution.requested_pause_sec))
+        execution.microstep_count += 1
+        self._append_microstep_trace(command=command, rig_delta=rig_delta)
+        return rig_delta
+
+    def _update_active_macro_execution(self, *, current_state: dict[str, object]) -> None:
+        execution = self._active_macro_execution
+        if execution is None:
+            return
+        is_self_calibration_macro = self._state.phase == EpisodePhase.SELF_CALIBRATING and self._current_schedule is None
+        measured_translation_m, measured_yaw_deg = self._macro_motion_from_states(
+            start_state=execution.start_state,
+            current_state=current_state,
+        )
+        tracking_status = str(current_state.get("tracking_status", "UNKNOWN"))
+        target_evidence_change = self._target_evidence_change_text(
+            execution.start_state.get("target_detection"),
+            current_state.get("target_detection"),
+        )
+        body_motion_allowed_now = self._body_motion_allowed_for_observation_state(current_state)
+        completed = False
+        aborted = False
+        replan_after_finalize = False
+        if execution.command.kind is CommandKind.TRANSLATE:
+            if is_self_calibration_macro or execution.allow_untracked_completion:
+                completed = execution.sent_translation_m >= execution.requested_translation_m - 1e-6
+                aborted = False
+                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
+                    completed = True
+                    replan_after_finalize = True
+            else:
+                completed = measured_translation_m is not None and float(measured_translation_m) >= self._translate_success_threshold(execution.requested_translation_m)
+                aborted = self._macro_likely_blocked(
+                    execution=execution,
+                    measured_translation_m=measured_translation_m,
+                    measured_yaw_deg=measured_yaw_deg,
+                )
+                if not body_motion_allowed_now:
+                    aborted = True
+                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
+                    completed = True
+                    replan_after_finalize = True
+                elif execution.sent_translation_m >= execution.requested_translation_m - 1e-6 and not completed:
+                    aborted = True
+        elif execution.command.kind is CommandKind.ROTATE_BODY:
+            if is_self_calibration_macro or execution.allow_untracked_completion:
+                completed = execution.sent_yaw_deg >= execution.requested_yaw_deg - 1e-6
+                aborted = False
+                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
+                    completed = True
+                    replan_after_finalize = True
+            else:
+                completed = measured_yaw_deg is not None and float(measured_yaw_deg) >= self._rotate_success_threshold(execution.requested_yaw_deg)
+                aborted = self._macro_likely_blocked(
+                    execution=execution,
+                    measured_translation_m=measured_translation_m,
+                    measured_yaw_deg=measured_yaw_deg,
+                )
+                if not body_motion_allowed_now:
+                    aborted = True
+                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
+                    completed = True
+                    replan_after_finalize = True
+                elif execution.sent_yaw_deg >= execution.requested_yaw_deg - 1e-6 and not completed:
+                    aborted = True
+        elif execution.command.kind is CommandKind.AIM_CAMERA:
+            completed = (
+                abs(float(self._current_camera_state.yaw_deg) - float(execution.target_camera_yaw_deg or 0.0)) <= 0.25
+                and abs(float(self._current_camera_state.pitch_deg) - float(execution.target_camera_pitch_deg or 0.0)) <= 0.25
+            )
+        else:
+            completed = execution.microstep_count > 0
+        if not completed and not aborted:
+            return
+        self._finalize_active_macro_execution(current_state=current_state, completed=completed, aborted=aborted)
+        if is_self_calibration_macro:
+            if self._state.selfcal_step_index >= len(self._selfcal_actions):
+                self._state.phase = EpisodePhase.PERCEIVE_AND_PLAN
+            else:
+                self._state.phase = EpisodePhase.SELF_CALIBRATING
+            return
+        if aborted or replan_after_finalize:
+            self._current_schedule = None
+            self._state.schedule_cursor = 0
+            self._state.phase = EpisodePhase.REASSESS
+            return
+        if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.commands):
+            self._current_schedule = None
+            self._state.schedule_cursor = 0
+            self._state.phase = EpisodePhase.REASSESS
+            return
+        self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
+
+    def _advance_self_calibration(self, *, current_state: dict[str, object]) -> bool:
+        while self._state.selfcal_step_index < len(self._selfcal_actions):
+            command = self._selfcal_actions[self._state.selfcal_step_index]
+            self._state.selfcal_step_index += 1
+            self._active_macro_execution = self._start_macro_execution(command=command, current_state=current_state)
+            return True
+        self._state.phase = EpisodePhase.PERCEIVE_AND_PLAN
+        return False
+
+    def _start_next_schedule_macro(self, *, current_state: dict[str, object]) -> bool:
+        if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.commands):
+            self._current_schedule = None
+            self._state.schedule_cursor = 0
+            self._state.phase = EpisodePhase.REASSESS
+            return False
+        command = self._current_schedule.commands[int(self._state.schedule_cursor)]
+        self._state.schedule_cursor += 1
+        self._active_macro_execution = self._start_macro_execution(command=command, current_state=current_state)
+        return True
+
+    def _select_next_command(self, *, artifacts, current_state: dict[str, object]) -> UnityRigDeltaCommand:
+        for _ in range(12):
+            if self._state.phase == EpisodePhase.SUCCEEDED:
+                return UnityRigDeltaCommand(pause_sec=0.0)
+            if self._state.phase == EpisodePhase.SELF_CALIBRATING:
+                if self._active_macro_execution is None and not self._advance_self_calibration(current_state=current_state):
+                    continue
+            elif self._state.phase in {EpisodePhase.PERCEIVE_AND_PLAN, EpisodePhase.REASSESS} or self._current_schedule is None:
+                self._plan_next_schedule(artifacts=artifacts, observation_state=current_state)
+                continue
+            elif self._active_macro_execution is None and not self._start_next_schedule_macro(current_state=current_state):
+                continue
+            next_delta = self._next_microstep_delta_for_active_macro()
+            if next_delta is None:
+                self._finalize_active_macro_execution(current_state=current_state, completed=True, aborted=False)
+                continue
+            return next_delta
+        return UnityRigDeltaCommand(pause_sec=0.25)
+
+    def _plan_next_schedule(self, *, artifacts, observation_state: dict[str, object] | None = None) -> None:
         self._finalize_completed_search(artifacts=artifacts)
-        observation_state = self._observation_state_from_artifacts(artifacts=artifacts)
+        observation_state = observation_state or self._observation_state_from_artifacts(artifacts=artifacts)
         reconstruction_brief = self._reconstruction_brief(observation_state=observation_state)
-        batch_step_limit = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
-        replan_frame_budget = self._replan_frame_budget()
+        max_commands_per_schedule = min(3, max(1, int(getattr(self._config, "sim_action_batch_size", 3))))
+        allowed_command_kinds = (
+            tuple(item.value for item in CommandKind)
+            if self._body_motion_allowed_for_observation_state(observation_state)
+            else (CommandKind.AIM_CAMERA.value, CommandKind.PAUSE.value)
+        )
         depth_map = np.asarray(getattr(artifacts, "depth_map", np.ones((1, 1))), dtype=np.float32)
         context = build_planner_context(
             phase=self._state.phase,
@@ -989,6 +1654,9 @@ class LivingRoomEpisodeRunner:
                 "mesh_triangles": int(reconstruction_brief.mesh_triangle_count),
                 "tracked_points": int(reconstruction_brief.mesh_vertex_count),
                 "mesh_growth_delta": int(reconstruction_brief.mesh_growth_delta),
+                "tracked_feature_count": int(reconstruction_brief.tracked_feature_count),
+                "median_reprojection_error": reconstruction_brief.median_reprojection_error,
+                "initializing_streak_frames": int(observation_state.get("initializing_streak_frames", 0)),
             },
             depth_summary={
                 "min_depth_m": float(np.nanmin(depth_map)),
@@ -1006,16 +1674,24 @@ class LivingRoomEpisodeRunner:
             depth_map=depth_map,
             frame_shape=tuple(np.asarray(getattr(artifacts, "frame_bgr", np.empty((0, 0, 3)))).shape[:2]),
             camera_pose_world=np.asarray(getattr(artifacts, "camera_pose_world", np.empty((0, 0))), dtype=np.float32),
+            camera_intrinsics=observation_state.get("camera_intrinsics"),
+            current_camera_state=self._current_camera_state,
             navigation_affordances=observation_state.get("navigation_affordances"),
             reconstruction_brief=reconstruction_brief,
             recent_action_effects=tuple(self._recent_action_effects),
-            batch_step_limit=batch_step_limit,
-            replan_frame_budget=replan_frame_budget,
-            tracking_safe_limits={
-                primitive.value: self._tracking_safe_step_limit(primitive)
-                for primitive in ActionPrimitive
-                if self._tracking_safe_step_limit(primitive) is not None
+            allowed_command_kinds=allowed_command_kinds,
+            max_commands_per_schedule=max_commands_per_schedule,
+            execution_capabilities={
+                "move_speed_mps": float(self._rig_capabilities.move_speed_mps),
+                "turn_speed_deg_per_sec": float(self._rig_capabilities.turn_speed_deg_per_sec),
+                "camera_yaw_speed_deg_per_sec": float(self._rig_capabilities.camera_yaw_speed_deg_per_sec),
+                "camera_pitch_speed_deg_per_sec": float(self._rig_capabilities.camera_pitch_speed_deg_per_sec),
+                "camera_yaw_limit_deg": float(self._rig_capabilities.camera_yaw_limit_deg),
+                "camera_pitch_limit_deg": float(self._rig_capabilities.camera_pitch_limit_deg),
+                "max_translate_distance_m": 0.72,
+                "max_rotate_body_deg": 36.0,
             },
+            microstep_limits=dict(_DEFAULT_MICROSTEP_LIMITS),
         )
         try:
             try:
@@ -1027,7 +1703,7 @@ class LivingRoomEpisodeRunner:
                 schedule = self._planner.plan(context=context)
         except Exception as exc:
             schedule = ActionSchedule(
-                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                commands=(MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="planner fallback"),),
                 rationale=f"planner unavailable; pause and reassess ({exc})",
                 model="planner_error",
                 issued_at_frame=self._state.frame_index,
@@ -1043,10 +1719,10 @@ class LivingRoomEpisodeRunner:
             )
         self._latest_planner_context = context
         schedule = self._validated_schedule(schedule=schedule, observation_state=observation_state, context=context)
-        truncated_steps = tuple(schedule.steps[:batch_step_limit])
-        if truncated_steps != schedule.steps:
+        truncated_commands = tuple(schedule.commands[:max_commands_per_schedule])
+        if truncated_commands != schedule.commands:
             schedule = ActionSchedule(
-                steps=truncated_steps,
+                commands=truncated_commands,
                 rationale=schedule.rationale,
                 model=schedule.model,
                 issued_at_frame=schedule.issued_at_frame,
@@ -1056,9 +1732,9 @@ class LivingRoomEpisodeRunner:
                 safety_flags=schedule.safety_flags,
                 confidence=schedule.confidence,
             )
-        if not schedule.steps:
+        if not schedule.commands:
             schedule = ActionSchedule(
-                steps=(ActionStep(ActionPrimitive.PAUSE, 0.5),),
+                commands=(MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="empty schedule fallback"),),
                 rationale="planner returned no safe actions; pause and reassess",
                 model=getattr(self._planner, "model", "fallback"),
                 issued_at_frame=self._state.frame_index,
@@ -1084,9 +1760,9 @@ class LivingRoomEpisodeRunner:
         self._current_schedule = schedule
         self._active_schedule_start_frame = int(self._state.frame_index)
         self._active_schedule_start_observation = observation_state
-        self._active_schedule_executed_steps = []
+        self._active_schedule_executed_commands = []
+        self._active_macro_execution = None
         self._state.schedule_cursor = 0
-        self._executed_schedule_steps = 0
         self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
         self._state.planner_turn_count += 1
         self._planner_turn_logs.append(
@@ -1117,69 +1793,13 @@ class LivingRoomEpisodeRunner:
                         "replan_reason": schedule.safety_flags.replan_reason,
                     },
                     "confidence": schedule.confidence,
-                    "steps": [
-                        {"primitive": step.primitive.value, "value": step.value, "intent": step.intent}
-                        for step in schedule.steps
+                    "commands": [
+                        self._serialize_motion_command(command)
+                        for command in schedule.commands
                     ],
                 },
             }
         )
-
-    def _consume_schedule_step(self) -> ActionStep:
-        step = self._next_tracking_safe_step()
-        if step is None:
-            self._current_schedule = None
-            self._executed_schedule_steps = 0
-            self._state.phase = EpisodePhase.REASSESS
-            return ActionStep(ActionPrimitive.PAUSE, 0.5)
-        self._active_schedule_executed_steps.append(self._format_action_step(step))
-        self._executed_schedule_steps += 1
-        max_schedule_steps = max(1, int(getattr(self._config, "sim_action_batch_size", 1)))
-        replan_frame_budget = self._replan_frame_budget()
-        if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
-            self._current_schedule = None
-            self._executed_schedule_steps = 0
-            self._state.phase = EpisodePhase.REASSESS
-        elif self._executed_schedule_steps >= max_schedule_steps:
-            self._current_schedule = None
-            self._state.schedule_cursor = 0
-            self._executed_schedule_steps = 0
-            self._state.phase = EpisodePhase.REASSESS
-        elif self._executed_schedule_steps >= replan_frame_budget:
-            self._current_schedule = None
-            self._state.schedule_cursor = 0
-            self._executed_schedule_steps = 0
-            self._state.phase = EpisodePhase.REASSESS
-        else:
-            self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
-        return step
-
-    def _next_tracking_safe_step(self) -> ActionStep | None:
-        if self._current_schedule is None or self._state.schedule_cursor >= len(self._current_schedule.steps):
-            return None
-        cursor = int(self._state.schedule_cursor)
-        step = self._current_schedule.steps[cursor]
-        limit = self._tracking_safe_step_limit(step.primitive)
-        if limit is None or abs(float(step.value)) <= limit + 1e-9:
-            self._state.schedule_cursor += 1
-            return step
-
-        chunk_value = math.copysign(limit, float(step.value))
-        residual_value = float(step.value) - chunk_value
-        updated_steps = list(self._current_schedule.steps)
-        updated_steps[cursor] = ActionStep(step.primitive, residual_value, intent=step.intent)
-        self._current_schedule = ActionSchedule(
-            steps=tuple(updated_steps),
-            rationale=self._current_schedule.rationale,
-            model=self._current_schedule.model,
-            issued_at_frame=self._current_schedule.issued_at_frame,
-            situation_summary=self._current_schedule.situation_summary,
-            behavior_mode=self._current_schedule.behavior_mode,
-            goal_hypothesis=self._current_schedule.goal_hypothesis,
-            safety_flags=self._current_schedule.safety_flags,
-            confidence=self._current_schedule.confidence,
-        )
-        return ActionStep(step.primitive, chunk_value, intent=step.intent)
 
     def _write_selfcalibration_artifact(self) -> None:
         payload = {
@@ -1257,6 +1877,7 @@ class LivingRoomEpisodeRunner:
 
     def _commit_sensor_frame(self, sensor_frame: SensorFrame) -> None:
         self._latest_sensor_frame = sensor_frame
+        self._rig_capabilities = rig_capabilities_from_metadata(sensor_frame.metadata) or self._rig_capabilities
         self._state.frame_index += 1
         self._state.elapsed_sec += 1.0 / max(self._camera_rig.fps, 1e-6)
         self._write_selfcalibration_artifact()

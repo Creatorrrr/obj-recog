@@ -84,6 +84,8 @@ class FrameArtifacts:
     loop_closure_applied: bool
     segmentation_overlay_bgr: np.ndarray
     segments: list[PanopticSegment]
+    tracked_feature_count: int = 0
+    median_reprojection_error: float | None = None
     depth_diagnostics: DepthDiagnostics | None = None
     perception_diagnostics: PerceptionDiagnostics | None = None
     scene_graph_snapshot: SceneGraphSnapshot | None = None

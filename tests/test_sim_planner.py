@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
+from obj_recog.reconstruct import intrinsics_for_frame
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context, planner_prompt_from_context
-from obj_recog.sim_protocol import EpisodePhase, PlannerActionEffectSummary, PlannerSearchOutcome
+from obj_recog.sim_protocol import (
+    CommandKind,
+    EpisodePhase,
+    PlannerActionEffectSummary,
+    PlannerCameraState,
+    PlannerSearchOutcome,
+)
 from obj_recog.types import Detection, PanopticSegment
 
 
@@ -83,7 +92,7 @@ def test_planner_context_redacts_hidden_pose_and_unseen_authored_objects() -> No
         ),
         reconstruction_summary={"mesh_vertices": 1200, "tracked_points": 480},
         depth_summary={"min_depth_m": 0.6, "median_depth_m": 1.8},
-        recent_actions=("turn_left:15",),
+        recent_actions=("rotate_body:left:angle_deg:15.00",),
         calibration_status="converged",
         tracking_status="TRACKING",
     )
@@ -95,129 +104,136 @@ def test_planner_context_redacts_hidden_pose_and_unseen_authored_objects() -> No
     assert '"sofa"' in prompt
 
 
-def test_planner_context_includes_visible_graph_nodes_once_they_are_seen() -> None:
-    edge = GraphEdge(
-        source="ego",
-        target="chair-1",
-        relation="front-right-of",
-        confidence=0.88,
-        last_updated_frame=8,
-        distance_bucket="mid",
-        source_kind="detection",
-    )
+def test_planner_context_includes_relative_xyz_camera_state_and_coordinate_convention() -> None:
     context = build_planner_context(
         phase=EpisodePhase.REASSESS,
-        frame_index=11,
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(
-            nodes=(
-                _ego_node(),
-                _node(node_id="chair-1", label="chair", last_seen_direction="front-right"),
-            ),
-            visible_node_ids=("ego", "chair-1"),
-            edges=(edge,),
-        ),
-        reconstruction_summary={"mesh_vertices": 2200, "tracked_points": 980},
-        depth_summary={"min_depth_m": 0.7, "median_depth_m": 2.1},
-        recent_actions=("move_forward:0.5",),
-        calibration_status="converged",
-        tracking_status="TRACKING",
-    )
-    prompt = planner_prompt_from_context(context)
-
-    assert 'ego->front-right-of->chair-1' in prompt
-
-
-def test_planner_context_uses_scene_specific_goal_description() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.PERCEIVE_AND_PLAN,
-        frame_index=13,
-        goal_description="Reach the front position of the TV using only current visible evidence.",
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
-        reconstruction_summary={"mesh_vertices": 640, "tracked_points": 220},
-        depth_summary={"min_depth_m": 0.9, "median_depth_m": 2.6},
-        recent_actions=("turn_right:12",),
-        calibration_status="converged",
-        tracking_status="TRACKING",
-    )
-
-    assert context.goal_description == "Reach the front position of the TV using only current visible evidence."
-
-
-def test_planner_context_places_nonvisible_target_only_in_memory() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=14,
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(
-            nodes=(
-                _ego_node(),
-                _node(
-                    node_id="tv-1",
-                    label="tv_panel",
-                    state="occluded",
-                    last_seen_frame=12,
-                    last_seen_direction="front-right",
-                ),
-            ),
-            visible_node_ids=("ego",),
-        ),
-        reconstruction_summary={"mesh_vertices": 1500, "tracked_points": 520},
-        depth_summary={"min_depth_m": 0.8, "median_depth_m": 2.0},
-        recent_actions=("turn_left:6",),
-        target_label="tv_panel",
-        calibration_status="converged",
-        tracking_status="TRACKING",
-    )
-    prompt = planner_prompt_from_context(context)
-
-    assert context.perception.visible_detections == ()
-    assert context.memory.target_memory is not None
-    assert context.memory.target_memory.label == "tv_panel"
-    assert context.memory.target_memory.state == "occluded"
-    assert context.memory.target_memory.age_frames == 2
-    assert context.goal_estimate.status == "remembered"
-    assert '"target_memory"' in prompt
-    assert '"visible_detections": []' in prompt
-
-
-def test_planner_context_uses_current_target_visibility_over_memory() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=14,
+        frame_index=18,
         detections=[
             Detection(
-                xyxy=(2, 1, 12, 10),
+                xyxy=(1, 1, 7, 8),
                 class_id=1,
-                label="tv_panel",
-                confidence=0.91,
-                color=(255, 0, 0),
+                label="chair",
+                confidence=0.84,
+                color=(255, 255, 0),
             )
         ],
-        scene_graph_snapshot=_graph_snapshot(
-            nodes=(
-                _ego_node(),
-                _node(
-                    node_id="tv-1",
-                    label="tv_panel",
-                    state="occluded",
-                    last_seen_frame=12,
-                    last_seen_direction="left",
-                ),
+        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
+        reconstruction_summary={"mesh_vertices": 1200, "tracked_points": 900, "mesh_triangles": 340},
+        depth_summary={"min_depth_m": 0.7, "median_depth_m": 1.8},
+        recent_actions=("translate:forward:distance_m:0.12",),
+        calibration_status="converged",
+        tracking_status="TRACKING",
+        depth_map=np.full((10, 10), 1.8, dtype=np.float32),
+        frame_shape=(10, 10),
+        camera_intrinsics=intrinsics_for_frame(10, 10),
+        current_camera_state=PlannerCameraState(yaw_deg=-12.0, pitch_deg=6.0),
+        segments=(
+            PanopticSegment(
+                segment_id=1,
+                label_id=1,
+                label="floor",
+                color_rgb=(0, 255, 0),
+                mask=np.ones((10, 10), dtype=bool),
+                area_pixels=100,
             ),
-            visible_node_ids=("ego",),
         ),
-        reconstruction_summary={"mesh_vertices": 1500, "tracked_points": 520},
-        depth_summary={"min_depth_m": 0.8, "median_depth_m": 2.0},
-        recent_actions=("turn_left:6",),
-        target_label="tv_panel",
+    )
+    prompt_payload = json.loads(planner_prompt_from_context(context))
+
+    assert context.perception.objects
+    assert context.perception.objects[0].relative_xyz is not None
+    assert prompt_payload["coordinate_convention"]["camera_frame"] == {
+        "x": "right",
+        "y": "up",
+        "z": "forward",
+    }
+    assert prompt_payload["robot_state"]["current_camera_state"] == {
+        "yaw_deg": -12.0,
+        "pitch_deg": 6.0,
+    }
+    assert prompt_payload["objects"][0]["relative_xyz"] is not None
+
+
+def test_planner_context_serializes_recent_searches_and_aborted_macro_effects() -> None:
+    context = build_planner_context(
+        phase=EpisodePhase.REASSESS,
+        frame_index=17,
+        detections=[],
+        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
+        reconstruction_summary={"mesh_vertices": 800, "tracked_points": 300},
+        depth_summary={"min_depth_m": 0.7, "median_depth_m": 1.7},
+        recent_actions=("rotate_body:left:angle_deg:6.00",),
+        recent_searches=(
+            PlannerSearchOutcome(
+                start_frame=10,
+                end_frame=13,
+                executed_actions=(
+                    "rotate_body:left:angle_deg:6.00",
+                    "translate:forward:distance_m:0.12",
+                ),
+                target_visible_after_search=False,
+                tracking_status="TRACKING",
+            ),
+        ),
+        recent_action_effects=(
+            PlannerActionEffectSummary(
+                action="translate:forward:distance_m:0.12",
+                estimated_motion="translation=0.00m",
+                clearance_change="forward:stable",
+                target_evidence_change="none",
+                likely_blocked=True,
+                aborted=True,
+            ),
+        ),
         calibration_status="converged",
         tracking_status="TRACKING",
     )
+    prompt_payload = json.loads(planner_prompt_from_context(context))
 
-    assert context.perception.visible_detections == ("tv_panel",)
-    assert context.memory.target_memory is None
+    assert prompt_payload["recent_searches"][0]["executed_actions"] == [
+        "rotate_body:left:angle_deg:6.00",
+        "translate:forward:distance_m:0.12",
+    ]
+    assert prompt_payload["robot_state"]["recent_action_effects"][0]["aborted"] is True
+    assert prompt_payload["robot_state"]["recent_action_effects"][0]["likely_blocked"] is True
+
+
+def test_planner_context_uses_command_constraints() -> None:
+    context = build_planner_context(
+        phase=EpisodePhase.REASSESS,
+        frame_index=12,
+        detections=[],
+        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
+        reconstruction_summary={"mesh_vertices": 400, "tracked_points": 200},
+        depth_summary={"min_depth_m": 0.8, "median_depth_m": 1.9},
+        recent_actions=(),
+        calibration_status="converged",
+        tracking_status="TRACKING",
+        max_commands_per_schedule=2,
+        execution_capabilities={
+            "move_speed_mps": 1.6,
+            "turn_speed_deg_per_sec": 100.0,
+            "camera_yaw_speed_deg_per_sec": 90.0,
+            "camera_pitch_speed_deg_per_sec": 90.0,
+            "camera_yaw_limit_deg": 70.0,
+            "camera_pitch_limit_deg": 55.0,
+            "max_translate_distance_m": 0.72,
+            "max_rotate_body_deg": 36.0,
+        },
+        microstep_limits={
+            "translate_distance_m": 0.08,
+            "body_yaw_deg": 4.0,
+            "camera_yaw_deg": 4.0,
+            "camera_pitch_deg": 4.0,
+        },
+    )
+    prompt_payload = json.loads(planner_prompt_from_context(context))
+
+    assert context.constraints.allowed_command_kinds == tuple(item.value for item in CommandKind)
+    assert context.constraints.max_commands_per_schedule == 2
+    assert prompt_payload["constraints"]["allowed_command_kinds"] == [item.value for item in CommandKind]
+    assert prompt_payload["constraints"]["max_commands_per_schedule"] == 2
+    assert "absolute yaw/pitch setpoints" in " ".join(context.constraints.notes)
 
 
 def test_planner_context_includes_target_detection_summary_when_target_is_visible() -> None:
@@ -236,7 +252,7 @@ def test_planner_context_includes_target_detection_summary_when_target_is_visibl
         scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
         reconstruction_summary={"mesh_vertices": 1500, "tracked_points": 520},
         depth_summary={"min_depth_m": 0.8, "median_depth_m": 2.0},
-        recent_actions=("turn_left:6",),
+        recent_actions=("rotate_body:left:angle_deg:6.00",),
         target_label="tv_panel",
         calibration_status="converged",
         tracking_status="TRACKING",
@@ -247,262 +263,18 @@ def test_planner_context_includes_target_detection_summary_when_target_is_visibl
             "center_offset_ratio": 0.08,
             "horizontal_position": "center",
             "median_depth_m": 1.9,
+            "relative_xyz": (0.1, -0.2, 1.9),
+            "center_ray_xyz": (0.1, -0.2, 1.9),
         },
     )
-    prompt = planner_prompt_from_context(context)
+    prompt_payload = json.loads(planner_prompt_from_context(context))
 
     assert context.perception.target_detection is not None
-    assert context.perception.target_detection["horizontal_position"] == "center"
-    assert '"target_detection"' in prompt
-    assert '"median_depth_m": 1.9' in prompt
+    assert prompt_payload["target_detection"]["relative_xyz"] == [0.1, -0.2, 1.9]
+    assert prompt_payload["target_detection"]["center_ray_xyz"] == [0.1, -0.2, 1.9]
 
 
-def test_planner_context_excludes_floor_and_ceiling_from_nonvisible_memory() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=10,
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(
-            nodes=(
-                _ego_node(),
-                _node(node_id="seg-floor-1", label="floor", node_type="segment", state="occluded", last_seen_frame=9),
-                _node(node_id="seg-wall-1", label="wall", node_type="segment", state="occluded", last_seen_frame=9),
-                _node(node_id="seg-ceiling-1", label="ceiling", node_type="segment", state="lost", last_seen_frame=8),
-            ),
-            visible_node_ids=("ego",),
-        ),
-        reconstruction_summary={"mesh_vertices": 300, "tracked_points": 120},
-        depth_summary={"min_depth_m": 0.5, "median_depth_m": 1.2},
-        recent_actions=(),
-        calibration_status="converged",
-        tracking_status="TRACKING",
-    )
-
-    assert [item.label for item in context.memory.nonvisible_observations] == ["wall"]
-
-
-def test_planner_context_serializes_recent_searches_without_raw_rationale() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=17,
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
-        reconstruction_summary={"mesh_vertices": 800, "tracked_points": 300},
-        depth_summary={"min_depth_m": 0.7, "median_depth_m": 1.7},
-        recent_actions=("turn_right:6",),
-        recent_searches=(
-            PlannerSearchOutcome(
-                start_frame=10,
-                end_frame=13,
-                executed_actions=("turn_left:6", "move_forward:0.12"),
-                target_visible_after_search=False,
-                tracking_status="TRACKING",
-            ),
-        ),
-        calibration_status="converged",
-        tracking_status="TRACKING",
-    )
-    prompt = planner_prompt_from_context(context)
-
-    assert '"recent_searches"' in prompt
-    assert '"executed_actions": ["turn_left:6", "move_forward:0.12"]' in prompt
-    assert '"target_visible_after_search": false' in prompt
-    assert '"rationale"' not in prompt
-
-
-def test_planner_context_serializes_structured_navigation_sections() -> None:
-    mask = np.ones((10, 10), dtype=bool)
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=18,
-        detections=[
-            Detection(
-                xyxy=(1, 1, 7, 8),
-                class_id=1,
-                label="chair",
-                confidence=0.84,
-                color=(255, 255, 0),
-            )
-        ],
-        scene_graph_snapshot=_graph_snapshot(
-            nodes=(
-                _ego_node(),
-                _node(node_id="chair-1", label="chair", last_seen_direction="front-left"),
-            ),
-            visible_node_ids=("ego", "chair-1"),
-            edges=(
-                GraphEdge(
-                    source="ego",
-                    target="chair-1",
-                    relation="front-left",
-                    confidence=0.91,
-                    last_updated_frame=18,
-                    distance_bucket="mid",
-                    source_kind="detection",
-                ),
-            ),
-        ),
-        reconstruction_summary={"mesh_vertices": 1200, "tracked_points": 900, "mesh_triangles": 340},
-        depth_summary={"min_depth_m": 0.7, "median_depth_m": 1.8},
-        recent_actions=("turn_left:6", "move_forward:0.12"),
-        calibration_status="converged",
-        tracking_status="TRACKING",
-        depth_map=np.full((10, 10), 1.8, dtype=np.float32),
-        frame_shape=(10, 10),
-        segments=(
-            PanopticSegment(
-                segment_id=1,
-                label_id=1,
-                label="floor",
-                color_rgb=(0, 255, 0),
-                mask=mask,
-                area_pixels=int(mask.sum()),
-            ),
-        ),
-        recent_action_effects=(
-            PlannerActionEffectSummary(
-                action="move_forward:0.12",
-                estimated_motion="translation=0.10m",
-                clearance_change="forward:+0.12m",
-                target_evidence_change="none",
-                likely_blocked=False,
-            ),
-        ),
-        batch_step_limit=3,
-        replan_frame_budget=6,
-    )
-    prompt = planner_prompt_from_context(context)
-
-    assert context.perception.objects
-    assert context.perception.objects[0].depth_m == pytest.approx(1.8)
-    assert context.perception.structural_segments[0].label == "floor"
-    assert context.perception.navigation_affordances is not None
-    assert context.constraints.batch_step_limit == 3
-    assert context.recent_action_effects[0].action == "move_forward:0.12"
-    assert '"objects"' in prompt
-    assert '"segments"' in prompt
-    assert '"navigation_affordances"' in prompt
-    assert '"recent_action_effects"' in prompt
-    assert '"constraints"' in prompt
-
-
-def test_planner_context_goal_estimate_status_visible() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=12,
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
-        reconstruction_summary={"mesh_vertices": 400, "tracked_points": 200},
-        depth_summary={"min_depth_m": 0.8, "median_depth_m": 1.9},
-        recent_actions=(),
-        target_label="tv_panel",
-        calibration_status="converged",
-        tracking_status="TRACKING",
-        target_detection={"label": "tv_panel", "horizontal_position": "right", "median_depth_m": 2.1},
-    )
-
-    assert context.goal_estimate.status == "visible"
-    assert context.goal_estimate.bearing_hint == "right"
-
-
-def test_planner_context_goal_estimate_status_inferred_for_tv_cues() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=12,
-        detections=[
-            Detection(
-                xyxy=(1, 1, 7, 8),
-                class_id=1,
-                label="sofa",
-                confidence=0.92,
-                color=(255, 0, 0),
-            )
-        ],
-        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
-        reconstruction_summary={"mesh_vertices": 600, "tracked_points": 300},
-        depth_summary={"min_depth_m": 0.8, "median_depth_m": 2.1},
-        recent_actions=(),
-        target_label="tv_panel",
-        calibration_status="converged",
-        tracking_status="TRACKING",
-        depth_map=np.full((10, 10), 2.2, dtype=np.float32),
-        frame_shape=(10, 10),
-        segments=(
-            PanopticSegment(
-                segment_id=1,
-                label_id=1,
-                label="wall",
-                color_rgb=(255, 255, 255),
-                mask=np.ones((10, 10), dtype=bool),
-                area_pixels=100,
-            ),
-        ),
-    )
-
-    assert context.goal_estimate.status == "inferred"
-    assert "object:sofa" in context.goal_estimate.evidence_sources
-
-
-def test_planner_context_goal_estimate_status_unknown_without_target_cues() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=12,
-        detections=[],
-        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
-        reconstruction_summary={"mesh_vertices": 200, "tracked_points": 80},
-        depth_summary={"min_depth_m": 0.9, "median_depth_m": 2.8},
-        recent_actions=(),
-        target_label="lamp",
-        calibration_status="converged",
-        tracking_status="TRACKING",
-        depth_map=np.full((10, 10), 2.8, dtype=np.float32),
-        frame_shape=(10, 10),
-    )
-
-    assert context.goal_estimate.status == "unknown"
-
-
-def test_planner_context_serializes_canonical_world_state_sections() -> None:
-    context = build_planner_context(
-        phase=EpisodePhase.REASSESS,
-        frame_index=22,
-        detections=[
-            Detection(
-                xyxy=(1, 1, 7, 8),
-                class_id=1,
-                label="tv_panel",
-                confidence=0.95,
-                color=(255, 0, 0),
-            )
-        ],
-        scene_graph_snapshot=_graph_snapshot(
-            nodes=(
-                _ego_node(),
-                _node(node_id="tv-1", label="tv_panel", last_seen_direction="front"),
-            ),
-            visible_node_ids=("ego", "tv-1"),
-        ),
-        reconstruction_summary={"mesh_vertices": 900, "tracked_points": 540, "mesh_triangles": 180},
-        depth_summary={"min_depth_m": 0.7, "median_depth_m": 1.9},
-        recent_actions=("turn_left:6",),
-        target_label="tv_panel",
-        calibration_status="converged",
-        tracking_status="TRACKING",
-        target_detection={"label": "tv_panel", "horizontal_position": "front", "median_depth_m": 1.9},
-        depth_map=np.full((10, 10), 1.9, dtype=np.float32),
-        frame_shape=(10, 10),
-    )
-    prompt = planner_prompt_from_context(context)
-
-    assert '"image_metadata"' in prompt
-    assert '"robot_state"' in prompt
-    assert '"goal"' in prompt
-    assert '"scene_graph"' in prompt
-    assert '"navigation_map"' in prompt
-    assert '"target_hypotheses"' in prompt
-
-
-def test_openai_planner_sends_rgb_image_and_parses_structured_response() -> None:
+def test_openai_planner_sends_rgb_image_and_parses_structured_commands() -> None:
     class _FakeResponses:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
@@ -516,10 +288,12 @@ def test_openai_planner_sends_rgb_image_and_parses_structured_response() -> None
                     "output_text": (
                         '{"situation_summary":"Target visible ahead.","goal_hypothesis":{"status":"visible",'
                         '"bearing_hint":"front","distance_hint":"1.8m","evidence":["target_detection"],'
-                        '"confidence":0.94},"behavior_mode":"approach","steps":[{"primitive":"move_forward",'
-                        '"value":0.12,"intent":"close distance"}],"safety_flags":{"front_blocked":false,'
-                        '"dead_end_risk":0.1,"tracking_risk":"low","replan_reason":"target_visible"},'
-                        '"confidence":0.91}'
+                        '"confidence":0.94},"behavior_mode":"approach","commands":['
+                        '{"kind":"rotate_body","direction":"left","mode":"angle_deg","value":18.0,"intent":"face target"},'
+                        '{"kind":"aim_camera","yaw_deg":-12.0,"pitch_deg":6.0,"intent":"center view"},'
+                        '{"kind":"translate","direction":"forward","mode":"distance_m","value":0.36,"intent":"close distance"}],'
+                        '"safety_flags":{"front_blocked":false,"dead_end_risk":0.1,"tracking_risk":"low",'
+                        '"replan_reason":"target_visible"},"confidence":0.91}'
                     )
                 },
             )()
@@ -550,4 +324,11 @@ def test_openai_planner_sends_rgb_image_and_parses_structured_response() -> None
     assert schedule.behavior_mode == "approach"
     assert schedule.goal_hypothesis is not None
     assert schedule.goal_hypothesis.status == "visible"
-    assert schedule.steps[0].intent == "close distance"
+    assert [command.kind for command in schedule.commands] == [
+        CommandKind.ROTATE_BODY,
+        CommandKind.AIM_CAMERA,
+        CommandKind.TRANSLATE,
+    ]
+    assert schedule.commands[0].intent == "face target"
+    assert schedule.commands[1].yaw_deg == pytest.approx(-12.0)
+    assert schedule.commands[2].value == pytest.approx(0.36)

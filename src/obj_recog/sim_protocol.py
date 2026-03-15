@@ -7,16 +7,29 @@ from typing import Any
 import numpy as np
 
 
-class ActionPrimitive(str, Enum):
-    MOVE_FORWARD = "move_forward"
-    MOVE_BACKWARD = "move_backward"
-    STRAFE_LEFT = "strafe_left"
-    STRAFE_RIGHT = "strafe_right"
-    TURN_LEFT = "turn_left"
-    TURN_RIGHT = "turn_right"
-    CAMERA_PAN_LEFT = "camera_pan_left"
-    CAMERA_PAN_RIGHT = "camera_pan_right"
+class CommandKind(str, Enum):
+    TRANSLATE = "translate"
+    ROTATE_BODY = "rotate_body"
+    AIM_CAMERA = "aim_camera"
     PAUSE = "pause"
+
+
+class TranslationDirection(str, Enum):
+    FORWARD = "forward"
+    BACKWARD = "backward"
+    LEFT = "left"
+    RIGHT = "right"
+
+
+class RotationDirection(str, Enum):
+    LEFT = "left"
+    RIGHT = "right"
+
+
+class CommandValueMode(str, Enum):
+    DISTANCE_M = "distance_m"
+    HOLD_SEC = "hold_sec"
+    ANGLE_DEG = "angle_deg"
 
 
 class EpisodePhase(str, Enum):
@@ -35,6 +48,7 @@ class RobotPose:
     z: float
     yaw_deg: float
     camera_pan_deg: float = 0.0
+    camera_pitch_deg: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +186,8 @@ class PlannerReconstructionBrief:
     explored_directions: tuple[str, ...] = ()
     unexplored_directions: tuple[str, ...] = ()
     recently_failed_directions: tuple[str, ...] = ()
+    tracked_feature_count: int = 0
+    median_reprojection_error: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,14 +206,15 @@ class PlannerActionEffectSummary:
     clearance_change: str
     target_evidence_change: str
     likely_blocked: bool
+    aborted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class PlannerConstraintSummary:
-    allowed_primitives: tuple[str, ...]
-    tracking_safe_limits: dict[str, float]
-    batch_step_limit: int
-    replan_frame_budget: int
+    allowed_command_kinds: tuple[str, ...]
+    execution_capabilities: dict[str, float]
+    microstep_limits: dict[str, float]
+    max_commands_per_schedule: int
     notes: tuple[str, ...]
 
 
@@ -207,6 +224,12 @@ class PlannerSafetyFlags:
     dead_end_risk: float
     tracking_risk: str
     replan_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerCameraState:
+    yaw_deg: float
+    pitch_deg: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +249,7 @@ class PerceptionSnapshot:
     frame_size: tuple[int, int] = (0, 0)
     scene_nodes: tuple[PlannerSceneNodeObservation, ...] = ()
     scene_edges: tuple[PlannerSceneEdgeObservation, ...] = ()
+    current_camera_state: PlannerCameraState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,21 +297,53 @@ class PlannerContext:
 
 
 @dataclass(frozen=True, slots=True)
-class ActionStep:
-    primitive: ActionPrimitive
-    value: float
+class MotionCommand:
+    kind: CommandKind
+    intent: str = ""
+    direction: str | None = None
+    mode: str | None = None
+    value: float | None = None
+    yaw_deg: float | None = None
+    pitch_deg: float | None = None
+    duration_sec: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UnityRigDeltaCommand:
+    translate_forward_m: float = 0.0
+    translate_right_m: float = 0.0
+    body_yaw_deg: float = 0.0
+    camera_yaw_delta_deg: float = 0.0
+    camera_pitch_delta_deg: float = 0.0
+    pause_sec: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class RigCapabilities:
+    move_speed_mps: float
+    turn_speed_deg_per_sec: float
+    camera_yaw_speed_deg_per_sec: float
+    camera_pitch_speed_deg_per_sec: float
+    camera_yaw_limit_deg: float
+    camera_pitch_limit_deg: float
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutedMacroCommand:
+    command: MotionCommand
+    measured_translation_m: float | None
+    measured_yaw_deg: float | None
+    completed: bool
+    aborted: bool
+    microstep_count: int
+    target_evidence_change: str
+    pose_progress_m: float | None = None
     intent: str = ""
 
 
 @dataclass(frozen=True, slots=True)
-class UnityActionCommand:
-    primitive: ActionPrimitive
-    value: float
-
-
-@dataclass(frozen=True, slots=True)
 class ActionSchedule:
-    steps: tuple[ActionStep, ...]
+    commands: tuple[MotionCommand, ...]
     rationale: str
     model: str
     issued_at_frame: int

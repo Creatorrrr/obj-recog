@@ -17,8 +17,12 @@ namespace ObjRecog.UnitySim
         {
             public string kind = string.Empty;
             public string scenario_id = string.Empty;
-            public string primitive = string.Empty;
-            public float value = 0.0f;
+            public float translate_forward_m = 0.0f;
+            public float translate_right_m = 0.0f;
+            public float body_yaw_deg = 0.0f;
+            public float camera_yaw_delta_deg = 0.0f;
+            public float camera_pitch_delta_deg = 0.0f;
+            public float pause_sec = 0.0f;
         }
 
         [Serializable]
@@ -28,6 +32,12 @@ namespace ObjRecog.UnitySim
             public float timestamp_sec = 0.0f;
             public string image_encoding = "png";
             public string image_bytes_b64 = string.Empty;
+            public float move_speed_mps = 0.0f;
+            public float turn_speed_deg_per_sec = 0.0f;
+            public float camera_yaw_speed_deg_per_sec = 0.0f;
+            public float camera_pitch_speed_deg_per_sec = 0.0f;
+            public float camera_yaw_limit_deg = 0.0f;
+            public float camera_pitch_limit_deg = 0.0f;
         }
 
         [SerializeField] private string host = "127.0.0.1";
@@ -201,8 +211,15 @@ namespace ObjRecog.UnitySim
                 case "reset_episode":
                     sessionState.ResetEpisode();
                     return CaptureFrameEnvelope();
-                case "action":
-                    robotRig.ApplyCommand(request.primitive, request.value);
+                case "rig_delta":
+                    robotRig.ApplyRigDelta(
+                        request.translate_forward_m,
+                        request.translate_right_m,
+                        request.body_yaw_deg,
+                        request.camera_yaw_delta_deg,
+                        request.camera_pitch_delta_deg,
+                        request.pause_sec
+                    );
                     return CaptureFrameEnvelope();
                 default:
                     throw new InvalidOperationException("Unsupported request kind: " + request.kind);
@@ -215,6 +232,12 @@ namespace ObjRecog.UnitySim
             {
                 timestamp_sec = Time.time,
                 image_bytes_b64 = Convert.ToBase64String(robotRig.CapturePng()),
+                move_speed_mps = robotRig.MoveSpeedMps,
+                turn_speed_deg_per_sec = robotRig.TurnSpeedDegPerSec,
+                camera_yaw_speed_deg_per_sec = robotRig.CameraYawSpeedDegPerSec,
+                camera_pitch_speed_deg_per_sec = robotRig.CameraPitchSpeedDegPerSec,
+                camera_yaw_limit_deg = robotRig.CameraYawLimitDeg,
+                camera_pitch_limit_deg = robotRig.CameraPitchLimitDeg,
             };
             return JsonUtility.ToJson(payload);
         }

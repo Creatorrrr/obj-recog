@@ -8,21 +8,23 @@ from typing import Iterable
 
 import numpy as np
 
+from obj_recog.reconstruct import CameraIntrinsics, back_project_pixels
 from obj_recog.scene_graph import GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import (
-    ActionPrimitive,
     ActionSchedule,
-    ActionStep,
+    CommandKind,
     EpisodePhase,
+    MotionCommand,
     PerceptionSnapshot,
     PlannerActionEffectSummary,
+    PlannerCameraState,
     PlannerConstraintSummary,
     PlannerContext,
-    PlannerNavigationSectorObservation,
     PlannerGoalEstimate,
     PlannerMemoryObservation,
     PlannerMemorySnapshot,
     PlannerNavigationAffordances,
+    PlannerNavigationSectorObservation,
     PlannerObjectObservation,
     PlannerReconstructionBrief,
     PlannerSafetyFlags,
@@ -36,27 +38,34 @@ from obj_recog.types import Detection, PanopticSegment
 
 _PLANNER_SYSTEM_INSTRUCTIONS = (
     "You are a multimodal navigation planner for a wheeled indoor robot operating from the current egocentric RGB image, "
-    "depth-derived navigation sectors, segmentation summaries, scene-graph memory, and short-term action history. "
+    "depth-derived navigation sectors, segmentation summaries, scene-graph memory, current camera yaw/pitch state, "
+    "camera-frame 3D object coordinates, and short-term action history. "
     "Return JSON only. "
     "Use only planner-visible evidence from the prompt. Never invent hidden coordinates, authored scene truth, "
     "or unseen furniture. "
-    "Allowed primitives: "
-    + ", ".join(item.value for item in ActionPrimitive)
+    "Allowed command kinds: "
+    + ", ".join(item.value for item in CommandKind)
     + ". "
+    "Use the coordinate convention camera-frame = +x right, +y up, +z forward. "
+    "For aim_camera, yaw_deg > 0 means right, yaw_deg < 0 means left, pitch_deg > 0 means up, pitch_deg < 0 means down. "
+    "aim_camera sets an absolute camera yaw/pitch target, not a relative pan. "
+    "rotate_body is always relative body yaw, and translate is always relative body-frame motion. "
     "Behavior modes: "
     "If goal_hypothesis.status is visible, center the target first and then approach it. "
-    "Do not mix opposing left/right turns or camera pans in the same batch unless the target is already centered. "
+    "Do not mix opposing body rotations or contradictory camera aims in the same batch. "
     "If goal_hypothesis.status is remembered, search using the remembered bearing and avoid repeating a recently "
     "failed batch when better options exist. "
     "If goal_hypothesis.status is inferred, infer promising target regions from visible cues such as chairs, sofas, "
-    "walls, consoles, shelves, cabinets, open floor, and visible relations. "
+    "walls, consoles, shelves, cabinets, open floor, visible relations, and relative_xyz. "
     "If recent_action_effects or navigation_map indicate blockage, dead end, or no progress, switch to "
-    "escape mode: include backward or strafe motion plus turn and camera pan, and do not repeat pure forward pushes. "
-    "Favor short committed batches of 2 to 4 low-level actions over oscillating. "
-    "Use camera pans to confirm visibility, but pair them with translation or heading change when recent pure scans failed. "
-    "Respect constraints.allowed_primitives and constraints.tracking_safe_limits. "
-    "Output keys must be exactly situation_summary, goal_hypothesis, behavior_mode, steps, safety_flags, confidence. "
-    "Each step must include primitive, value, and intent."
+    "escape mode: include translation or rotation plus camera aim, and do not repeat pure forward pushes. "
+    "Return at most 3 commands. Favor committed batches over oscillating. "
+    "Use aim_camera to set a clear yaw/pitch target, and pair scanning with viewpoint change when recent pure scans failed. "
+    "Respect constraints.allowed_command_kinds, constraints.execution_capabilities, constraints.microstep_limits, "
+    "and constraints.max_commands_per_schedule. "
+    "Output keys must be exactly situation_summary, goal_hypothesis, behavior_mode, commands, safety_flags, confidence. "
+    "Each command must include kind and intent, with translate/rotate_body using direction+mode+value, "
+    "aim_camera using yaw_deg+pitch_deg, and pause using duration_sec."
 )
 
 _TV_CUE_LABELS = {
@@ -241,6 +250,23 @@ def _relative_xyz(
     return tuple(round(float(value), 3) for value in camera_xyz[:3])
 
 
+def _bbox_relative_xyz(
+    *,
+    depth_map: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None,
+    xyxy: tuple[int, int, int, int],
+) -> tuple[float, float, float] | None:
+    depth_m = _bbox_depth_m(depth_map, xyxy)
+    if depth_m is None or intrinsics is None:
+        return None
+    x1, y1, x2, y2 = (int(value) for value in xyxy)
+    center_xy = np.asarray([[(x1 + x2) * 0.5, (y1 + y2) * 0.5]], dtype=np.float32)
+    center_xyz = back_project_pixels(center_xy, np.asarray([depth_m], dtype=np.float32), intrinsics)
+    if center_xyz.shape != (1, 3):
+        return None
+    return tuple(round(float(value), 3) for value in center_xyz[0])
+
+
 def _direction_from_center(center_x_ratio: float) -> str:
     if center_x_ratio <= 0.18:
         return "left"
@@ -270,6 +296,7 @@ def _object_observations_from_detections(
     detections: Iterable[Detection],
     depth_map: np.ndarray | None,
     frame_shape: tuple[int, int] | None,
+    camera_intrinsics: CameraIntrinsics | None,
     target_label: str,
     limit: int = 8,
 ) -> tuple[PlannerObjectObservation, ...]:
@@ -298,6 +325,11 @@ def _object_observations_from_detections(
                 target_label=target_label,
             ),
             distance_bucket=_distance_bucket(depth_m),
+            relative_xyz=_bbox_relative_xyz(
+                depth_map=depth_map,
+                intrinsics=camera_intrinsics,
+                xyxy=(x1, y1, x2, y2),
+            ),
         )
         observations.append((area_ratio, confidence, observation))
     observations.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -557,6 +589,12 @@ def _default_reconstruction_brief(
         explored_directions=explored_directions,
         unexplored_directions=unexplored_directions,
         recently_failed_directions=recently_failed_directions,
+        tracked_feature_count=int(reconstruction_summary.get("tracked_feature_count", 0) or 0),
+        median_reprojection_error=(
+            None
+            if reconstruction_summary.get("median_reprojection_error") is None
+            else float(reconstruction_summary["median_reprojection_error"])
+        ),
     )
 
 
@@ -700,32 +738,47 @@ def _goal_estimate_from_context(
 
 def _default_constraints(
     *,
+    allowed_command_kinds: Iterable[str] | None = None,
+    max_commands_per_schedule: int | None = None,
+    execution_capabilities: dict[str, float] | None = None,
+    microstep_limits: dict[str, float] | None = None,
     batch_step_limit: int | None,
     replan_frame_budget: int | None,
     tracking_safe_limits: dict[str, float] | None,
 ) -> PlannerConstraintSummary:
-    limits = dict(tracking_safe_limits or {})
-    if not limits:
-        limits = {
-            ActionPrimitive.MOVE_FORWARD.value: 0.12,
-            ActionPrimitive.MOVE_BACKWARD.value: 0.12,
-            ActionPrimitive.STRAFE_LEFT.value: 0.12,
-            ActionPrimitive.STRAFE_RIGHT.value: 0.12,
-            ActionPrimitive.TURN_LEFT.value: 6.0,
-            ActionPrimitive.TURN_RIGHT.value: 6.0,
-            ActionPrimitive.CAMERA_PAN_LEFT.value: 6.0,
-            ActionPrimitive.CAMERA_PAN_RIGHT.value: 6.0,
+    resolved_microstep_limits = dict(microstep_limits or tracking_safe_limits or {})
+    if not resolved_microstep_limits:
+        resolved_microstep_limits = {
+            "translate_distance_m": 0.08,
+            "body_yaw_deg": 4.0,
+            "camera_yaw_deg": 4.0,
+            "camera_pitch_deg": 4.0,
         }
-    resolved_batch_step_limit = max(1, int(batch_step_limit or 1))
-    resolved_replan_frame_budget = max(1, int(replan_frame_budget or resolved_batch_step_limit))
+    resolved_execution_capabilities = dict(execution_capabilities or {})
+    if not resolved_execution_capabilities:
+        resolved_execution_capabilities = {
+            "move_speed_mps": 1.6,
+            "turn_speed_deg_per_sec": 100.0,
+            "camera_yaw_speed_deg_per_sec": 90.0,
+            "camera_pitch_speed_deg_per_sec": 90.0,
+            "camera_yaw_limit_deg": 70.0,
+            "camera_pitch_limit_deg": 55.0,
+            "max_translate_distance_m": 0.72,
+            "max_rotate_body_deg": 36.0,
+        }
+    resolved_max_commands = min(3, max(1, int(max_commands_per_schedule or batch_step_limit or 3)))
+    resolved_allowed_command_kinds = tuple(str(item) for item in (allowed_command_kinds or (item.value for item in CommandKind)))
+    _ = replan_frame_budget
     return PlannerConstraintSummary(
-        allowed_primitives=tuple(item.value for item in ActionPrimitive),
-        tracking_safe_limits=limits,
-        batch_step_limit=resolved_batch_step_limit,
-        replan_frame_budget=resolved_replan_frame_budget,
+        allowed_command_kinds=resolved_allowed_command_kinds,
+        execution_capabilities=resolved_execution_capabilities,
+        microstep_limits=resolved_microstep_limits,
+        max_commands_per_schedule=resolved_max_commands,
         notes=(
             "Prefer committed batches over oscillation.",
-            "Escape blocked states with backward or strafe motion before re-centering.",
+            "Escape blocked states with translation or rotation before re-centering.",
+            "Use camera-frame coordinates where +x is right, +y is up, and +z is forward.",
+            "Use aim_camera for absolute yaw/pitch setpoints; do not express camera motion as relative pans.",
         ),
     )
 
@@ -749,6 +802,8 @@ def build_planner_context(
     depth_map: np.ndarray | None = None,
     frame_shape: tuple[int, int] | None = None,
     camera_pose_world: np.ndarray | None = None,
+    camera_intrinsics: CameraIntrinsics | None = None,
+    current_camera_state: PlannerCameraState | None = None,
     object_observations: Iterable[PlannerObjectObservation] = (),
     segment_observations: Iterable[PlannerSegmentObservation] = (),
     navigation_affordances: PlannerNavigationAffordances | None = None,
@@ -756,6 +811,10 @@ def build_planner_context(
     goal_estimate: PlannerGoalEstimate | None = None,
     recent_action_effects: Iterable[PlannerActionEffectSummary] = (),
     constraints: PlannerConstraintSummary | None = None,
+    allowed_command_kinds: Iterable[str] | None = None,
+    max_commands_per_schedule: int | None = None,
+    execution_capabilities: dict[str, float] | None = None,
+    microstep_limits: dict[str, float] | None = None,
     batch_step_limit: int | None = None,
     replan_frame_budget: int | None = None,
     tracking_safe_limits: dict[str, float] | None = None,
@@ -785,6 +844,7 @@ def build_planner_context(
         detections=detections_tuple,
         depth_map=depth_map,
         frame_shape=frame_shape,
+        camera_intrinsics=camera_intrinsics,
         target_label=str(target_label),
     )
     resolved_segment_observations = tuple(segment_observations) or _segment_observations_from_segments(
@@ -816,6 +876,10 @@ def build_planner_context(
         navigation_affordances=resolved_navigation_affordances,
     )
     resolved_constraints = constraints or _default_constraints(
+        allowed_command_kinds=allowed_command_kinds,
+        max_commands_per_schedule=max_commands_per_schedule,
+        execution_capabilities=execution_capabilities,
+        microstep_limits=microstep_limits,
         batch_step_limit=batch_step_limit,
         replan_frame_budget=replan_frame_budget,
         tracking_safe_limits=tracking_safe_limits,
@@ -841,6 +905,7 @@ def build_planner_context(
             frame_size=(frame_height, frame_width),
             scene_nodes=scene_node_observations,
             scene_edges=scene_edge_observations,
+            current_camera_state=current_camera_state,
         ),
         memory=memory,
         goal_estimate=resolved_goal_estimate,
@@ -910,11 +975,30 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
     navigation_affordances = context.perception.navigation_affordances
     reconstruction_brief = context.perception.reconstruction_brief
     memory_payload = _memory_prompt_payload(context.memory)
+    current_camera_state = context.perception.current_camera_state
     return {
         "request_type": "multimodal_planner_core",
         "phase": context.phase.value,
         "frame_index": int(context.frame_index),
         "image_metadata": dict(context.image_metadata),
+        "coordinate_convention": {
+            "camera_frame": {
+                "x": "right",
+                "y": "up",
+                "z": "forward",
+            },
+            "aim_camera": {
+                "yaw_deg_positive": "right",
+                "yaw_deg_negative": "left",
+                "pitch_deg_positive": "up",
+                "pitch_deg_negative": "down",
+            },
+            "rotate_body": {
+                "type": "relative_yaw_delta",
+                "direction_left": "positive",
+                "direction_right": "negative",
+            },
+        },
         "visible_detections": list(context.perception.visible_detections),
         "visible_segments": list(context.perception.visible_segments),
         "visible_graph_relations": list(context.perception.visible_graph_relations),
@@ -933,6 +1017,14 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
         "robot_state": {
             "tracking_status": context.perception.tracking_status,
             "calibration_status": context.perception.calibration_status,
+            "current_camera_state": (
+                None
+                if current_camera_state is None
+                else {
+                    "yaw_deg": float(current_camera_state.yaw_deg),
+                    "pitch_deg": float(current_camera_state.pitch_deg),
+                }
+            ),
             "recent_actions": list(context.recent_actions),
             "recent_action_effects": [
                 {
@@ -941,6 +1033,7 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                     "clearance_change": item.clearance_change,
                     "target_evidence_change": item.target_evidence_change,
                     "likely_blocked": bool(item.likely_blocked),
+                    "aborted": bool(item.aborted),
                 }
                 for item in context.recent_action_effects
             ],
@@ -1104,6 +1197,8 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                 "explored_directions": list(reconstruction_brief.explored_directions),
                 "unexplored_directions": list(reconstruction_brief.unexplored_directions),
                 "recently_failed_directions": list(reconstruction_brief.recently_failed_directions),
+                "tracked_feature_count": int(reconstruction_brief.tracked_feature_count),
+                "median_reprojection_error": reconstruction_brief.median_reprojection_error,
             }
         ),
         "memory": memory_payload,
@@ -1114,16 +1209,17 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                 "clearance_change": item.clearance_change,
                 "target_evidence_change": item.target_evidence_change,
                 "likely_blocked": bool(item.likely_blocked),
+                "aborted": bool(item.aborted),
             }
             for item in context.recent_action_effects
         ],
         "recent_searches": memory_payload["recent_searches"],
         "target_hypotheses": [_goal_hypothesis_payload(context.goal_estimate)],
         "constraints": {
-            "allowed_primitives": list(context.constraints.allowed_primitives),
-            "tracking_safe_limits": dict(context.constraints.tracking_safe_limits),
-            "batch_step_limit": int(context.constraints.batch_step_limit),
-            "replan_frame_budget": int(context.constraints.replan_frame_budget),
+            "allowed_command_kinds": list(context.constraints.allowed_command_kinds),
+            "execution_capabilities": dict(context.constraints.execution_capabilities),
+            "microstep_limits": dict(context.constraints.microstep_limits),
+            "max_commands_per_schedule": int(context.constraints.max_commands_per_schedule),
             "notes": list(context.constraints.notes),
             "hidden_scene_truth_policy": "forbidden",
         },
@@ -1159,6 +1255,96 @@ def _planner_input_content(*, context: PlannerContext, frame_bgr: np.ndarray | N
     if frame_bgr is not None and np.asarray(frame_bgr).size > 0:
         content.append({"type": "input_image", "image_url": _encode_frame_as_data_url(np.asarray(frame_bgr, dtype=np.uint8))})
     return content
+
+
+def _command_schema() -> dict[str, object]:
+    translate_or_rotate_base = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string"},
+            "direction": {"type": "string"},
+            "mode": {"type": "string"},
+            "value": {"type": "number"},
+            "intent": {"type": "string"},
+        },
+    }
+    return {
+        "type": "array",
+        "maxItems": 3,
+        "items": {
+            "anyOf": [
+                {
+                    **translate_or_rotate_base,
+                    "properties": {
+                        **translate_or_rotate_base["properties"],
+                        "kind": {"type": "string", "const": CommandKind.TRANSLATE.value},
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "backward", "left", "right"],
+                        },
+                        "mode": {"type": "string", "enum": ["distance_m", "hold_sec"]},
+                    },
+                    "required": ["kind", "direction", "mode", "value", "intent"],
+                },
+                {
+                    **translate_or_rotate_base,
+                    "properties": {
+                        **translate_or_rotate_base["properties"],
+                        "kind": {"type": "string", "const": CommandKind.ROTATE_BODY.value},
+                        "direction": {"type": "string", "enum": ["left", "right"]},
+                        "mode": {"type": "string", "enum": ["angle_deg", "hold_sec"]},
+                    },
+                    "required": ["kind", "direction", "mode", "value", "intent"],
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"type": "string", "const": CommandKind.AIM_CAMERA.value},
+                        "yaw_deg": {"type": "number"},
+                        "pitch_deg": {"type": "number"},
+                        "intent": {"type": "string"},
+                    },
+                    "required": ["kind", "yaw_deg", "pitch_deg", "intent"],
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"type": "string", "const": CommandKind.PAUSE.value},
+                        "duration_sec": {"type": "number"},
+                        "intent": {"type": "string"},
+                    },
+                    "required": ["kind", "duration_sec", "intent"],
+                },
+            ]
+        },
+    }
+
+
+def _motion_command_from_payload(item: dict[str, object]) -> MotionCommand:
+    kind = CommandKind(str(item.get("kind") or CommandKind.PAUSE.value))
+    if kind in {CommandKind.TRANSLATE, CommandKind.ROTATE_BODY}:
+        return MotionCommand(
+            kind=kind,
+            direction=str(item.get("direction") or ""),
+            mode=str(item.get("mode") or ""),
+            value=float(item.get("value") or 0.0),
+            intent=str(item.get("intent") or ""),
+        )
+    if kind is CommandKind.AIM_CAMERA:
+        return MotionCommand(
+            kind=kind,
+            yaw_deg=float(item.get("yaw_deg") or 0.0),
+            pitch_deg=float(item.get("pitch_deg") or 0.0),
+            intent=str(item.get("intent") or ""),
+        )
+    return MotionCommand(
+        kind=CommandKind.PAUSE,
+        duration_sec=float(item.get("duration_sec") or 0.0),
+        intent=str(item.get("intent") or ""),
+    )
 
 
 class OpenAILivingRoomPlanner:
@@ -1224,22 +1410,7 @@ class OpenAILivingRoomPlanner:
                                 "type": "string",
                                 "enum": ["approach", "reacquire", "infer", "escape", "scan"],
                             },
-                            "steps": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "primitive": {
-                                            "type": "string",
-                                            "enum": [item.value for item in ActionPrimitive],
-                                        },
-                                        "value": {"type": "number"},
-                                        "intent": {"type": "string"},
-                                    },
-                                    "required": ["primitive", "value", "intent"],
-                                },
-                            },
+                            "commands": _command_schema(),
                             "safety_flags": {
                                 "type": "object",
                                 "additionalProperties": False,
@@ -1257,7 +1428,7 @@ class OpenAILivingRoomPlanner:
                             "situation_summary",
                             "goal_hypothesis",
                             "behavior_mode",
-                            "steps",
+                            "commands",
                             "safety_flags",
                             "confidence",
                         ],
@@ -1271,13 +1442,10 @@ class OpenAILivingRoomPlanner:
         response = self._client.responses.create(**request_kwargs)
         payload = _response_json(response)
         return ActionSchedule(
-            steps=tuple(
-                ActionStep(
-                    primitive=ActionPrimitive(str(item["primitive"])),
-                    value=float(item["value"]),
-                    intent=str(item.get("intent") or ""),
-                )
-                for item in list(payload.get("steps") or [])
+            commands=tuple(
+                _motion_command_from_payload(dict(item))
+                for item in list(payload.get("commands") or [])
+                if isinstance(item, dict)
             ),
             rationale=str(payload.get("situation_summary") or ""),
             model=self._model,

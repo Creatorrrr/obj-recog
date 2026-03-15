@@ -80,14 +80,25 @@ def _planner_response_text_from_frame_packet(frame_packet: FramePacket | None) -
     if frame_packet is None or getattr(frame_packet, "planner_schedule", None) is None:
         return ""
     schedule = frame_packet.planner_schedule
-    steps = [
-        {
-            "primitive": getattr(getattr(step, "primitive", None), "value", getattr(step, "primitive", "")),
-            "value": float(getattr(step, "value", 0.0)),
-            "intent": str(getattr(step, "intent", "")),
+    commands = []
+    for command in tuple(getattr(schedule, "commands", ()) or ()):
+        kind = getattr(getattr(command, "kind", None), "value", getattr(command, "kind", ""))
+        payload = {
+            "kind": str(kind),
+            "intent": str(getattr(command, "intent", "")),
         }
-        for step in tuple(getattr(schedule, "steps", ()) or ())
-    ]
+        if str(kind) in {"translate", "rotate_body"}:
+            payload["direction"] = getattr(command, "direction", None)
+            payload["mode"] = getattr(command, "mode", None)
+            payload["value"] = None if getattr(command, "value", None) is None else float(command.value)
+        elif str(kind) == "aim_camera":
+            payload["yaw_deg"] = None if getattr(command, "yaw_deg", None) is None else float(command.yaw_deg)
+            payload["pitch_deg"] = None if getattr(command, "pitch_deg", None) is None else float(command.pitch_deg)
+        elif str(kind) == "pause":
+            payload["duration_sec"] = (
+                None if getattr(command, "duration_sec", None) is None else float(command.duration_sec)
+            )
+        commands.append(payload)
     payload = {
         "rationale": str(getattr(schedule, "rationale", "")),
         "situation_summary": str(getattr(schedule, "situation_summary", "")),
@@ -116,7 +127,7 @@ def _planner_response_text_from_frame_packet(frame_packet: FramePacket | None) -
             }
         ),
         "confidence": None if getattr(schedule, "confidence", None) is None else float(schedule.confidence),
-        "steps": steps,
+        "commands": commands,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -150,14 +161,26 @@ def _planner_summary_text_from_frame_packet(frame_packet: FramePacket | None) ->
             + f"tracking_risk={str(getattr(safety_flags, 'tracking_risk', 'unknown'))}, "
             + f"replan_reason={str(getattr(safety_flags, 'replan_reason', ''))}"
         )
-    summary_lines.append("Planned steps:")
-    for index, step in enumerate(tuple(getattr(schedule, "steps", ()) or ()), start=1):
-        summary_lines.append(
-            f"{index}. "
-            + f"{getattr(getattr(step, 'primitive', None), 'value', getattr(step, 'primitive', ''))} "
-            + f"{float(getattr(step, 'value', 0.0)):.2f}"
-            + (f" | {str(getattr(step, 'intent', ''))}" if str(getattr(step, "intent", "")).strip() else "")
-        )
+    summary_lines.append("Planned commands:")
+    for index, command in enumerate(tuple(getattr(schedule, "commands", ()) or ()), start=1):
+        kind = str(getattr(getattr(command, "kind", None), "value", getattr(command, "kind", "")))
+        if kind in {"translate", "rotate_body"}:
+            body = (
+                f"{kind} {getattr(command, 'direction', '')} "
+                f"{getattr(command, 'mode', '')}="
+                f"{float(getattr(command, 'value', 0.0)):.2f}"
+            )
+        elif kind == "aim_camera":
+            body = (
+                f"{kind} yaw={float(getattr(command, 'yaw_deg', 0.0)):.1f}deg "
+                f"pitch={float(getattr(command, 'pitch_deg', 0.0)):.1f}deg"
+            )
+        elif kind == "pause":
+            body = f"{kind} duration={float(getattr(command, 'duration_sec', 0.0)):.2f}s"
+        else:
+            body = kind
+        intent = str(getattr(command, "intent", "")).strip()
+        summary_lines.append(f"{index}. {body}" + (f" | {intent}" if intent else ""))
     return "\n".join(line for line in summary_lines if str(line).strip())
 
 
@@ -733,6 +756,8 @@ def process_frame(
         loop_closure_applied=bool(getattr(map_update, "loop_closure_applied", slam_result.loop_closure_applied)),
         segmentation_overlay_bgr=np.zeros_like(frame_bgr),
         segments=[],
+        tracked_feature_count=int(getattr(slam_result, "tracked_feature_count", 0)),
+        median_reprojection_error=getattr(slam_result, "median_reprojection_error", None),
         depth_diagnostics=depth_diagnostics,
         perception_diagnostics=perception_diagnostics,
         mesh_revision=(None if mesh_revision is None else int(mesh_revision)),
