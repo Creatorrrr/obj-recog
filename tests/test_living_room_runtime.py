@@ -821,11 +821,15 @@ def test_unity_rgb_sensor_backend_validates_vendor_setup(monkeypatch: pytest.Mon
     monkeypatch.setattr("obj_recog.simulation.UnityRgbClient", _FakeClient)
 
     backend = _build_unity_rgb_sensor_backend(
-        config=_config(unity_player_path="C:/UnityBuild/obj-recog.exe", unity_host="127.0.0.2", unity_port=9001),
+        config=_config(
+            unity_player_path="/tmp/obj-recog-unity.app",
+            unity_host="127.0.0.2",
+            unity_port=9001,
+        ),
         camera_rig=object(),
     )
 
     assert calls == ["checked"]
-    assert backend._client.kwargs["unity_player_path"] == "C:/UnityBuild/obj-recog.exe"
+    assert backend._client.kwargs["unity_player_path"] == "/tmp/obj-recog-unity.app"
     assert backend._client.kwargs["host"] == "127.0.0.2"
     assert backend._client.kwargs["port"] == 9001

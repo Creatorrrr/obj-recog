@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import plistlib
 import socket
 import struct
 import threading
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 
 from obj_recog.sim_protocol import ActionPrimitive
-from obj_recog.unity_rgb import UnityRgbClient, command_from_step
+from obj_recog.unity_rgb import UnityRgbClient, _resolve_unity_player_launch_path, command_from_step
 
 
 def _send_message(sock: socket.socket, payload: dict[str, object]) -> None:
@@ -112,6 +113,80 @@ def test_unity_rgb_client_launches_player_in_agent_mode(
 
     assert launched["command"] == [
         str(player_path),
+        "--obj-recog-mode=agent",
+        "--quality-level=2",
+        "--obj-recog-host=127.0.0.1",
+        "--obj-recog-port=8765",
+    ]
+
+
+def test_resolve_unity_player_launch_path_accepts_macos_app_bundle(tmp_path: Path) -> None:
+    app_path = tmp_path / "obj-recog-unity.app"
+    binary_path = app_path / "Contents" / "MacOS" / "obj-recog-unity"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"stub")
+
+    assert _resolve_unity_player_launch_path(str(app_path)) == binary_path
+
+
+def test_resolve_unity_player_launch_path_rejects_malformed_macos_app_bundle(tmp_path: Path) -> None:
+    app_path = tmp_path / "obj-recog-unity.app"
+    app_path.mkdir()
+
+    with pytest.raises(RuntimeError, match="Unity player app bundle is missing executable"):
+        _resolve_unity_player_launch_path(str(app_path))
+
+
+def test_resolve_unity_player_launch_path_uses_bundle_executable_name_from_info_plist(tmp_path: Path) -> None:
+    app_path = tmp_path / "obj-recog-unity.app"
+    contents_path = app_path / "Contents"
+    binary_path = contents_path / "MacOS" / "unity"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"stub")
+    (contents_path / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": "unity"})
+    )
+
+    assert _resolve_unity_player_launch_path(str(app_path)) == binary_path
+
+
+def test_unity_rgb_client_launches_macos_app_bundle_in_agent_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    app_path = tmp_path / "obj-recog-unity.app"
+    binary_path = app_path / "Contents" / "MacOS" / "obj-recog-unity"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"stub")
+    launched: dict[str, object] = {}
+
+    class _FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> None:
+            _ = timeout
+            return None
+
+    def _fake_popen(command):
+        launched["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr("obj_recog.unity_rgb.subprocess.Popen", _fake_popen)
+
+    client = UnityRgbClient(
+        host="127.0.0.1",
+        port=8765,
+        unity_player_path=str(app_path),
+        player_args=("--quality-level=2",),
+    )
+    client._launch_player()
+
+    assert launched["command"] == [
+        str(binary_path),
         "--obj-recog-mode=agent",
         "--quality-level=2",
         "--obj-recog-host=127.0.0.1",
