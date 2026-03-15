@@ -24,6 +24,7 @@ from obj_recog.sim_protocol import (
     MotionCommand,
     PlannerActionEffectSummary,
     PlannerCameraState,
+    PlannerGoalCompletion,
     PlannerNavigationAffordances,
     PlannerNavigationSectorObservation,
     PlannerReconstructionBrief,
@@ -832,6 +833,30 @@ class LivingRoomEpisodeRunner:
             )
         return bool(area_ratio >= 0.22 and center_offset_ratio <= 0.25)
 
+    @staticmethod
+    def _schedule_reports_goal_reached(schedule: ActionSchedule | None) -> bool:
+        goal_completion = None if schedule is None else getattr(schedule, "goal_completion", None)
+        return bool(goal_completion is not None and bool(getattr(goal_completion, "reached", False)))
+
+    def _visual_goal_completion_assessment(self, *, artifacts) -> PlannerGoalCompletion | None:
+        target_detection = self._target_detection_summary(artifacts=artifacts)
+        if target_detection is None or not self._goal_visually_reached(artifacts=artifacts):
+            return None
+        area_ratio = float(target_detection.get("area_ratio", 0.0) or 0.0)
+        center_offset_ratio = float(target_detection.get("center_offset_ratio", 1.0) or 1.0)
+        median_depth_m = target_detection.get("median_depth_m")
+        depth_text = "unknown"
+        if median_depth_m is not None:
+            depth_text = f"{float(median_depth_m):.2f}m"
+        return PlannerGoalCompletion(
+            reached=True,
+            confidence=0.65,
+            rationale=(
+                "visual fallback: target detection remained large and centered "
+                + f"(area_ratio={area_ratio:.3f}, center_offset_ratio={center_offset_ratio:.3f}, depth={depth_text})"
+            ),
+        )
+
     def _target_visible_in_artifacts(self, *, artifacts) -> bool:
         target_label = getattr(self._scene_spec, "semantic_target_class", "")
         for detection in list(getattr(artifacts, "detections", []) or []):
@@ -1220,13 +1245,10 @@ class LivingRoomEpisodeRunner:
         current_state = self._observation_state_from_artifacts(artifacts=artifacts)
         current_state = self._update_tracking_recovery_state(current_state)
         self._update_active_macro_execution(current_state=current_state)
-        if self._goal_visually_reached(artifacts=artifacts):
-            self._previous_observation_state = current_state
-            self._mark_goal_completed()
-            return
-
         next_command = self._select_next_command(artifacts=artifacts, current_state=current_state)
         self._previous_observation_state = current_state
+        if self._state.phase == EpisodePhase.SUCCEEDED:
+            return
         submit_action = getattr(self._sensor_backend, "submit_action", None)
         if callable(submit_action):
             self._latest_sensor_frame = None
@@ -1248,6 +1270,51 @@ class LivingRoomEpisodeRunner:
         self._active_macro_execution = None
         self._latest_sensor_frame = None
         self._write_episode_report()
+
+    def _record_planner_turn(self, *, context, schedule: ActionSchedule) -> None:
+        self._state.planner_turn_count += 1
+        self._planner_turn_logs.append(
+            {
+                "frame_index": self._state.frame_index,
+                "phase": context.phase.value,
+                "prompt": context,
+                "schedule": {
+                    "rationale": schedule.rationale,
+                    "situation_summary": schedule.situation_summary,
+                    "behavior_mode": schedule.behavior_mode,
+                    "model": schedule.model,
+                    "goal_hypothesis": None
+                    if schedule.goal_hypothesis is None
+                    else {
+                        "status": schedule.goal_hypothesis.status,
+                        "bearing_hint": schedule.goal_hypothesis.bearing_hint,
+                        "distance_hint": schedule.goal_hypothesis.distance_hint,
+                        "evidence": list(schedule.goal_hypothesis.evidence_sources),
+                        "confidence": float(schedule.goal_hypothesis.confidence),
+                    },
+                    "goal_completion": None
+                    if schedule.goal_completion is None
+                    else {
+                        "reached": bool(schedule.goal_completion.reached),
+                        "confidence": float(schedule.goal_completion.confidence),
+                        "rationale": schedule.goal_completion.rationale,
+                    },
+                    "safety_flags": None
+                    if schedule.safety_flags is None
+                    else {
+                        "front_blocked": bool(schedule.safety_flags.front_blocked),
+                        "dead_end_risk": float(schedule.safety_flags.dead_end_risk),
+                        "tracking_risk": schedule.safety_flags.tracking_risk,
+                        "replan_reason": schedule.safety_flags.replan_reason,
+                    },
+                    "confidence": schedule.confidence,
+                    "commands": [
+                        self._serialize_motion_command(command)
+                        for command in schedule.commands
+                    ],
+                },
+            }
+        )
 
     @staticmethod
     def _serialize_motion_command(command: MotionCommand) -> dict[str, object]:
@@ -1467,6 +1534,8 @@ class LivingRoomEpisodeRunner:
         observation_state: dict[str, object],
         context,
     ) -> ActionSchedule:
+        if self._schedule_reports_goal_reached(schedule):
+            return replace(schedule, commands=())
         affordances = observation_state.get("navigation_affordances")
         front_blocked = bool(
             isinstance(affordances, PlannerNavigationAffordances) and affordances.front_blocked
@@ -1494,6 +1563,7 @@ class LivingRoomEpisodeRunner:
                 situation_summary=schedule.situation_summary or "Contradictory actions rejected; executing escape fallback.",
                 behavior_mode="escape",
                 goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                goal_completion=schedule.goal_completion,
                 safety_flags=PlannerSafetyFlags(
                     front_blocked=front_blocked,
                     dead_end_risk=dead_end_risk,
@@ -1522,6 +1592,7 @@ class LivingRoomEpisodeRunner:
                 situation_summary=schedule.situation_summary or "Tracking is unstable; pausing to reassess.",
                 behavior_mode="scan",
                 goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                goal_completion=schedule.goal_completion,
                 safety_flags=PlannerSafetyFlags(
                     front_blocked=front_blocked,
                     dead_end_risk=dead_end_risk,
@@ -1543,6 +1614,7 @@ class LivingRoomEpisodeRunner:
                 ),
                 behavior_mode="escape",
                 goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                goal_completion=schedule.goal_completion,
                 safety_flags=PlannerSafetyFlags(
                     front_blocked=front_blocked,
                     dead_end_risk=dead_end_risk,
@@ -1562,6 +1634,7 @@ class LivingRoomEpisodeRunner:
                 situation_summary=schedule.situation_summary,
                 behavior_mode=schedule.behavior_mode,
                 goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                goal_completion=schedule.goal_completion,
                 safety_flags=PlannerSafetyFlags(
                     front_blocked=front_blocked,
                     dead_end_risk=dead_end_risk,
@@ -1579,6 +1652,7 @@ class LivingRoomEpisodeRunner:
                 situation_summary=schedule.situation_summary,
                 behavior_mode=schedule.behavior_mode,
                 goal_hypothesis=schedule.goal_hypothesis or context.goal_estimate,
+                goal_completion=schedule.goal_completion,
                 safety_flags=schedule.safety_flags,
                 confidence=schedule.confidence,
             )
@@ -1924,17 +1998,16 @@ class LivingRoomEpisodeRunner:
         schedule = self._validated_schedule(schedule=schedule, observation_state=observation_state, context=context)
         truncated_commands = tuple(schedule.commands[:max_commands_per_schedule])
         if truncated_commands != schedule.commands:
-            schedule = ActionSchedule(
-                commands=truncated_commands,
-                rationale=schedule.rationale,
-                model=schedule.model,
-                issued_at_frame=schedule.issued_at_frame,
-                situation_summary=schedule.situation_summary,
-                behavior_mode=schedule.behavior_mode,
-                goal_hypothesis=schedule.goal_hypothesis,
-                safety_flags=schedule.safety_flags,
-                confidence=schedule.confidence,
-            )
+            schedule = replace(schedule, commands=truncated_commands)
+        if schedule.goal_completion is None:
+            visual_goal_completion = self._visual_goal_completion_assessment(artifacts=artifacts)
+            if visual_goal_completion is not None:
+                schedule = replace(schedule, goal_completion=visual_goal_completion)
+        if self._schedule_reports_goal_reached(schedule):
+            self._latest_planner_schedule = schedule
+            self._record_planner_turn(context=context, schedule=schedule)
+            self._mark_goal_completed()
+            return
         if not schedule.commands:
             schedule = ActionSchedule(
                 commands=(MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="empty schedule fallback"),),
@@ -1944,6 +2017,7 @@ class LivingRoomEpisodeRunner:
                 situation_summary="Planner returned no safe actions.",
                 behavior_mode="scan",
                 goal_hypothesis=context.goal_estimate,
+                goal_completion=schedule.goal_completion,
                 safety_flags=PlannerSafetyFlags(
                     front_blocked=bool(
                         context.perception.navigation_affordances is not None
@@ -1967,42 +2041,7 @@ class LivingRoomEpisodeRunner:
         self._active_macro_execution = None
         self._state.schedule_cursor = 0
         self._state.phase = EpisodePhase.EXECUTING_SCHEDULE
-        self._state.planner_turn_count += 1
-        self._planner_turn_logs.append(
-            {
-                "frame_index": self._state.frame_index,
-                "phase": context.phase.value,
-                "prompt": context,
-                "schedule": {
-                    "rationale": schedule.rationale,
-                    "situation_summary": schedule.situation_summary,
-                    "behavior_mode": schedule.behavior_mode,
-                    "model": schedule.model,
-                    "goal_hypothesis": None
-                    if schedule.goal_hypothesis is None
-                    else {
-                        "status": schedule.goal_hypothesis.status,
-                        "bearing_hint": schedule.goal_hypothesis.bearing_hint,
-                        "distance_hint": schedule.goal_hypothesis.distance_hint,
-                        "evidence": list(schedule.goal_hypothesis.evidence_sources),
-                        "confidence": float(schedule.goal_hypothesis.confidence),
-                    },
-                    "safety_flags": None
-                    if schedule.safety_flags is None
-                    else {
-                        "front_blocked": bool(schedule.safety_flags.front_blocked),
-                        "dead_end_risk": float(schedule.safety_flags.dead_end_risk),
-                        "tracking_risk": schedule.safety_flags.tracking_risk,
-                        "replan_reason": schedule.safety_flags.replan_reason,
-                    },
-                    "confidence": schedule.confidence,
-                    "commands": [
-                        self._serialize_motion_command(command)
-                        for command in schedule.commands
-                    ],
-                },
-            }
-        )
+        self._record_planner_turn(context=context, schedule=schedule)
 
     def _write_selfcalibration_artifact(self) -> None:
         payload = {

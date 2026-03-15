@@ -20,6 +20,7 @@ from obj_recog.sim_protocol import (
     PlannerCameraState,
     PlannerConstraintSummary,
     PlannerContext,
+    PlannerGoalCompletion,
     PlannerGoalEstimate,
     PlannerMemoryObservation,
     PlannerMemorySnapshot,
@@ -50,6 +51,10 @@ _PLANNER_SYSTEM_INSTRUCTIONS = (
     "For aim_camera, yaw_deg > 0 means right, yaw_deg < 0 means left, pitch_deg > 0 means up, pitch_deg < 0 means down. "
     "aim_camera sets an absolute camera yaw/pitch target, not a relative pan. "
     "rotate_body is always relative body yaw, and translate is always relative body-frame motion. "
+    "Judge final goal completion from the current evidence, not from hidden ground truth. "
+    "Use detections, segmentation labels, scene-graph memory, relative_xyz, depth hints, and recent action effects together. "
+    "If the goal already appears achieved, set goal_completion.reached=true, explain why in goal_completion.rationale, "
+    "and do not request extra motion. "
     "Behavior modes: "
     "If goal_hypothesis.status is visible, center the target first and then approach it. "
     "Do not mix opposing body rotations or contradictory camera aims in the same batch. "
@@ -63,7 +68,7 @@ _PLANNER_SYSTEM_INSTRUCTIONS = (
     "Use aim_camera to set a clear yaw/pitch target, and pair scanning with viewpoint change when recent pure scans failed. "
     "Respect constraints.allowed_command_kinds, constraints.execution_capabilities, constraints.microstep_limits, "
     "and constraints.max_commands_per_schedule. "
-    "Output keys must be exactly situation_summary, goal_hypothesis, behavior_mode, commands, safety_flags, confidence. "
+    "Output keys must be exactly situation_summary, goal_hypothesis, goal_completion, behavior_mode, commands, safety_flags, confidence. "
     "Each command must include kind and intent, with translate/rotate_body using direction+mode+value, "
     "aim_camera using yaw_deg+pitch_deg, and pause using duration_sec."
 )
@@ -1414,6 +1419,16 @@ class OpenAILivingRoomPlanner:
                                 },
                                 "required": ["status", "bearing_hint", "distance_hint", "evidence", "confidence"],
                             },
+                            "goal_completion": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "reached": {"type": "boolean"},
+                                    "confidence": {"type": "number"},
+                                    "rationale": {"type": "string"},
+                                },
+                                "required": ["reached", "confidence", "rationale"],
+                            },
                             "behavior_mode": {
                                 "type": "string",
                                 "enum": ["approach", "reacquire", "infer", "escape", "scan"],
@@ -1435,6 +1450,7 @@ class OpenAILivingRoomPlanner:
                         "required": [
                             "situation_summary",
                             "goal_hypothesis",
+                            "goal_completion",
                             "behavior_mode",
                             "commands",
                             "safety_flags",
@@ -1449,6 +1465,7 @@ class OpenAILivingRoomPlanner:
             request_kwargs["reasoning"] = {"effort": "minimal"}
         response = self._client.responses.create(**request_kwargs)
         payload = _response_json(response)
+        goal_completion_payload = payload.get("goal_completion") or {}
         return ActionSchedule(
             commands=tuple(
                 _motion_command_from_payload(dict(item))
@@ -1466,6 +1483,11 @@ class OpenAILivingRoomPlanner:
                 distance_hint=(payload.get("goal_hypothesis") or {}).get("distance_hint"),
                 evidence_sources=tuple(str(item) for item in list((payload.get("goal_hypothesis") or {}).get("evidence") or [])),
                 confidence=float((payload.get("goal_hypothesis") or {}).get("confidence") or 0.0),
+            ),
+            goal_completion=PlannerGoalCompletion(
+                reached=bool(goal_completion_payload.get("reached")),
+                confidence=float(goal_completion_payload.get("confidence") or 0.0),
+                rationale=str(goal_completion_payload.get("rationale") or ""),
             ),
             safety_flags=PlannerSafetyFlags(
                 front_blocked=bool((payload.get("safety_flags") or {}).get("front_blocked")),

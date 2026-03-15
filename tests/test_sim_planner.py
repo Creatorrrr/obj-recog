@@ -183,6 +183,10 @@ def test_planner_context_serializes_recent_searches_and_aborted_macro_effects() 
                 target_evidence_change="none",
                 likely_blocked=True,
                 aborted=True,
+                commanded_progress_m=0.12,
+                vision_progress_m=0.0,
+                fused_progress_m=0.12,
+                progress_source="commanded",
             ),
         ),
         calibration_status="converged",
@@ -196,6 +200,8 @@ def test_planner_context_serializes_recent_searches_and_aborted_macro_effects() 
     ]
     assert prompt_payload["robot_state"]["recent_action_effects"][0]["aborted"] is True
     assert prompt_payload["robot_state"]["recent_action_effects"][0]["likely_blocked"] is True
+    assert prompt_payload["robot_state"]["recent_action_effects"][0]["commanded_progress_m"] == pytest.approx(0.12)
+    assert prompt_payload["robot_state"]["recent_action_effects"][0]["progress_source"] == "commanded"
 
 
 def test_planner_context_uses_command_constraints() -> None:
@@ -288,7 +294,8 @@ def test_openai_planner_sends_rgb_image_and_parses_structured_commands() -> None
                     "output_text": (
                         '{"situation_summary":"Target visible ahead.","goal_hypothesis":{"status":"visible",'
                         '"bearing_hint":"front","distance_hint":"1.8m","evidence":["target_detection"],'
-                        '"confidence":0.94},"behavior_mode":"approach","commands":['
+                        '"confidence":0.94},"goal_completion":{"reached":false,"confidence":0.12,'
+                        '"rationale":"target still ahead"},"behavior_mode":"approach","commands":['
                         '{"kind":"rotate_body","direction":"left","mode":"angle_deg","value":18.0,"intent":"face target"},'
                         '{"kind":"aim_camera","yaw_deg":-12.0,"pitch_deg":6.0,"intent":"center view"},'
                         '{"kind":"translate","direction":"forward","mode":"distance_m","value":0.36,"intent":"close distance"}],'
@@ -324,6 +331,8 @@ def test_openai_planner_sends_rgb_image_and_parses_structured_commands() -> None
     assert schedule.behavior_mode == "approach"
     assert schedule.goal_hypothesis is not None
     assert schedule.goal_hypothesis.status == "visible"
+    assert schedule.goal_completion is not None
+    assert schedule.goal_completion.reached is False
     assert [command.kind for command in schedule.commands] == [
         CommandKind.ROTATE_BODY,
         CommandKind.AIM_CAMERA,

@@ -116,6 +116,15 @@ def _planner_response_text_from_frame_packet(frame_packet: FramePacket | None) -
                 "confidence": float(getattr(schedule.goal_hypothesis, "confidence", 0.0)),
             }
         ),
+        "goal_completion": (
+            None
+            if getattr(schedule, "goal_completion", None) is None
+            else {
+                "reached": bool(getattr(schedule.goal_completion, "reached", False)),
+                "confidence": float(getattr(schedule.goal_completion, "confidence", 0.0)),
+                "rationale": str(getattr(schedule.goal_completion, "rationale", "")),
+            }
+        ),
         "safety_flags": (
             None
             if getattr(schedule, "safety_flags", None) is None
@@ -137,11 +146,21 @@ def _planner_summary_text_from_frame_packet(frame_packet: FramePacket | None) ->
         return ""
     schedule = frame_packet.planner_schedule
     goal_hypothesis = getattr(schedule, "goal_hypothesis", None)
+    goal_completion = getattr(schedule, "goal_completion", None)
     safety_flags = getattr(schedule, "safety_flags", None)
     summary_lines = [
         str(getattr(schedule, "situation_summary", "") or getattr(schedule, "rationale", "")).strip(),
         f"Behavior mode: {str(getattr(schedule, 'behavior_mode', '') or 'scan')}",
     ]
+    if goal_completion is not None:
+        summary_lines.append(
+            "Goal completion: "
+            + f"reached={bool(getattr(goal_completion, 'reached', False))}"
+            + f" | confidence={float(getattr(goal_completion, 'confidence', 0.0)):.2f}"
+        )
+        rationale = str(getattr(goal_completion, "rationale", "")).strip()
+        if rationale:
+            summary_lines.append(f"Completion rationale: {rationale}")
     if goal_hypothesis is not None:
         evidence = ", ".join(str(item) for item in tuple(getattr(goal_hypothesis, "evidence_sources", ()) or ()))
         summary_lines.append(

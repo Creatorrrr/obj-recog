@@ -13,6 +13,7 @@ from obj_recog.sim_protocol import (
     CommandKind,
     EpisodePhase,
     MotionCommand,
+    PlannerGoalCompletion,
     RigCapabilities,
     SensorFrame,
 )
@@ -349,6 +350,46 @@ def test_living_room_runtime_marks_success_when_target_is_visually_reached(tmp_p
     packet = runner.next_frame()
     assert packet is not None
     runner.record_runtime_observation(frame_packet=packet, artifacts=_goal_artifacts(packet))
+
+    report_payload = json.loads((tmp_path / "episode_report.json").read_text(encoding="utf-8"))
+    assert runner.next_frame() is None
+    assert report_payload["success"] is True
+    assert report_payload["final_phase"] == EpisodePhase.SUCCEEDED.value
+
+
+def test_living_room_runtime_marks_success_when_planner_reports_goal_completion(tmp_path: Path) -> None:
+    class _ReachedPlanner:
+        model = "fake-llm"
+
+        def plan(self, *, context, frame_bgr=None):
+            _ = frame_bgr
+            return ActionSchedule(
+                commands=(),
+                rationale="already at goal",
+                model=self.model,
+                issued_at_frame=context.frame_index,
+                situation_summary="The robot is already at the TV front position.",
+                goal_hypothesis=context.goal_estimate,
+                goal_completion=PlannerGoalCompletion(
+                    reached=True,
+                    confidence=0.93,
+                    rationale="TV-front evidence is already sufficient; no further motion is required.",
+                ),
+                confidence=0.93,
+            )
+
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=_ReachedPlanner(),
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(frame_packet=packet, artifacts=_artifacts(packet, detections=[]))
 
     report_payload = json.loads((tmp_path / "episode_report.json").read_text(encoding="utf-8"))
     assert runner.next_frame() is None

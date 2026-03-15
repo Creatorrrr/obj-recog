@@ -231,6 +231,13 @@ class PlannerSafetyFlags:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerGoalCompletion:
+    reached: bool
+    confidence: float
+    rationale: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerCameraState:
     yaw_deg: float
     pitch_deg: float
@@ -358,6 +365,7 @@ class ActionSchedule:
     situation_summary: str = ""
     behavior_mode: str = "scan"
     goal_hypothesis: PlannerGoalEstimate | None = None
+    goal_completion: PlannerGoalCompletion | None = None
     safety_flags: PlannerSafetyFlags | None = None
     confidence: float | None = None
 

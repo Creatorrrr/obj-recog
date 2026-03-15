@@ -188,8 +188,11 @@ class OrbSlam3Bridge:
         if not settings_path or not Path(settings_path).is_file():
             raise RuntimeError("ORB-SLAM3 requires a valid --camera-calibration path")
 
+        self._vocabulary_path = str(vocabulary_path)
+        self._settings_path = str(settings_path)
         self._frame_width = int(frame_width)
         self._frame_height = int(frame_height)
+        self._successful_tracks = 0
         resolved_binary_path = resolve_orbslam3_bridge_binary_path(binary_path)
         if resolved_binary_path is None:
             searched_locations = [Path(binary_path)] if binary_path is not None else list(orbslam3_bridge_binary_candidates())
@@ -204,73 +207,131 @@ class OrbSlam3Bridge:
         self._command = [
             self._binary_path,
             "--vocabulary",
-            vocabulary_path,
+            self._vocabulary_path,
             "--settings",
-            settings_path,
+            self._settings_path,
             "--width",
             str(self._frame_width),
             "--height",
             str(self._frame_height),
         ]
+        self._runtime_dirs: tuple[str, ...] = ()
         process_env = None
         if os.name == "nt":
             process_env = os.environ.copy()
             runtime_dirs = [str(path) for path in orbslam3_bridge_runtime_library_dirs()]
+            self._runtime_dirs = tuple(runtime_dirs)
             if runtime_dirs:
-                path_entries = runtime_dirs
+                path_entries = list(runtime_dirs)
                 existing_path = process_env.get("PATH")
                 if existing_path:
                     path_entries.append(existing_path)
                 process_env["PATH"] = os.pathsep.join(path_entries)
-        self._process = subprocess.Popen(
-            self._command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=process_env,
-        )
+        self._process_env = process_env
+        self._process: subprocess.Popen[bytes] | None = None
+        self._start_process()
 
     def track(self, frame_gray: np.ndarray, timestamp: float) -> SlamFrameResult:
+        return self._track(frame_gray, timestamp, allow_initial_restart=self._successful_tracks == 0)
+
+    def _track(self, frame_gray: np.ndarray, timestamp: float, *, allow_initial_restart: bool) -> SlamFrameResult:
         frame_gray = np.asarray(frame_gray, dtype=np.uint8)
         if frame_gray.shape != (self._frame_height, self._frame_width):
             raise ValueError("SLAM frame shape does not match configured bridge resolution")
-        if self._process.poll() is not None or self._process.stdin is None or self._process.stdout is None:
-            stderr = ""
-            if self._process.stderr is not None:
-                try:
-                    stderr = self._process.stderr.read().decode("utf-8", errors="replace")
-                except Exception:
-                    stderr = ""
-            raise RuntimeError(f"ORB-SLAM3 bridge is not running. {stderr}".strip())
+        if self._process is None or self._process.poll() is not None or self._process.stdin is None or self._process.stdout is None:
+            details = self._format_process_failure(
+                prefix="ORB-SLAM3 bridge is not running",
+                process=self._process,
+            )
+            if allow_initial_restart and self._restart_for_initial_track():
+                return self._track(frame_gray, timestamp, allow_initial_restart=False)
+            raise RuntimeError(details)
 
         packet = encode_frame_packet(frame_gray, timestamp)
         try:
             self._process.stdin.write(packet)
             self._process.stdin.flush()
         except BrokenPipeError as exc:
-            returncode = self._process.poll()
-            if returncode is None:
-                try:
-                    returncode = self._process.wait(timeout=0.2)
-                except subprocess.TimeoutExpired:
-                    returncode = None
-            stderr = ""
-            if self._process.stderr is not None:
-                try:
-                    stderr = self._process.stderr.read().decode("utf-8", errors="replace")
-                except Exception:
-                    stderr = ""
-            details = stderr.strip()
-            if returncode is not None:
-                details = f"exit code {returncode}. {details}".strip()
-            raise RuntimeError(f"ORB-SLAM3 bridge terminated while writing frame. {details}".strip()) from exc
-        return _read_protocol_response(self._process)
+            if allow_initial_restart and self._restart_for_initial_track():
+                return self._track(frame_gray, timestamp, allow_initial_restart=False)
+            raise RuntimeError(
+                self._format_process_failure(
+                    prefix="ORB-SLAM3 bridge terminated while writing frame",
+                    process=self._process,
+                )
+            ) from exc
+        try:
+            result = _read_protocol_response(self._process)
+        except RuntimeError:
+            if allow_initial_restart and self._process.poll() is not None and self._restart_for_initial_track():
+                return self._track(frame_gray, timestamp, allow_initial_restart=False)
+            raise
+        self._successful_tracks += 1
+        return result
 
     def close(self) -> None:
-        if self._process.poll() is None:
-            self._process.terminate()
+        self._shutdown_process()
+
+    def _start_process(self) -> None:
+        self._process = subprocess.Popen(
+            self._command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self._process_env,
+        )
+
+    def _restart_for_initial_track(self) -> bool:
+        if self._successful_tracks != 0:
+            return False
+        self._shutdown_process()
+        self._start_process()
+        return True
+
+    def _shutdown_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
             try:
-                self._process.wait(timeout=1.0)
+                process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=1.0)
+                process.kill()
+                process.wait(timeout=1.0)
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, stream_name, None)
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
+                try:
+                    close_stream()
+                except Exception:
+                    pass
+        self._process = None
+
+    def _drain_stderr(self, process: subprocess.Popen[bytes] | None) -> str:
+        if process is None or process.stderr is None:
+            return ""
+        try:
+            return process.stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    def _format_process_failure(
+        self,
+        *,
+        prefix: str,
+        process: subprocess.Popen[bytes] | None,
+    ) -> str:
+        details: list[str] = []
+        returncode = None if process is None else process.poll()
+        if returncode is not None:
+            details.append(f"exit code {returncode}")
+        stderr = self._drain_stderr(process)
+        if stderr:
+            details.append(stderr)
+        details.append(f"binary={self._binary_path}")
+        details.append(f"command={' '.join(self._command)}")
+        if self._runtime_dirs:
+            details.append(f"runtime_dirs={', '.join(self._runtime_dirs)}")
+        return f"{prefix}. {' | '.join(details)}".strip()

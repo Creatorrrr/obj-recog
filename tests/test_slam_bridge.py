@@ -263,7 +263,7 @@ def test_orbslam3_bridge_track_surfaces_native_stderr_when_pipe_breaks(
         stdout_lines=[],
         stderr_lines=[b"truncated grayscale payload\n"],
         stdin=_BrokenPipeWriter(),
-        returncode=1,
+        returncode=None,
     )
 
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: fake_process)
@@ -275,9 +275,107 @@ def test_orbslam3_bridge_track_surfaces_native_stderr_when_pipe_breaks(
         frame_height=3,
         binary_path=str(bridge_binary),
     )
+    bridge._successful_tracks = 1
 
     with pytest.raises(RuntimeError, match="truncated grayscale payload"):
         bridge.track(np.zeros((3, 4), dtype=np.uint8), timestamp=0.25)
+
+
+def test_orbslam3_bridge_restarts_once_if_initial_process_has_already_exited(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vocab = tmp_path / "ORBvoc.txt"
+    settings = tmp_path / "camera.yaml"
+    bridge_binary = tmp_path / "orbslam3_bridge.exe"
+    vocab.write_text("", encoding="utf-8")
+    settings.write_text("", encoding="utf-8")
+    bridge_binary.write_text("", encoding="utf-8")
+    exited_process = _FakeProcess(
+        stdout_lines=[],
+        stderr_lines=[b"startup failed\n"],
+        returncode=1,
+    )
+    healthy_process = _FakeProcess(
+        stdout_lines=[
+            json.dumps(
+                {
+                    "tracking_state": "INITIALIZING",
+                    "pose_world": np.eye(4, dtype=np.float32).reshape(-1).tolist(),
+                    "keyframe_inserted": False,
+                    "keyframe_id": None,
+                    "optimized_keyframe_poses": {},
+                    "sparse_map_points": [],
+                    "loop_closure_applied": False,
+                }
+            ).encode("utf-8")
+            + b"\n",
+        ]
+    )
+    created_processes = [exited_process, healthy_process]
+
+    def fake_popen(*args, **kwargs):
+        return created_processes.pop(0)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    bridge = OrbSlam3Bridge(
+        vocabulary_path=str(vocab),
+        settings_path=str(settings),
+        frame_width=4,
+        frame_height=3,
+        binary_path=str(bridge_binary),
+    )
+
+    result = bridge.track(np.zeros((3, 4), dtype=np.uint8), timestamp=0.25)
+
+    assert result.tracking_state == "INITIALIZING"
+    assert len(healthy_process.stdin.writes) == 1
+
+
+def test_orbslam3_bridge_reports_exit_code_command_and_runtime_dirs_when_not_running(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vocab = tmp_path / "ORBvoc.txt"
+    settings = tmp_path / "camera.yaml"
+    bridge_binary = tmp_path / "orbslam3_bridge.exe"
+    runtime_dir = tmp_path / "runtime-a"
+    vocab.write_text("", encoding="utf-8")
+    settings.write_text("", encoding="utf-8")
+    bridge_binary.write_text("", encoding="utf-8")
+    runtime_dir.mkdir()
+    fake_process = _FakeProcess(
+        stdout_lines=[],
+        stderr_lines=[b"native startup failure\n"],
+        returncode=23,
+    )
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: fake_process)
+    monkeypatch.setattr(
+        "obj_recog.slam_bridge.orbslam3_bridge_runtime_library_dirs",
+        lambda **_: (runtime_dir,),
+    )
+    monkeypatch.setattr("obj_recog.slam_bridge.os.name", "nt", raising=False)
+
+    bridge = OrbSlam3Bridge(
+        vocabulary_path=str(vocab),
+        settings_path=str(settings),
+        frame_width=4,
+        frame_height=3,
+        binary_path=str(bridge_binary),
+    )
+    bridge._successful_tracks = 1
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bridge.track(np.zeros((3, 4), dtype=np.uint8), timestamp=0.25)
+
+    message = str(excinfo.value)
+    assert "exit code 23" in message
+    assert "native startup failure" in message
+    assert f"binary={bridge_binary}" in message
+    assert "command=" in message
+    assert f"runtime_dirs={runtime_dir}" in message
 
 
 def test_resolve_orbslam3_bridge_binary_path_accepts_windows_executable_candidate(
