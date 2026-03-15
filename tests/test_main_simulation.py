@@ -514,7 +514,7 @@ def test_run_sim_mode_shows_explanation_panel_from_planner_core_when_enabled(
         explanation_panel_renderer=lambda **_kwargs: np.zeros((80, 120, 3), dtype=np.uint8),
     )
 
-    assert "Situation Explanation" in fake_cv2.imshow_calls
+    assert "Planner Overview" in fake_cv2.imshow_calls
     assert worker.submissions == []
     assert worker.closed is False
 

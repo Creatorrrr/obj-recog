@@ -161,6 +161,10 @@ def _planner_summary_text_from_frame_packet(frame_packet: FramePacket | None) ->
     return "\n".join(line for line in summary_lines if str(line).strip())
 
 
+def _explanation_window_name(*, input_source: str) -> str:
+    return "Planner Overview" if str(input_source) == "sim" else "Situation Explanation"
+
+
 def _tsdf_requires_orbslam3_message() -> str:
     return (
         "3D reconstruction/TSDF mesh requires ORB-SLAM3 keyframes. "
@@ -1003,6 +1007,7 @@ def run(
         "down_rect": None,
         "tab_rects": {},
     }
+    explanation_window_name = _explanation_window_name(input_source=config.input_source)
     explanation_mouse_callback_registered = False
     explanation_panel_mouse_callback_registered = False
     depth_debug_level = "basic"
@@ -1791,7 +1796,11 @@ def run(
                         model=explanation_result.model or config.explanation_model,
                         latency_ms=explanation_result.latency_ms,
                         timestamp_label=latest_explanation_timestamp,
-                        request_context=latest_explanation_request_context,
+                        request_context=(
+                            latest_explanation_request_context
+                            if config.input_source != "sim"
+                            else ""
+                        ),
                         planner_request_context=latest_planner_request_context,
                         planner_response_text=latest_planner_response_text,
                         active_tab=active_tab,
@@ -1828,7 +1837,7 @@ def run(
                     explanation_panel_state["tab_rects"] = {}
                 _imshow_runtime_window(
                     cv2,
-                    "Situation Explanation",
+                    explanation_window_name,
                     panel,
                     primary_width=int(config.width),
                     primary_height=int(config.height),
@@ -1838,7 +1847,7 @@ def run(
                     not explanation_panel_mouse_callback_registered
                     and callable(getattr(cv2, "setMouseCallback", None))
                 ):
-                    cv2.setMouseCallback("Situation Explanation", _handle_explanation_window_mouse)
+                    cv2.setMouseCallback(explanation_window_name, _handle_explanation_window_mouse)
                     explanation_panel_mouse_callback_registered = True
             reconstruction_viewer_active = _update_viewer(viewer, artifacts)
             viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)

@@ -975,8 +975,7 @@ def test_render_explanation_panel_includes_request_context_and_uses_taller_defau
     assert "Request chars: 31" in fake_cv2.text_calls
     assert "Response chars: 16" in fake_cv2.text_calls
     assert unicode_calls
-    assert unicode_calls[-1][0] == "LLM request"
-    assert "LLM response" in unicode_calls[-1]
+    assert unicode_calls[-1] == ["response summary"]
 
 
 def test_render_explanation_panel_supports_planner_tabs_and_returns_tab_metadata() -> None:
@@ -1023,8 +1022,8 @@ def test_render_explanation_panel_supports_planner_tabs_and_returns_tab_metadata
     assert "planner_request" in metadata["tab_rects"]
     assert "planner_response" in metadata["tab_rects"]
     assert unicode_calls
-    assert unicode_calls[-1][0] == "Planner request"
-    assert any(text == "Planner Req" for text in fake_cv2.text_calls)
+    assert unicode_calls[-1][0] == "Raw request"
+    assert any(text == "Raw Request" for text in fake_cv2.text_calls)
 
 
 def test_render_explanation_panel_shows_ready_empty_response_message() -> None:
