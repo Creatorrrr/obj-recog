@@ -6,6 +6,9 @@ import numpy as np
 import pytest
 
 from obj_recog.depth import DepthEstimator, RunningPercentileNormalizer
+from obj_recog.metric_stabilization import MetricDepthCalibrator
+from obj_recog.reconstruct import CameraIntrinsics
+from obj_recog.types import PanopticSegment
 
 
 def test_depth_estimator_reports_missing_timm_dependency(
@@ -91,3 +94,75 @@ def test_depth_estimator_falls_back_to_eager_when_compiled_model_needs_triton() 
     assert estimator._model is estimator._eager_model
     assert estimator._compiled_model_active is False
     assert any("fallback to eager" in message for message in debug_messages)
+
+
+def test_metric_depth_calibrator_uses_floor_anchors_and_preserves_monotonicity() -> None:
+    calibrator = MetricDepthCalibrator(min_depth=0.3, max_depth=6.0, ema_alpha=1.0)
+    intrinsics = CameraIntrinsics(fx=8.0, fy=8.0, cx=4.0, cy=2.0)
+    floor_mask = np.zeros((8, 8), dtype=bool)
+    floor_mask[4:, :] = True
+    segment = PanopticSegment(
+        segment_id=1,
+        label_id=1,
+        label="floor",
+        color_rgb=(0, 255, 0),
+        mask=floor_mask,
+        area_pixels=int(floor_mask.sum()),
+    )
+    ys, _xs = np.nonzero(floor_mask)
+    metric_floor_depth = 1.25 / np.maximum((ys.astype(np.float32) - intrinsics.cy) / intrinsics.fy, 1e-6)
+    raw_depth = np.tile(np.linspace(3.0, 1.0, 8, dtype=np.float32), (8, 1))
+    raw_depth[floor_mask] = metric_floor_depth / 0.5
+
+    corrected = calibrator.correct(
+        raw_depth,
+        intrinsics=intrinsics,
+        segments=[segment],
+        camera_height_m=1.25,
+        camera_pitch_deg=0.0,
+    )
+
+    corrected_floor = corrected.depth_map[floor_mask]
+    assert corrected.correction_state == "live"
+    assert corrected.scale_factor == pytest.approx(0.5, rel=0.1)
+    assert np.median(corrected_floor) == pytest.approx(np.median(metric_floor_depth), rel=0.1)
+    assert np.all(np.diff(corrected.depth_map[2]) <= 0.0)
+
+
+def test_metric_depth_calibrator_freezes_previous_mapping_without_new_anchors() -> None:
+    calibrator = MetricDepthCalibrator(min_depth=0.3, max_depth=6.0, ema_alpha=1.0)
+    intrinsics = CameraIntrinsics(fx=6.0, fy=6.0, cx=3.0, cy=2.0)
+    floor_mask = np.zeros((6, 6), dtype=bool)
+    floor_mask[3:, :] = True
+    segment = PanopticSegment(
+        segment_id=1,
+        label_id=1,
+        label="floor",
+        color_rgb=(0, 255, 0),
+        mask=floor_mask,
+        area_pixels=int(floor_mask.sum()),
+    )
+    ys, _xs = np.nonzero(floor_mask)
+    metric_floor_depth = 1.25 / np.maximum((ys.astype(np.float32) - intrinsics.cy) / intrinsics.fy, 1e-6)
+    first_raw = np.full((6, 6), 4.0, dtype=np.float32)
+    first_raw[floor_mask] = metric_floor_depth / 0.5
+    calibrator.correct(
+        first_raw,
+        intrinsics=intrinsics,
+        segments=[segment],
+        camera_height_m=1.25,
+        camera_pitch_deg=0.0,
+    )
+
+    second_raw = np.full((6, 6), 5.0, dtype=np.float32)
+    corrected = calibrator.correct(
+        second_raw,
+        intrinsics=intrinsics,
+        segments=[],
+        camera_height_m=1.25,
+        camera_pitch_deg=0.0,
+    )
+
+    assert corrected.correction_state == "frozen"
+    assert corrected.scale_factor == pytest.approx(0.5, rel=0.2)
+    assert np.median(corrected.depth_map) == pytest.approx(2.5, rel=0.2)

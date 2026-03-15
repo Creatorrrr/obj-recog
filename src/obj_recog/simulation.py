@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -11,6 +11,7 @@ import numpy as np
 
 from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
+from obj_recog.metric_stabilization import MetricCorrectionResult, MetricDepthCalibrator
 from obj_recog.reconstruct import CameraIntrinsics, back_project_pixels, intrinsics_for_frame
 from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context, planner_prompt_from_context
 from obj_recog.sim_protocol import (
@@ -97,6 +98,28 @@ class _ActiveMacroExecution:
     sent_camera_pitch_deg: float = 0.0
     microstep_count: int = 0
     allow_untracked_completion: bool = False
+    soft_block_streak: int = 0
+    recent_step_observations: list[_MicrostepProgressObservation] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _MacroMotionProgress:
+    commanded_progress_m: float | None
+    vision_progress_m: float | None
+    fused_progress_m: float | None
+    progress_source: str
+    commanded_yaw_deg: float | None = None
+    vision_yaw_deg: float | None = None
+    fused_yaw_deg: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MicrostepProgressObservation:
+    clearance_delta_m: float | None
+    scene_change_score: float
+    front_clearance_m: float | None
+    hard_blocked: bool
+    soft_blocked: bool
 
 
 class RgbSimulationBackend(Protocol):
@@ -275,6 +298,7 @@ class LivingRoomEpisodeRunner:
         self._latest_planner_schedule: ActionSchedule | None = None
         self._closed = False
         self._debug_microstep_trace: list[dict[str, object]] = []
+        self._metric_depth_calibrator = MetricDepthCalibrator()
         self._write_selfcalibration_artifact()
         self._write_planner_turns_artifact()
         self._write_episode_report()
@@ -453,6 +477,94 @@ class LivingRoomEpisodeRunner:
         return float(np.nanpercentile(valid, 30))
 
     @staticmethod
+    def _depth_percentiles(depth_map: np.ndarray) -> tuple[float, float, float]:
+        depth = np.asarray(depth_map, dtype=np.float32)
+        valid = depth[np.isfinite(depth) & (depth > 0.05)]
+        if valid.size == 0:
+            return (0.0, 0.0, 0.0)
+        return (
+            float(np.percentile(valid, 10.0)),
+            float(np.percentile(valid, 50.0)),
+            float(np.percentile(valid, 90.0)),
+        )
+
+    def prepare_runtime_artifacts(self, *, artifacts) -> None:
+        if bool(getattr(artifacts, "metric_depth_prepared", False)):
+            return
+        raw_depth_map = np.asarray(
+            getattr(artifacts, "raw_depth_map", getattr(artifacts, "depth_map", np.empty((0, 0)))),
+            dtype=np.float32,
+        )
+        if raw_depth_map.ndim != 2:
+            setattr(artifacts, "metric_depth_prepared", True)
+            return
+        artifacts.raw_depth_map = raw_depth_map.copy()
+        correction = self._metric_depth_calibrator.correct(
+            raw_depth_map,
+            intrinsics=self._camera_intrinsics_for_artifacts(artifacts),
+            segments=list(getattr(artifacts, "segments", []) or ()),
+            camera_height_m=float(self._camera_rig.camera_height_m),
+            camera_pitch_deg=float(self._current_camera_state.pitch_deg),
+        )
+        if self._maybe_update_motion_anchor(artifacts=artifacts, correction=correction):
+            correction = self._metric_depth_calibrator.apply(raw_depth_map)
+        artifacts.depth_map = np.asarray(correction.depth_map, dtype=np.float32)
+        artifacts.metric_depth_prepared = True
+        depth_diagnostics = getattr(artifacts, "depth_diagnostics", None)
+        if depth_diagnostics is not None:
+            artifacts.depth_diagnostics = replace(
+                depth_diagnostics,
+                normalized_distance_percentiles=self._depth_percentiles(artifacts.depth_map),
+                metric_scale_factor=float(correction.scale_factor),
+                metric_confidence=float(correction.confidence),
+                anchor_count=int(correction.anchor_count),
+                correction_state=str(correction.correction_state),
+            )
+
+    def _maybe_update_motion_anchor(
+        self,
+        *,
+        artifacts,
+        correction: MetricCorrectionResult,
+    ) -> bool:
+        execution = self._active_macro_execution
+        if execution is None or execution.command.kind is not CommandKind.TRANSLATE:
+            return False
+        if self._previous_observation_state is None:
+            return False
+        if self._state.phase != EpisodePhase.SELF_CALIBRATING or self._current_schedule is not None:
+            return False
+        previous_raw_depth = np.asarray(self._previous_observation_state.get("raw_depth_map", np.empty((0, 0))), dtype=np.float32)
+        current_raw_depth = np.asarray(getattr(artifacts, "raw_depth_map", np.empty((0, 0))), dtype=np.float32)
+        if previous_raw_depth.shape != current_raw_depth.shape or previous_raw_depth.ndim != 2:
+            return False
+        if self._previous_observation_state.get("target_detection") is not None:
+            return False
+        if self._target_visible_in_artifacts(artifacts=artifacts):
+            return False
+        current_forward_clearance = self._sector_clearance(
+            correction.depth_map,
+            x_bounds=(0.35, 0.65),
+            y_bounds=(0.45, 0.95),
+        )
+        if current_forward_clearance is None or float(current_forward_clearance) < 1.2:
+            return False
+        if float(current_forward_clearance) < 0.45:
+            return False
+        last_step_m = min(
+            float(_DEFAULT_MICROSTEP_LIMITS["translate_distance_m"]),
+            max(0.0, float(execution.sent_translation_m)),
+        )
+        if last_step_m <= 1e-6:
+            return False
+        return self._metric_depth_calibrator.update_motion_anchor(
+            previous_raw_depth,
+            current_raw_depth,
+            direction=str(execution.command.direction or "forward"),
+            commanded_delta_m=last_step_m,
+        )
+
+    @staticmethod
     def _direction_from_action_text(action_text: str) -> str | None:
         text = str(action_text or "")
         if ":left" in text:
@@ -561,9 +673,9 @@ class LivingRoomEpisodeRunner:
         candidate_open_directions = tuple(
             direction
             for direction, clearance in sorted(direction_scores.items(), key=lambda item: item[1], reverse=True)
-            if clearance >= 1.15
+            if clearance >= 1.20
         )
-        front_blocked = forward_clearance_m is not None and forward_clearance_m < 0.8
+        front_blocked = forward_clearance_m is not None and forward_clearance_m < 0.70
         side_clearances = [value for value in (left_clearance_m, right_clearance_m) if value is not None]
         side_best = max(side_clearances) if side_clearances else None
         dead_end_likelihood = 0.15
@@ -597,6 +709,8 @@ class LivingRoomEpisodeRunner:
         )
 
     def _observation_state_from_artifacts(self, *, artifacts) -> dict[str, object]:
+        if not bool(getattr(artifacts, "metric_depth_prepared", False)):
+            self.prepare_runtime_artifacts(artifacts=artifacts)
         navigation_affordances = self._navigation_affordances_summary(artifacts=artifacts)
         target_detection = self._target_detection_summary(artifacts=artifacts)
         scene_graph_snapshot = getattr(artifacts, "scene_graph_snapshot", None)
@@ -609,6 +723,11 @@ class LivingRoomEpisodeRunner:
                 getattr(artifacts, "camera_pose_world", np.empty((0, 0))),
                 dtype=np.float32,
             ).copy(),
+            "raw_depth_map": np.asarray(
+                getattr(artifacts, "raw_depth_map", getattr(artifacts, "depth_map", np.empty((0, 0)))),
+                dtype=np.float32,
+            ).copy(),
+            "corrected_depth_map": np.asarray(getattr(artifacts, "depth_map", np.empty((0, 0))), dtype=np.float32).copy(),
             "yaw_deg": self._camera_yaw_deg(getattr(artifacts, "camera_pose_world", None)),
             "target_detection": target_detection,
             "visible_detection_labels": tuple(
@@ -808,47 +927,124 @@ class LivingRoomEpisodeRunner:
             return "weaker"
         return "stable"
 
-    @staticmethod
-    def _translate_success_threshold(requested_translation_m: float) -> float:
-        return max(float(requested_translation_m) * 0.6, float(requested_translation_m) - 0.08)
-
-    @staticmethod
-    def _rotate_success_threshold(requested_yaw_deg: float) -> float:
-        return max(float(requested_yaw_deg) * 0.7, float(requested_yaw_deg) - 4.0)
-
-    def _macro_motion_from_states(
-        self,
-        *,
-        start_state: dict[str, object],
-        current_state: dict[str, object],
-    ) -> tuple[float | None, float | None]:
-        translation_progress = self._pose_progress_m(
-            start_state.get("camera_pose_world"),
-            current_state.get("camera_pose_world"),
-        )
-        yaw_delta_deg = self._angle_delta_deg(
-            start_state.get("yaw_deg"),
-            current_state.get("yaw_deg"),
-        )
-        return translation_progress, None if yaw_delta_deg is None else abs(float(yaw_delta_deg))
-
-    def _macro_likely_blocked(
+    def _macro_motion_progress(
         self,
         *,
         execution: _ActiveMacroExecution,
-        measured_translation_m: float | None,
-        measured_yaw_deg: float | None,
-    ) -> bool:
-        command = execution.command
-        if command.kind is CommandKind.TRANSLATE:
-            if execution.requested_translation_m <= 0.0 or execution.sent_translation_m < (execution.requested_translation_m * 0.5):
-                return False
-            return measured_translation_m is None or float(measured_translation_m) < 0.03
-        if command.kind is CommandKind.ROTATE_BODY:
-            if execution.requested_yaw_deg <= 0.0 or execution.sent_yaw_deg < (execution.requested_yaw_deg * 0.5):
-                return False
-            return measured_yaw_deg is None or float(measured_yaw_deg) < 3.0
-        return False
+        start_state: dict[str, object],
+        current_state: dict[str, object],
+    ) -> _MacroMotionProgress:
+        vision_translation_m = self._pose_progress_m(
+            start_state.get("camera_pose_world"),
+            current_state.get("camera_pose_world"),
+        )
+        vision_yaw_deg = self._angle_delta_deg(
+            start_state.get("yaw_deg"),
+            current_state.get("yaw_deg"),
+        )
+        commanded_progress_m = None
+        commanded_yaw_deg = None
+        fused_progress_m = None
+        fused_yaw_deg = None
+        progress_source = "none"
+        if execution.command.kind is CommandKind.TRANSLATE:
+            commanded_progress_m = float(execution.sent_translation_m)
+            fused_progress_m = float(execution.sent_translation_m)
+            progress_source = "commanded"
+        elif execution.command.kind is CommandKind.ROTATE_BODY:
+            commanded_yaw_deg = float(execution.sent_yaw_deg)
+            fused_yaw_deg = float(execution.sent_yaw_deg)
+            progress_source = "commanded"
+        elif execution.command.kind in {CommandKind.AIM_CAMERA, CommandKind.PAUSE}:
+            vision_translation_m = 0.0
+            vision_yaw_deg = 0.0
+            fused_progress_m = 0.0
+            fused_yaw_deg = 0.0
+            progress_source = "clamped"
+        return _MacroMotionProgress(
+            commanded_progress_m=commanded_progress_m,
+            vision_progress_m=None if vision_translation_m is None else float(vision_translation_m),
+            fused_progress_m=fused_progress_m,
+            progress_source=progress_source,
+            commanded_yaw_deg=commanded_yaw_deg,
+            vision_yaw_deg=None if vision_yaw_deg is None else abs(float(vision_yaw_deg)),
+            fused_yaw_deg=fused_yaw_deg,
+        )
+
+    @staticmethod
+    def _scene_change_score(previous_depth_map: np.ndarray, current_depth_map: np.ndarray) -> float:
+        previous = np.asarray(previous_depth_map, dtype=np.float32)
+        current = np.asarray(current_depth_map, dtype=np.float32)
+        if previous.shape != current.shape or previous.ndim != 2:
+            return 0.0
+        height, width = previous.shape[:2]
+        x1 = int(round(width * 0.3))
+        x2 = int(round(width * 0.7))
+        y1 = int(round(height * 0.5))
+        y2 = int(round(height * 0.9))
+        previous_roi = previous[y1:y2, x1:x2]
+        current_roi = current[y1:y2, x1:x2]
+        valid = (
+            np.isfinite(previous_roi)
+            & np.isfinite(current_roi)
+            & (previous_roi > 0.05)
+            & (current_roi > 0.05)
+        )
+        if not np.any(valid):
+            return 0.0
+        return float(np.nanmedian(np.abs(previous_roi[valid] - current_roi[valid])))
+
+    def _microstep_progress_observation(
+        self,
+        *,
+        execution: _ActiveMacroExecution,
+        previous_state: dict[str, object] | None,
+        current_state: dict[str, object],
+    ) -> _MicrostepProgressObservation:
+        if execution.command.kind is not CommandKind.TRANSLATE or previous_state is None:
+            return _MicrostepProgressObservation(
+                clearance_delta_m=None,
+                scene_change_score=0.0,
+                front_clearance_m=None,
+                hard_blocked=False,
+                soft_blocked=False,
+            )
+        previous_affordances = previous_state.get("navigation_affordances")
+        current_affordances = current_state.get("navigation_affordances")
+        previous_front_clearance = (
+            None
+            if not isinstance(previous_affordances, PlannerNavigationAffordances)
+            else previous_affordances.forward_clearance_m
+        )
+        current_front_clearance = (
+            None
+            if not isinstance(current_affordances, PlannerNavigationAffordances)
+            else current_affordances.forward_clearance_m
+        )
+        clearance_delta_m = None
+        if previous_front_clearance is not None and current_front_clearance is not None:
+            clearance_delta_m = float(current_front_clearance) - float(previous_front_clearance)
+        scene_change_score = self._scene_change_score(
+            np.asarray(previous_state.get("corrected_depth_map", np.empty((0, 0))), dtype=np.float32),
+            np.asarray(current_state.get("corrected_depth_map", np.empty((0, 0))), dtype=np.float32),
+        )
+        hard_blocked = current_front_clearance is not None and float(current_front_clearance) < 0.45
+        soft_blocked = bool(
+            not hard_blocked
+            and clearance_delta_m is not None
+            and abs(float(clearance_delta_m)) < 0.08
+            and scene_change_score < 0.06
+            and previous_front_clearance is not None
+            and current_front_clearance is not None
+            and float(current_front_clearance) <= float(previous_front_clearance) + 0.04
+        )
+        return _MicrostepProgressObservation(
+            clearance_delta_m=clearance_delta_m,
+            scene_change_score=scene_change_score,
+            front_clearance_m=current_front_clearance,
+            hard_blocked=bool(hard_blocked),
+            soft_blocked=bool(soft_blocked),
+        )
 
     def _record_macro_effect(
         self,
@@ -858,10 +1054,15 @@ class LivingRoomEpisodeRunner:
         current_state: dict[str, object],
     ) -> None:
         estimated_motion_parts: list[str] = []
-        if executed_macro.measured_translation_m is not None:
-            estimated_motion_parts.append(f"translation={float(executed_macro.measured_translation_m):.2f}m")
+        if executed_macro.commanded_progress_m is not None:
+            estimated_motion_parts.append(f"commanded={float(executed_macro.commanded_progress_m):.2f}m")
+        if executed_macro.vision_progress_m is not None:
+            estimated_motion_parts.append(f"vision={float(executed_macro.vision_progress_m):.2f}m")
+        if executed_macro.fused_progress_m is not None:
+            estimated_motion_parts.append(f"fused={float(executed_macro.fused_progress_m):.2f}m")
         if executed_macro.measured_yaw_deg is not None:
             estimated_motion_parts.append(f"yaw={float(executed_macro.measured_yaw_deg):+.1f}deg")
+        estimated_motion_parts.append(f"source={str(executed_macro.progress_source)}")
         if executed_macro.command.kind is CommandKind.AIM_CAMERA:
             estimated_motion_parts.append(
                 f"camera=yaw{self._current_camera_state.yaw_deg:+.1f}/pitch{self._current_camera_state.pitch_deg:+.1f}"
@@ -880,6 +1081,10 @@ class LivingRoomEpisodeRunner:
             target_evidence_change=executed_macro.target_evidence_change,
             likely_blocked=bool(not executed_macro.completed and executed_macro.aborted),
             aborted=bool(executed_macro.aborted),
+            commanded_progress_m=executed_macro.commanded_progress_m,
+            vision_progress_m=executed_macro.vision_progress_m,
+            fused_progress_m=executed_macro.fused_progress_m,
+            progress_source=str(executed_macro.progress_source),
         )
         self._recent_action_effects.append(effect)
         self._recent_action_effects = self._recent_action_effects[-4:]
@@ -897,7 +1102,8 @@ class LivingRoomEpisodeRunner:
         execution = self._active_macro_execution
         if execution is None:
             return None
-        measured_translation_m, measured_yaw_deg = self._macro_motion_from_states(
+        progress = self._macro_motion_progress(
+            execution=execution,
             start_state=execution.start_state,
             current_state=current_state,
         )
@@ -907,14 +1113,18 @@ class LivingRoomEpisodeRunner:
         )
         executed_macro = ExecutedMacroCommand(
             command=execution.command,
-            measured_translation_m=measured_translation_m,
-            measured_yaw_deg=measured_yaw_deg,
+            measured_translation_m=progress.fused_progress_m,
+            measured_yaw_deg=progress.fused_yaw_deg,
             completed=bool(completed),
             aborted=bool(aborted),
             microstep_count=int(execution.microstep_count),
             target_evidence_change=target_evidence_change,
-            pose_progress_m=measured_translation_m,
+            pose_progress_m=progress.vision_progress_m,
             intent=str(execution.command.intent or ""),
+            commanded_progress_m=progress.commanded_progress_m,
+            vision_progress_m=progress.vision_progress_m,
+            fused_progress_m=progress.fused_progress_m,
+            progress_source=str(progress.progress_source),
         )
         self._record_macro_effect(
             executed_macro=executed_macro,
@@ -1510,11 +1720,6 @@ class LivingRoomEpisodeRunner:
         if execution is None:
             return
         is_self_calibration_macro = self._state.phase == EpisodePhase.SELF_CALIBRATING and self._current_schedule is None
-        measured_translation_m, measured_yaw_deg = self._macro_motion_from_states(
-            start_state=execution.start_state,
-            current_state=current_state,
-        )
-        tracking_status = str(current_state.get("tracking_status", "UNKNOWN"))
         target_evidence_change = self._target_evidence_change_text(
             execution.start_state.get("target_detection"),
             current_state.get("target_detection"),
@@ -1524,47 +1729,45 @@ class LivingRoomEpisodeRunner:
         aborted = False
         replan_after_finalize = False
         if execution.command.kind is CommandKind.TRANSLATE:
-            if is_self_calibration_macro or execution.allow_untracked_completion:
-                completed = execution.sent_translation_m >= execution.requested_translation_m - 1e-6
-                aborted = False
-                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
-                    completed = True
-                    replan_after_finalize = True
+            step_observation = self._microstep_progress_observation(
+                execution=execution,
+                previous_state=self._previous_observation_state,
+                current_state=current_state,
+            )
+            execution.recent_step_observations.append(step_observation)
+            execution.recent_step_observations = execution.recent_step_observations[-2:]
+            if step_observation.soft_blocked:
+                execution.soft_block_streak += 1
             else:
-                completed = measured_translation_m is not None and float(measured_translation_m) >= self._translate_success_threshold(execution.requested_translation_m)
-                aborted = self._macro_likely_blocked(
-                    execution=execution,
-                    measured_translation_m=measured_translation_m,
-                    measured_yaw_deg=measured_yaw_deg,
+                execution.soft_block_streak = 0
+            hard_blocked = bool(step_observation.hard_blocked)
+            soft_blocked = execution.soft_block_streak >= 2
+            evidence_replan_allowed = target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES
+            if str(execution.command.direction or "") == "forward":
+                committed_distance_m = max(0.24, 0.35 * float(execution.requested_translation_m))
+                evidence_replan_allowed = evidence_replan_allowed and (
+                    float(execution.sent_translation_m) >= committed_distance_m - 1e-6
                 )
-                if not body_motion_allowed_now:
-                    aborted = True
-                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
-                    completed = True
-                    replan_after_finalize = True
-                elif execution.sent_translation_m >= execution.requested_translation_m - 1e-6 and not completed:
-                    aborted = True
+            else:
+                evidence_replan_allowed = evidence_replan_allowed and execution.microstep_count > 0
+            if not body_motion_allowed_now and not (is_self_calibration_macro or execution.allow_untracked_completion):
+                aborted = True
+            elif hard_blocked or soft_blocked:
+                aborted = True
+            elif execution.sent_translation_m >= execution.requested_translation_m - 1e-6:
+                completed = True
+                replan_after_finalize = bool(evidence_replan_allowed)
+            elif evidence_replan_allowed:
+                completed = True
+                replan_after_finalize = True
         elif execution.command.kind is CommandKind.ROTATE_BODY:
-            if is_self_calibration_macro or execution.allow_untracked_completion:
-                completed = execution.sent_yaw_deg >= execution.requested_yaw_deg - 1e-6
-                aborted = False
-                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
-                    completed = True
-                    replan_after_finalize = True
-            else:
-                completed = measured_yaw_deg is not None and float(measured_yaw_deg) >= self._rotate_success_threshold(execution.requested_yaw_deg)
-                aborted = self._macro_likely_blocked(
-                    execution=execution,
-                    measured_translation_m=measured_translation_m,
-                    measured_yaw_deg=measured_yaw_deg,
-                )
-                if not body_motion_allowed_now:
-                    aborted = True
-                if target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
-                    completed = True
-                    replan_after_finalize = True
-                elif execution.sent_yaw_deg >= execution.requested_yaw_deg - 1e-6 and not completed:
-                    aborted = True
+            if not body_motion_allowed_now and not (is_self_calibration_macro or execution.allow_untracked_completion):
+                aborted = True
+            elif execution.sent_yaw_deg >= execution.requested_yaw_deg - 1e-6:
+                completed = True
+            elif target_evidence_change in _TARGET_EVIDENCE_REPLAN_STATES and execution.microstep_count > 0:
+                completed = True
+                replan_after_finalize = True
         elif execution.command.kind is CommandKind.AIM_CAMERA:
             completed = (
                 abs(float(self._current_camera_state.yaw_deg) - float(execution.target_camera_yaw_deg or 0.0)) <= 0.25

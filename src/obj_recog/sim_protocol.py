@@ -207,6 +207,10 @@ class PlannerActionEffectSummary:
     target_evidence_change: str
     likely_blocked: bool
     aborted: bool = False
+    commanded_progress_m: float | None = None
+    vision_progress_m: float | None = None
+    fused_progress_m: float | None = None
+    progress_source: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +343,10 @@ class ExecutedMacroCommand:
     target_evidence_change: str
     pose_progress_m: float | None = None
     intent: str = ""
+    commanded_progress_m: float | None = None
+    vision_progress_m: float | None = None
+    fused_progress_m: float | None = None
+    progress_source: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

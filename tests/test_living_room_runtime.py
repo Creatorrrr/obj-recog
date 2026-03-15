@@ -140,7 +140,10 @@ def _artifacts(
     camera_pose_world: np.ndarray | None = None,
     tracked_feature_count: int = 0,
     median_reprojection_error: float | None = None,
+    raw_depth_map: np.ndarray | None = None,
+    metric_depth_prepared: bool = False,
 ):
+    depth_map = np.full((12, 16), depth_m, dtype=np.float32)
     return type(
         "Artifacts",
         (),
@@ -151,7 +154,13 @@ def _artifacts(
             "scene_graph_snapshot": None,
             "mesh_vertices_xyz": np.zeros((4, 3), dtype=np.float32),
             "mesh_triangles": np.empty((0, 3), dtype=np.int32),
-            "depth_map": np.full((12, 16), depth_m, dtype=np.float32),
+            "depth_map": depth_map,
+            "raw_depth_map": (
+                np.asarray(raw_depth_map, dtype=np.float32)
+                if raw_depth_map is not None
+                else depth_map.copy()
+            ),
+            "metric_depth_prepared": bool(metric_depth_prepared),
             "slam_tracking_state": slam_tracking_state,
             "camera_pose_world": (
                 np.asarray(camera_pose_world, dtype=np.float32)
@@ -382,12 +391,17 @@ def test_living_room_runtime_logs_macro_actions_once_even_when_microstepped(tmp_
     runner._state.phase = EpisodePhase.REASSESS
     runner._state.selfcal_step_index = len(runner._selfcal_actions)
 
-    for _ in range(2):
+    for _ in range(3):
         packet = runner.next_frame()
         assert packet is not None
         runner.record_runtime_observation(
             frame_packet=packet,
-            artifacts=_artifacts(packet, depth_m=0.6, camera_pose_world=np.eye(4, dtype=np.float32)),
+            artifacts=_artifacts(
+                packet,
+                depth_m=0.6,
+                camera_pose_world=np.eye(4, dtype=np.float32),
+                metric_depth_prepared=True,
+            ),
         )
 
     assert len(planner.calls) >= 2
@@ -400,6 +414,203 @@ def test_living_room_runtime_logs_macro_actions_once_even_when_microstepped(tmp_
     assert search.executed_actions == ("translate:forward:distance_m:0.12",)
     assert search.likely_blocked is True
     assert search.pose_progress_m == pytest.approx(0.0)
+
+
+def test_living_room_runtime_clamps_camera_only_drift_progress_to_zero(tmp_path: Path) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                commands=(
+                    MotionCommand(
+                        kind=CommandKind.AIM_CAMERA,
+                        yaw_deg=-8.0,
+                        pitch_deg=0.0,
+                        intent="scan left",
+                    ),
+                ),
+                rationale="scan left",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                commands=(MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="reassess"),),
+                rationale="reassess",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, metric_depth_prepared=True),
+    )
+
+    drift_pose = np.eye(4, dtype=np.float32)
+    drift_pose[0, 3] = 0.9
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, camera_pose_world=drift_pose, metric_depth_prepared=True),
+    )
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, camera_pose_world=drift_pose, metric_depth_prepared=True),
+    )
+
+    effect = planner.calls[1].recent_action_effects[0]
+    assert effect.action == "aim_camera:yaw=-8.0:pitch=0.0"
+    assert effect.commanded_progress_m is None
+    assert effect.vision_progress_m == pytest.approx(0.0)
+    assert effect.fused_progress_m == pytest.approx(0.0)
+    assert effect.progress_source == "clamped"
+
+
+def test_living_room_runtime_completes_translation_from_commanded_progress_when_pose_scale_stalls(
+    tmp_path: Path,
+) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                commands=(
+                    MotionCommand(
+                        kind=CommandKind.TRANSLATE,
+                        direction="forward",
+                        mode="distance_m",
+                        value=0.12,
+                        intent="advance",
+                    ),
+                ),
+                rationale="advance",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+            ActionSchedule(
+                commands=(MotionCommand(kind=CommandKind.PAUSE, duration_sec=0.5, intent="reassess"),),
+                rationale="reassess",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=_FakeSensorBackend(),
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, depth_m=2.0, metric_depth_prepared=True),
+    )
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(
+            packet,
+            depth_m=1.75,
+            camera_pose_world=np.eye(4, dtype=np.float32),
+            metric_depth_prepared=True,
+        ),
+    )
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(
+            packet,
+            depth_m=1.60,
+            camera_pose_world=np.eye(4, dtype=np.float32),
+            metric_depth_prepared=True,
+        ),
+    )
+
+    effect = planner.calls[1].recent_action_effects[0]
+    assert effect.action == "translate:forward:distance_m:0.12"
+    assert effect.aborted is False
+    assert effect.likely_blocked is False
+    assert effect.commanded_progress_m == pytest.approx(0.12)
+    assert effect.vision_progress_m == pytest.approx(0.0)
+    assert effect.fused_progress_m == pytest.approx(0.12)
+    assert effect.progress_source == "commanded"
+
+
+def test_living_room_runtime_does_not_replan_forward_translation_before_committed_distance(
+    tmp_path: Path,
+) -> None:
+    planner = _FakePlanner(
+        [
+            ActionSchedule(
+                commands=(
+                    MotionCommand(
+                        kind=CommandKind.TRANSLATE,
+                        direction="forward",
+                        mode="distance_m",
+                        value=0.72,
+                        intent="approach target",
+                    ),
+                ),
+                rationale="approach target",
+                model="fake-planner",
+                issued_at_frame=0,
+            ),
+        ]
+    )
+    backend = _FakeSensorBackend()
+    runner = LivingRoomEpisodeRunner(
+        config=_config(),
+        report_path=tmp_path / "episode.json",
+        planner=planner,
+        sensor_backend=backend,
+    )
+    runner._state.phase = EpisodePhase.REASSESS
+    runner._state.selfcal_step_index = len(runner._selfcal_actions)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(packet, depth_m=2.0, metric_depth_prepared=True),
+    )
+    assert backend.apply_calls[0].translate_forward_m == pytest.approx(0.08)
+
+    packet = runner.next_frame()
+    assert packet is not None
+    runner.record_runtime_observation(
+        frame_packet=packet,
+        artifacts=_artifacts(
+            packet,
+            detections=[_detection(label="dining_table", xyxy=(3, 2, 13, 10))],
+            depth_m=1.8,
+            metric_depth_prepared=True,
+        ),
+    )
+
+    assert len(backend.apply_calls) >= 2
+    assert backend.apply_calls[1].translate_forward_m == pytest.approx(0.08)
+    assert runner.current_schedule is not None
 
 
 def test_living_room_runtime_uses_escape_schedule_for_contradictory_commands(tmp_path: Path) -> None:

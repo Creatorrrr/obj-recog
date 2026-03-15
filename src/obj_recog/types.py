@@ -48,6 +48,10 @@ class DepthDiagnostics:
     mesh_z_span: float
     intrinsics_summary: tuple[float, float, float, float]
     hint: str
+    metric_scale_factor: float = 1.0
+    metric_confidence: float = 0.0
+    anchor_count: int = 0
+    correction_state: str = "raw"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,3 +96,5 @@ class FrameArtifacts:
     visible_graph_nodes: list[GraphNode] = field(default_factory=list)
     visible_graph_edges: list[GraphEdge] = field(default_factory=list)
     mesh_revision: int | None = None
+    raw_depth_map: np.ndarray | None = None
+    metric_depth_prepared: bool = False

@@ -515,6 +515,8 @@ def process_frame(
             cv2_module=cv2,
             prefer_cuda=prefer_opencv_cuda,
         )
+    depth_map = np.asarray(depth_map, dtype=np.float32)
+    raw_depth_map = depth_map.copy()
 
     if calibration is not None:
         intrinsics = intrinsics_from_calibration(
@@ -707,6 +709,10 @@ def process_frame(
                 dense_z_span=dense_z_span,
                 mesh_z_span=mesh_z_span,
             ),
+            metric_scale_factor=1.0,
+            metric_confidence=0.0,
+            anchor_count=0,
+            correction_state="raw",
         )
     else:
         depth_diagnostics = DepthDiagnostics(
@@ -731,6 +737,10 @@ def process_frame(
                 dense_z_span=dense_z_span,
                 mesh_z_span=mesh_z_span,
             ),
+            metric_scale_factor=float(depth_diagnostics.metric_scale_factor),
+            metric_confidence=float(depth_diagnostics.metric_confidence),
+            anchor_count=int(depth_diagnostics.anchor_count),
+            correction_state=str(depth_diagnostics.correction_state),
         )
 
     artifacts = FrameArtifacts(
@@ -761,6 +771,8 @@ def process_frame(
         depth_diagnostics=depth_diagnostics,
         perception_diagnostics=perception_diagnostics,
         mesh_revision=(None if mesh_revision is None else int(mesh_revision)),
+        raw_depth_map=raw_depth_map,
+        metric_depth_prepared=False,
     )
     return artifacts, list(detections)
 
@@ -1694,11 +1706,19 @@ def run(
                                         dense_z_span=artifacts.depth_diagnostics.dense_z_span,
                                         mesh_z_span=mesh_z_span,
                                     ),
+                                    metric_scale_factor=float(artifacts.depth_diagnostics.metric_scale_factor),
+                                    metric_confidence=float(artifacts.depth_diagnostics.metric_confidence),
+                                    anchor_count=int(artifacts.depth_diagnostics.anchor_count),
+                                    correction_state=str(artifacts.depth_diagnostics.correction_state),
                                 )
 
             if cached_segmentation is not None:
                 artifacts.segmentation_overlay_bgr = cached_segmentation.overlay_bgr
                 artifacts.segments = list(cached_segmentation.segments)
+
+            prepare_runtime_artifacts = getattr(frame_source, "prepare_runtime_artifacts", None)
+            if frame_packet is not None and callable(prepare_runtime_artifacts):
+                prepare_runtime_artifacts(artifacts=artifacts)
 
             if scene_graph_memory is not None:
                 if calibration is not None:

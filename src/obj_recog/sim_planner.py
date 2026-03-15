@@ -1034,6 +1034,10 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                     "target_evidence_change": item.target_evidence_change,
                     "likely_blocked": bool(item.likely_blocked),
                     "aborted": bool(item.aborted),
+                    "commanded_progress_m": item.commanded_progress_m,
+                    "vision_progress_m": item.vision_progress_m,
+                    "fused_progress_m": item.fused_progress_m,
+                    "progress_source": item.progress_source,
                 }
                 for item in context.recent_action_effects
             ],
@@ -1210,6 +1214,10 @@ def _planner_request_payload(context: PlannerContext) -> dict[str, object]:
                 "target_evidence_change": item.target_evidence_change,
                 "likely_blocked": bool(item.likely_blocked),
                 "aborted": bool(item.aborted),
+                "commanded_progress_m": item.commanded_progress_m,
+                "vision_progress_m": item.vision_progress_m,
+                "fused_progress_m": item.fused_progress_m,
+                "progress_source": item.progress_source,
             }
             for item in context.recent_action_effects
         ],
