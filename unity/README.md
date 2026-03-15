@@ -54,6 +54,33 @@ No depth, semantic mask, instance mask, pose, intrinsics, or hidden-goal state a
 4. Keep the imported assets at the default path under `Assets/Brick Project Studio/`.
 5. Load `Assets/Scenes/LivingRoomMain.unity`.
 6. Press Play to test `manual` mode in the editor.
-7. Build a Windows standalone player from the same scene.
+7. Build a standalone player from the same scene.
 
 The bootstrap keeps the ApartmentKit environment intact and wires the robot rig, hidden goal trigger, HUD, and TCP server automatically.
+
+## macOS Build And Launch
+
+From the repo root, create a macOS player bundle with:
+
+```bash
+scripts/build_unity_macos.sh
+```
+
+The default output is `build/unity/macos/obj-recog-unity.app`. Launch the simulator from Python with:
+
+```bash
+set -a; source .env; set +a
+PYTHONPATH=src python -m obj_recog.main \
+  --input-source sim \
+  --scenario living_room_navigation_v1 \
+  --unity-player-path build/unity/macos/obj-recog-unity.app \
+  --camera-calibration calibration/calibration.yaml \
+  --sim-planner-model gpt-5-mini \
+  --sim-planner-timeout-sec 8 \
+  --sim-replan-interval-sec 4 \
+  --sim-selfcal-max-sec 6 \
+  --sim-action-batch-size 6 \
+  --explanation-mode off
+```
+
+If you prefer to keep Unity running in the editor, start the scene in `agent` mode and connect from Python with `--unity-host` and `--unity-port` instead of `--unity-player-path`.

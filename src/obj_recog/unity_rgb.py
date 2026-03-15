@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 import json
+import plistlib
 import socket
 import struct
 import subprocess
@@ -116,9 +117,7 @@ class UnityRgbClient:
     def _launch_player(self) -> None:
         if self._process is not None:
             return
-        player_path = Path(self._unity_player_path or "")
-        if not player_path.is_file():
-            raise RuntimeError(f"Unity player not found: {player_path}")
+        player_path = _resolve_unity_player_launch_path(self._unity_player_path or "")
         launch_args = list(self._player_args)
         if not any(str(item).startswith("--obj-recog-mode=") for item in launch_args):
             launch_args.insert(0, "--obj-recog-mode=agent")
@@ -129,6 +128,42 @@ class UnityRgbClient:
             f"--obj-recog-port={self._port}",
         ]
         self._process = subprocess.Popen(command)
+
+
+def _resolve_unity_player_launch_path(unity_player_path: str | Path) -> Path:
+    player_path = Path(unity_player_path).expanduser()
+    if player_path.suffix.lower() == ".app":
+        if not player_path.exists():
+            raise RuntimeError(f"Unity player not found: {player_path}")
+        for executable_path in _unity_app_bundle_executable_candidates(player_path):
+            if executable_path.is_file():
+                return executable_path
+        raise RuntimeError(f"Unity player app bundle is missing executable: {player_path}")
+    if not player_path.is_file():
+        raise RuntimeError(f"Unity player not found: {player_path}")
+    return player_path
+
+
+def _unity_app_bundle_executable_candidates(player_path: Path) -> tuple[Path, ...]:
+    contents_path = player_path / "Contents"
+    macos_path = contents_path / "MacOS"
+    candidates: list[Path] = []
+    info_plist_path = contents_path / "Info.plist"
+    if info_plist_path.is_file():
+        info_plist = plistlib.loads(info_plist_path.read_bytes())
+        executable_name = info_plist.get("CFBundleExecutable")
+        if isinstance(executable_name, str) and executable_name:
+            candidates.append(macos_path / executable_name)
+    candidates.append(macos_path / player_path.stem)
+    if macos_path.is_dir():
+        files = sorted(path for path in macos_path.iterdir() if path.is_file())
+        if len(files) == 1:
+            candidates.append(files[0])
+    unique_candidates: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+    return tuple(unique_candidates)
 
 
 def command_from_step(primitive: ActionPrimitive, value: float) -> UnityActionCommand:

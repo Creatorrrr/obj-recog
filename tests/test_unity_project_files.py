@@ -4,15 +4,18 @@ from pathlib import Path
 
 
 def test_unity_project_scaffold_exists() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
     unity_root = Path(__file__).resolve().parents[1] / "unity"
     manifest_text = (unity_root / "Packages" / "manifest.json").read_text(encoding="utf-8")
 
+    assert (repo_root / "scripts" / "build_unity_macos.sh").is_file()
     assert (unity_root / "Packages" / "manifest.json").is_file()
     assert (unity_root / "ProjectSettings" / "ProjectVersion.txt").is_file()
     assert (unity_root / "ProjectSettings" / "EditorBuildSettings.asset").is_file()
     assert (unity_root / "Assets" / "Scenes" / "LivingRoomMain.unity").is_file()
     assert (unity_root / "Assets" / "Scripts" / "Runtime" / "LivingRoomAppBootstrap.cs").is_file()
     assert (unity_root / "Assets" / "Scripts" / "Runtime" / "AgentTcpServer.cs").is_file()
+    assert (unity_root / "Assets" / "Scripts" / "Editor" / "MacOsBuild.cs").is_file()
     assert '"com.unity.modules.animation": "1.0.0"' in manifest_text
 
 

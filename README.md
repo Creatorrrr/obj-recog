@@ -149,7 +149,7 @@ PYTHONPATH=src python -m obj_recog.unity_vendor_check --unity-project-root unity
 Open the project in Unity 6 LTS `6000.3.11f1`, then:
 
 - run Play mode with no special arguments for `manual` keyboard/mouse control
-- build a Windows standalone player and let Python launch it in `agent` mode
+- build a standalone player and let Python launch it in `agent` mode
 
 Do not edit files under `Assets/Brick Project Studio`. If the environment needs customization, create tracked copies or prefab/material variants in a separate project folder.
 
@@ -164,17 +164,23 @@ Manual mode controls:
 - `F1`: HUD toggle
 - `Esc`: release cursor, then press again to quit
 
-Run it like this:
+On macOS, build the Unity player once:
 
 ```bash
+scripts/build_unity_macos.sh
+```
+
+Then run the simulator and point Python at the `.app` bundle:
+
+```bash
+set -a; source .env; set +a
 PYTHONPATH=src python -m obj_recog.main \
   --input-source sim \
   --scenario living_room_navigation_v1 \
-  --unity-player-path C:/path/to/obj-recog-unity.exe \
+  --unity-player-path build/unity/macos/obj-recog-unity.app \
   --width 640 \
   --height 360 \
   --device auto \
-  --opencv-cuda on \
   --detector-backend torch \
   --depth-profile fast \
   --segmentation-mode panoptic \
@@ -187,13 +193,36 @@ PYTHONPATH=src python -m obj_recog.main \
   --explanation-mode off
 ```
 
+On Windows, point Python at the built `.exe` instead:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m obj_recog.main `
+  --input-source sim `
+  --scenario living_room_navigation_v1 `
+  --unity-player-path C:\path\to\obj-recog-unity.exe `
+  --width 640 `
+  --height 360 `
+  --device auto `
+  --detector-backend torch `
+  --depth-profile fast `
+  --segmentation-mode panoptic `
+  --camera-calibration calibration\calibration.yaml `
+  --sim-planner-model gpt-5-mini `
+  --sim-planner-timeout-sec 8 `
+  --sim-replan-interval-sec 4 `
+  --sim-selfcal-max-sec 6 `
+  --sim-action-batch-size 6 `
+  --explanation-mode off
+```
+
 Useful sim flags:
 
 - `--sim-headless`: run without the desktop windows.
 - `--unity-host` / `--unity-port`: connect to an already-running Unity player.
 - `--sim-planner-model`: choose the LLM used for navigation planning.
 - `--sim-interface-mode rgb_only`: enforce the RGB-only contract.
-- `--unity-player-path`: launch the same player build in `agent` mode with `--obj-recog-mode=agent`.
+- `--unity-player-path`: launch a built Unity player in `agent` mode. On macOS this can be a `.app` bundle or the inner executable.
 
 Visible sim windows:
 
