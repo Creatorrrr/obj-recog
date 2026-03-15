@@ -115,6 +115,7 @@ class AppConfig:
     scenario_preview_shots: bool = False
     validate_all_scenarios: bool = False
     validation_output_dir: str | None = None
+    temporal_stereo: str = "on"
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--unity-port", type=_positive_int, default=DEFAULT_UNITY_PORT)
     parser.add_argument("--explanation-mode", choices=("on", "off"), default="on")
     parser.add_argument("--explanation-model", type=str, default=DEFAULT_EXPLANATION_MODEL)
+    parser.add_argument("--temporal-stereo", choices=("on", "off"), default="on")
     parser.add_argument("--camera-calibration", type=str, default=os.getenv("CAMERA_CALIBRATION"))
     parser.add_argument("--recalibrate", action="store_true")
     parser.add_argument("--disable-slam-calibration", action="store_true")
@@ -409,6 +411,7 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         max_mesh_triangles=DEFAULT_MAX_MESH_TRIANGLES,
         explanation_enabled=args.explanation_mode == "on",
         explanation_model=args.explanation_model,
+        temporal_stereo=args.temporal_stereo,
         explanation_timeout_sec=DEFAULT_EXPLANATION_TIMEOUT_SEC,
         explanation_refresh_interval_sec=explanation_refresh_interval_sec,
         explanation_max_detections=DEFAULT_EXPLANATION_MAX_DETECTIONS,

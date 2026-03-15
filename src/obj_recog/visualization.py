@@ -10,7 +10,13 @@ from obj_recog.opencv_runtime import load_cv2
 from obj_recog.scene_graph import SceneGraphSnapshot
 from obj_recog.sim_scene import build_scene_mesh_components
 from obj_recog.situation_explainer import ExplanationStatus, wrap_explanation_text
-from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
+from obj_recog.types import (
+    DepthDiagnostics,
+    Detection,
+    PanopticSegment,
+    PerceptionDiagnostics,
+    TemporalStereoDiagnostics,
+)
 
 _RUNTIME_WINDOW_MARGIN_X = 32
 _RUNTIME_WINDOW_MARGIN_Y = 48
@@ -417,6 +423,7 @@ def _draw_runtime_status(
     depth_diagnostics: DepthDiagnostics | None = None,
     depth_debug_level: str | None = None,
     perception_diagnostics: PerceptionDiagnostics | None = None,
+    temporal_stereo_diagnostics: TemporalStereoDiagnostics | None = None,
 ) -> None:
     if (
         slam_tracking_state is None
@@ -429,6 +436,7 @@ def _draw_runtime_status(
         and explanation_status is None
         and depth_diagnostics is None
         and perception_diagnostics is None
+        and temporal_stereo_diagnostics is None
     ):
         return
 
@@ -460,6 +468,17 @@ def _draw_runtime_status(
                 ),
             ]
         )
+    lines.append(
+        "Stereo on"
+        if temporal_stereo_diagnostics is not None and temporal_stereo_diagnostics.enabled
+        else "Stereo off"
+    )
+    if temporal_stereo_diagnostics is not None:
+        if temporal_stereo_diagnostics.reference_keyframe_id is not None:
+            lines.append(f"Stereo ref {int(temporal_stereo_diagnostics.reference_keyframe_id)}")
+        lines.append(f"Stereo cov {float(temporal_stereo_diagnostics.coverage_ratio) * 100.0:.1f}%")
+        if temporal_stereo_diagnostics.fallback_reason:
+            lines.append(f"Stereo fallback {temporal_stereo_diagnostics.fallback_reason}")
     if depth_diagnostics is not None and depth_debug_level in {"basic", "detailed"}:
         p10, p50, p90 = depth_diagnostics.normalized_distance_percentiles
         lines.extend(
@@ -525,6 +544,7 @@ def draw_detections(
     depth_diagnostics: DepthDiagnostics | None = None,
     depth_debug_level: str | None = None,
     perception_diagnostics: PerceptionDiagnostics | None = None,
+    temporal_stereo_diagnostics: TemporalStereoDiagnostics | None = None,
     cv2_module=None,
 ) -> np.ndarray:
     cv2 = load_cv2(cv2_module)
@@ -591,6 +611,7 @@ def draw_detections(
         depth_diagnostics=depth_diagnostics,
         depth_debug_level=depth_debug_level,
         perception_diagnostics=perception_diagnostics,
+        temporal_stereo_diagnostics=temporal_stereo_diagnostics,
     )
 
     if segments:

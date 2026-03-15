@@ -51,6 +51,85 @@ class FakeDepthEstimator:
         return np.full((h, w), 1.0, dtype=np.float32)
 
 
+class FakeTemporalStereoEstimator:
+    def __init__(
+        self,
+        *,
+        fused_depth_value: float = 2.5,
+        applied: bool = True,
+        fallback_reason: str | None = None,
+    ) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._fused_depth_value = float(fused_depth_value)
+        self._applied = bool(applied)
+        self._fallback_reason = fallback_reason
+
+    def update_keyframe_cache(
+        self,
+        *,
+        keyframe_id: int | None,
+        frame_bgr: np.ndarray,
+        frame_gray: np.ndarray,
+        pose_world: np.ndarray,
+        intrinsics,
+    ) -> None:
+        self.calls.append(
+            {
+                "kind": "cache",
+                "keyframe_id": keyframe_id,
+                "frame_shape": tuple(frame_bgr.shape),
+                "gray_shape": tuple(frame_gray.shape),
+                "pose_world": np.asarray(pose_world, dtype=np.float32),
+                "intrinsics": intrinsics,
+            }
+        )
+
+    def estimate(
+        self,
+        *,
+        frame_bgr: np.ndarray,
+        provisional_depth_map: np.ndarray,
+        slam_result,
+        intrinsics,
+        detections,
+    ):
+        self.calls.append(
+            {
+                "kind": "estimate",
+                "frame_shape": tuple(frame_bgr.shape),
+                "depth_shape": tuple(provisional_depth_map.shape),
+                "tracking_state": slam_result.tracking_state,
+                "intrinsics": intrinsics,
+                "detections": list(detections),
+            }
+        )
+        diagnostics = SimpleNamespace(
+            enabled=True,
+            applied=self._applied,
+            reference_keyframe_id=7,
+            coverage_ratio=0.4 if self._applied else 0.0,
+            median_disparity_px=3.5 if self._applied else 0.0,
+            fit_sample_count=600 if self._applied else 0,
+            fit_rmse=0.15 if self._applied else None,
+            fallback_reason=self._fallback_reason,
+        )
+        fused_depth_map = (
+            np.full_like(provisional_depth_map, self._fused_depth_value, dtype=np.float32)
+            if self._applied
+            else np.asarray(provisional_depth_map, dtype=np.float32)
+        )
+        stereo_depth_map = (
+            np.full_like(provisional_depth_map, self._fused_depth_value, dtype=np.float32)
+            if self._applied
+            else np.zeros_like(provisional_depth_map, dtype=np.float32)
+        )
+        return SimpleNamespace(
+            stereo_depth_map=stereo_depth_map,
+            fused_depth_map=fused_depth_map,
+            diagnostics=diagnostics,
+        )
+
+
 class FakeTrackingResult:
     def __init__(
         self,
@@ -836,6 +915,218 @@ def test_process_frame_uses_calibrated_intrinsics_for_dense_points() -> None:
     assert map_builder.last_frame_points_xyz is not None
     assert map_builder.last_frame_points_xyz[0, 0] == pytest.approx(-0.125)
     assert map_builder.last_frame_points_xyz[0, 1] == pytest.approx(-1.0 / 6.0)
+
+
+def test_process_frame_uses_temporal_stereo_fused_depth_when_enabled() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=256,
+        detection_interval=2,
+        inference_width=16,
+        camera_calibration="/tmp/camera.yaml",
+        slam_vocabulary="/tmp/ORBvoc.txt",
+        slam_width=16,
+        slam_height=16,
+        temporal_stereo="on",
+    )
+    frame = np.full((16, 16, 3), 127, dtype=np.uint8)
+    detector = FakeDetector()
+    depth_estimator = FakeDepthEstimator()
+    slam_bridge = FakeSlamBridge()
+    map_builder = FakeMapBuilder()
+    temporal_stereo_estimator = FakeTemporalStereoEstimator(fused_depth_value=2.5, applied=True)
+
+    artifacts, _cached = process_frame(
+        frame_bgr=frame,
+        detector=detector,
+        depth_estimator=depth_estimator,
+        temporal_stereo_estimator=temporal_stereo_estimator,
+        slam_bridge=slam_bridge,
+        map_builder=map_builder,
+        config=config,
+        frame_index=0,
+        timestamp_sec=12.25,
+        cached_detections=[],
+    )
+
+    assert np.allclose(artifacts.depth_map, 2.5)
+    assert artifacts.raw_depth_map is not None
+    assert np.allclose(artifacts.raw_depth_map, 2.5)
+    assert artifacts.metric_depth_prepared is False
+    assert artifacts.perception_diagnostics is not None
+    assert artifacts.perception_diagnostics.depth_source == "runtime_temporal_stereo_fused"
+    assert artifacts.temporal_stereo_diagnostics is not None
+    assert artifacts.temporal_stereo_diagnostics.applied is True
+    assert [call["kind"] for call in temporal_stereo_estimator.calls] == ["estimate", "cache"]
+
+
+def test_process_frame_marks_midas_fallback_when_temporal_stereo_declines_fusion() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=256,
+        detection_interval=2,
+        inference_width=16,
+        camera_calibration="/tmp/camera.yaml",
+        slam_vocabulary="/tmp/ORBvoc.txt",
+        slam_width=16,
+        slam_height=16,
+        temporal_stereo="on",
+    )
+    frame = np.full((16, 16, 3), 127, dtype=np.uint8)
+    temporal_stereo_estimator = FakeTemporalStereoEstimator(applied=False, fallback_reason="low_stereo_coverage")
+
+    artifacts, _cached = process_frame(
+        frame_bgr=frame,
+        detector=FakeDetector(),
+        depth_estimator=FakeDepthEstimator(),
+        temporal_stereo_estimator=temporal_stereo_estimator,
+        slam_bridge=FakeSlamBridge(),
+        map_builder=FakeMapBuilder(),
+        config=config,
+        frame_index=0,
+        timestamp_sec=12.25,
+        cached_detections=[],
+    )
+
+    assert np.allclose(artifacts.depth_map, 1.0)
+    assert artifacts.raw_depth_map is not None
+    assert np.allclose(artifacts.raw_depth_map, 1.0)
+    assert artifacts.metric_depth_prepared is False
+    assert artifacts.perception_diagnostics is not None
+    assert artifacts.perception_diagnostics.depth_source == "runtime_midas_fallback"
+    assert artifacts.temporal_stereo_diagnostics is not None
+    assert artifacts.temporal_stereo_diagnostics.applied is False
+    assert artifacts.temporal_stereo_diagnostics.fallback_reason == "low_stereo_coverage"
+
+
+def test_process_frame_bypasses_temporal_stereo_for_sensor_depth_packets() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        sim_perception_mode="runtime",
+        temporal_stereo="on",
+    )
+    frame = np.full((8, 8, 3), 90, dtype=np.uint8)
+    packet = FramePacket(
+        frame_bgr=frame,
+        timestamp_sec=1.0,
+        depth_map=np.full((8, 8), 2.75, dtype=np.float32),
+        pose_world_gt=np.eye(4, dtype=np.float32),
+        intrinsics_gt=CameraIntrinsics(fx=8.0, fy=8.0, cx=4.0, cy=4.0),
+    )
+    temporal_stereo_estimator = FakeTemporalStereoEstimator(fused_depth_value=5.0, applied=True)
+
+    artifacts, _cached = process_frame(
+        frame_bgr=frame,
+        detector=FakeDetector(),
+        depth_estimator=FakeDepthEstimator(),
+        temporal_stereo_estimator=temporal_stereo_estimator,
+        map_builder=FakeMapBuilder(),
+        config=config,
+        frame_index=0,
+        timestamp_sec=1.0,
+        cached_detections=[],
+        tracker=FakeTracker(),
+        frame_packet=packet,
+        prefer_frame_packet_depth_sensor=True,
+        cv2_module=object(),
+    )
+
+    assert np.allclose(artifacts.depth_map, packet.depth_map)
+    assert artifacts.perception_diagnostics is not None
+    assert artifacts.perception_diagnostics.depth_source == "sensor"
+    assert temporal_stereo_estimator.calls == []
+
+
+def test_run_constructs_and_uses_temporal_stereo_estimator_when_enabled(tmp_path: Path) -> None:
+    from obj_recog.calibration import load_orbslam3_settings
+
+    vocabulary_path = tmp_path / "ORBvoc.txt"
+    vocabulary_path.write_text("", encoding="utf-8")
+    generated_path = tmp_path / "generated-camera.yaml"
+    generated_path.write_text(
+        "Camera.width: 640\nCamera.height: 360\nCamera.fx: 400.0\nCamera.fy: 400.0\nCamera.cx: 320.0\nCamera.cy: 180.0\nCamera.k1: 0.0\nCamera.k2: 0.0\nCamera.p1: 0.0\nCamera.p2: 0.0\nCamera.k3: 0.0\n",
+        encoding="utf-8",
+    )
+    config = AppConfig(
+        camera_index=0,
+        width=16,
+        height=16,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+        slam_vocabulary=str(vocabulary_path),
+        slam_width=640,
+        slam_height=360,
+        temporal_stereo="on",
+    )
+    fake_cv2 = FakeCV2(key_sequence=[ord("q")])
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
+    viewer = FakeViewer()
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    slam_bridge = FakeSlamBridge()
+    created_estimators: list[FakeTemporalStereoEstimator] = []
+
+    def _resolver(config, camera_session, **_kwargs):
+        return type(
+            "CalibrationBootstrap",
+            (),
+            {
+                "source": "cache",
+                "settings_path": str(generated_path),
+                "calibration": load_orbslam3_settings(generated_path),
+                "cache_entry": None,
+                "warmup_restarted": False,
+                "promoted_bridge": slam_bridge,
+            },
+        )()
+
+    def _temporal_stereo_factory(**_kwargs):
+        estimator = FakeTemporalStereoEstimator(fused_depth_value=2.5, applied=True)
+        created_estimators.append(estimator)
+        return estimator
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        temporal_stereo_factory=_temporal_stereo_factory,
+        map_builder_factory=lambda **_: map_builder,
+        slam_bridge_factory=lambda **_: FakeSlamBridge(),
+        viewer_factory=lambda: viewer,
+        open_camera_fn=FakeOpenCamera([camera_session]),
+        runtime_calibration_resolver=_resolver,
+    )
+
+    assert len(created_estimators) == 1
+    assert [call["kind"] for call in created_estimators[0].calls] == ["estimate", "cache"]
 
 
 def test_run_requires_slam_settings_and_vocabulary_paths() -> None:

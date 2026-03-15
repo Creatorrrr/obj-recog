@@ -419,9 +419,14 @@ def test_run_sim_mode_uses_runtime_depth_and_monocular_slam(tmp_path: Path) -> N
     assert slam_bridge_factory.instances[0].calls == 2
     assert "Situation Explanation" not in fake_cv2.imshow_calls
     assert len(source.runtime_observations) == 2
+    valid_runtime_depth_sources = {
+        "runtime_midas",
+        "runtime_midas_fallback",
+        "runtime_temporal_stereo_fused",
+    }
     assert all(
         observation[1].perception_diagnostics is not None
-        and observation[1].perception_diagnostics.depth_source == "runtime"
+        and observation[1].perception_diagnostics.depth_source in valid_runtime_depth_sources
         and observation[1].perception_diagnostics.pose_source == "runtime"
         for observation in source.runtime_observations
     )

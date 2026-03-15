@@ -10,7 +10,7 @@ from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import EpisodePhase, OperatorSceneState
 from obj_recog.sim_scene import build_interior_test_tv_scene_spec, build_living_room_scene_spec, build_scene_mesh_components
-from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics
+from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics, TemporalStereoDiagnostics
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
     Open3DMeshViewer,
@@ -256,6 +256,7 @@ def test_draw_detections_renders_only_detection_labels() -> None:
         "SLAM TRACKING",
         "KF 7",
         "Mesh 0t / 0v",
+        "Stereo off",
     ]
 
 
@@ -300,6 +301,7 @@ def test_draw_detections_renders_small_runtime_status_lines() -> None:
         "SLAM TRACKING",
         "KF 7",
         "Mesh 123t / 88v",
+        "Stereo off",
     ]
 
 
@@ -814,6 +816,7 @@ def test_draw_detections_renders_scene_graph_debug_counts_in_runtime_status() ->
         "Graph nodes 2",
         "Graph edges 1",
         "Localized 1",
+        "Stereo off",
         "front-right cup (near)",
     ]
 
@@ -1487,6 +1490,56 @@ def test_draw_detections_renders_perception_diagnostics_status_lines() -> None:
     assert "Detect runtime+fallback" in fake_cv2.text_calls
     assert "Depth/Pose ground_truth/ground_truth" in fake_cv2.text_calls
     assert "Benchmark invalid GT-visible yes" in fake_cv2.text_calls
+
+
+def test_draw_detections_renders_temporal_stereo_status_lines() -> None:
+    class _FakeCV2:
+        FONT_HERSHEY_SIMPLEX = 0
+        LINE_AA = 16
+
+        def __init__(self) -> None:
+            self.text_calls: list[str] = []
+
+        def rectangle(self, canvas, pt1, pt2, color, thickness):
+            return None
+
+        def putText(self, canvas, text, org, font, scale, color, thickness, line_type):
+            self.text_calls.append(text)
+            return None
+
+    import sys
+
+    fake_cv2 = _FakeCV2()
+    previous_cv2 = sys.modules.get("cv2")
+    sys.modules["cv2"] = fake_cv2
+    try:
+        draw_detections(
+            np.zeros((16, 16, 3), dtype=np.uint8),
+            [],
+            10.0,
+            slam_tracking_state="TRACKING",
+            keyframe_id=1,
+            temporal_stereo_diagnostics=TemporalStereoDiagnostics(
+                enabled=True,
+                applied=False,
+                reference_keyframe_id=7,
+                coverage_ratio=0.125,
+                median_disparity_px=2.5,
+                fit_sample_count=320,
+                fit_rmse=0.28,
+                fallback_reason="low_stereo_coverage",
+            ),
+        )
+    finally:
+        if previous_cv2 is None:
+            sys.modules.pop("cv2", None)
+        else:
+            sys.modules["cv2"] = previous_cv2
+
+    assert "Stereo on" in fake_cv2.text_calls
+    assert "Stereo ref 7" in fake_cv2.text_calls
+    assert "Stereo cov 12.5%" in fake_cv2.text_calls
+    assert "Stereo fallback low_stereo_coverage" in fake_cv2.text_calls
 
 
 def test_display_points_for_view_flips_y_and_z_axes() -> None:
