@@ -46,7 +46,7 @@ class AppConfig:
     orb_features: int = 1200
     keyframe_translation: float = 0.12
     keyframe_rotation_deg: float = 8.0
-    mapping_window_keyframes: int = 12
+    mapping_window_keyframes: int = 24
     map_voxel_size: float = 0.05
     max_map_points: int = 200_000
     max_mesh_triangles: int = 10_000
@@ -182,7 +182,7 @@ DEFAULT_INFERENCE_WIDTH = 640
 DEFAULT_ORB_FEATURES = 1200
 DEFAULT_KEYFRAME_TRANSLATION = 0.12
 DEFAULT_KEYFRAME_ROTATION_DEG = 8.0
-DEFAULT_MAPPING_WINDOW_KEYFRAMES = 12
+DEFAULT_MAPPING_WINDOW_KEYFRAMES = 24
 DEFAULT_MAP_VOXEL_SIZE = 0.05
 DEFAULT_MAX_MAP_POINTS = 200_000
 DEFAULT_MAX_MESH_TRIANGLES = 10_000
