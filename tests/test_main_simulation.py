@@ -467,7 +467,7 @@ def test_run_sim_mode_does_not_forward_environment_truth_to_open3d_view(tmp_path
     assert environment_viewer.closed is False
 
 
-def test_run_sim_mode_shows_explanation_panel_and_auto_refreshes_when_enabled(
+def test_run_sim_mode_shows_explanation_panel_from_planner_core_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -515,8 +515,8 @@ def test_run_sim_mode_shows_explanation_panel_and_auto_refreshes_when_enabled(
     )
 
     assert "Situation Explanation" in fake_cv2.imshow_calls
-    assert len(worker.submissions) >= 1
-    assert worker.closed is True
+    assert worker.submissions == []
+    assert worker.closed is False
 
 
 def test_run_sim_mode_records_runtime_observation_after_segments_and_scene_graph(tmp_path: Path) -> None:

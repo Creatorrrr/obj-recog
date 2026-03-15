@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
-from obj_recog.sim_planner import build_planner_context, planner_prompt_from_context
+from obj_recog.sim_planner import OpenAILivingRoomPlanner, build_planner_context, planner_prompt_from_context
 from obj_recog.sim_protocol import EpisodePhase, PlannerActionEffectSummary, PlannerSearchOutcome
 from obj_recog.types import Detection, PanopticSegment
 
@@ -460,3 +460,94 @@ def test_planner_context_goal_estimate_status_unknown_without_target_cues() -> N
     )
 
     assert context.goal_estimate.status == "unknown"
+
+
+def test_planner_context_serializes_canonical_world_state_sections() -> None:
+    context = build_planner_context(
+        phase=EpisodePhase.REASSESS,
+        frame_index=22,
+        detections=[
+            Detection(
+                xyxy=(1, 1, 7, 8),
+                class_id=1,
+                label="tv_panel",
+                confidence=0.95,
+                color=(255, 0, 0),
+            )
+        ],
+        scene_graph_snapshot=_graph_snapshot(
+            nodes=(
+                _ego_node(),
+                _node(node_id="tv-1", label="tv_panel", last_seen_direction="front"),
+            ),
+            visible_node_ids=("ego", "tv-1"),
+        ),
+        reconstruction_summary={"mesh_vertices": 900, "tracked_points": 540, "mesh_triangles": 180},
+        depth_summary={"min_depth_m": 0.7, "median_depth_m": 1.9},
+        recent_actions=("turn_left:6",),
+        target_label="tv_panel",
+        calibration_status="converged",
+        tracking_status="TRACKING",
+        target_detection={"label": "tv_panel", "horizontal_position": "front", "median_depth_m": 1.9},
+        depth_map=np.full((10, 10), 1.9, dtype=np.float32),
+        frame_shape=(10, 10),
+    )
+    prompt = planner_prompt_from_context(context)
+
+    assert '"image_metadata"' in prompt
+    assert '"robot_state"' in prompt
+    assert '"goal"' in prompt
+    assert '"scene_graph"' in prompt
+    assert '"navigation_map"' in prompt
+    assert '"target_hypotheses"' in prompt
+
+
+def test_openai_planner_sends_rgb_image_and_parses_structured_response() -> None:
+    class _FakeResponses:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            return type(
+                "Response",
+                (),
+                {
+                    "output_text": (
+                        '{"situation_summary":"Target visible ahead.","goal_hypothesis":{"status":"visible",'
+                        '"bearing_hint":"front","distance_hint":"1.8m","evidence":["target_detection"],'
+                        '"confidence":0.94},"behavior_mode":"approach","steps":[{"primitive":"move_forward",'
+                        '"value":0.12,"intent":"close distance"}],"safety_flags":{"front_blocked":false,'
+                        '"dead_end_risk":0.1,"tracking_risk":"low","replan_reason":"target_visible"},'
+                        '"confidence":0.91}'
+                    )
+                },
+            )()
+
+    fake_responses = _FakeResponses()
+    client = type("Client", (), {"responses": fake_responses})()
+    planner = OpenAILivingRoomPlanner(model="gpt-5-mini", timeout_sec=5.0, client=client)
+    context = build_planner_context(
+        phase=EpisodePhase.REASSESS,
+        frame_index=23,
+        detections=[],
+        scene_graph_snapshot=_graph_snapshot(nodes=(_ego_node(),), visible_node_ids=("ego",)),
+        reconstruction_summary={"mesh_vertices": 500, "tracked_points": 300},
+        depth_summary={"min_depth_m": 0.8, "median_depth_m": 1.8},
+        recent_actions=(),
+        target_label="tv_panel",
+        calibration_status="converged",
+        tracking_status="TRACKING",
+    )
+
+    schedule = planner.plan(context=context, frame_bgr=np.full((8, 8, 3), 127, dtype=np.uint8))
+
+    assert fake_responses.calls
+    content = fake_responses.calls[0]["input"][0]["content"]
+    assert any(item["type"] == "input_text" for item in content)
+    assert any(item["type"] == "input_image" for item in content)
+    assert schedule.situation_summary == "Target visible ahead."
+    assert schedule.behavior_mode == "approach"
+    assert schedule.goal_hypothesis is not None
+    assert schedule.goal_hypothesis.status == "visible"
+    assert schedule.steps[0].intent == "close distance"

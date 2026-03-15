@@ -104,6 +104,8 @@ class PlannerObjectObservation:
     bbox_area_ratio: float
     depth_m: float | None
     is_target_match: bool
+    distance_bucket: str | None = None
+    relative_xyz: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +114,37 @@ class PlannerSegmentObservation:
     coverage_ratio: float
     dominant_direction: str
     opening_hint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerSceneNodeObservation:
+    label: str
+    kind: str
+    state: str
+    bearing: str | None
+    distance_bucket: str | None
+    confidence: float
+    relative_xyz: tuple[float, float, float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerSceneEdgeObservation:
+    source_label: str
+    target_label: str
+    relation: str
+    confidence: float
+    source_kind: str
+    distance_bucket: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerNavigationSectorObservation:
+    sector: str
+    clearance_m: float | None
+    traversable: bool
+    obstacle_likelihood: float
+    frontier_score: float
+    recently_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +157,8 @@ class PlannerNavigationAffordances:
     candidate_open_directions: tuple[str, ...]
     dead_end_likelihood: float
     best_exploration_direction: str | None
+    sector_map: tuple[PlannerNavigationSectorObservation, ...] = ()
+    recently_failed_directions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +169,9 @@ class PlannerReconstructionBrief:
     mesh_triangle_count: int
     mesh_growth_delta: int
     frontier_directions: tuple[str, ...]
+    explored_directions: tuple[str, ...] = ()
+    unexplored_directions: tuple[str, ...] = ()
+    recently_failed_directions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +180,7 @@ class PlannerGoalEstimate:
     bearing_hint: str | None
     distance_hint: str | None
     evidence_sources: tuple[str, ...]
+    confidence: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +202,14 @@ class PlannerConstraintSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannerSafetyFlags:
+    front_blocked: bool
+    dead_end_risk: float
+    tracking_risk: str
+    replan_reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class PerceptionSnapshot:
     visible_detections: tuple[str, ...]
     visible_segments: tuple[str, ...]
@@ -176,6 +223,9 @@ class PerceptionSnapshot:
     structural_segments: tuple[PlannerSegmentObservation, ...] = ()
     navigation_affordances: PlannerNavigationAffordances | None = None
     reconstruction_brief: PlannerReconstructionBrief | None = None
+    frame_size: tuple[int, int] = (0, 0)
+    scene_nodes: tuple[PlannerSceneNodeObservation, ...] = ()
+    scene_edges: tuple[PlannerSceneEdgeObservation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,12 +269,14 @@ class PlannerContext:
     recent_action_effects: tuple[PlannerActionEffectSummary, ...]
     constraints: PlannerConstraintSummary
     recent_actions: tuple[str, ...]
+    image_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class ActionStep:
     primitive: ActionPrimitive
     value: float
+    intent: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +291,11 @@ class ActionSchedule:
     rationale: str
     model: str
     issued_at_frame: int
+    situation_summary: str = ""
+    behavior_mode: str = "scan"
+    goal_hypothesis: PlannerGoalEstimate | None = None
+    safety_flags: PlannerSafetyFlags | None = None
+    confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
