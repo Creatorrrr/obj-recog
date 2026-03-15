@@ -7,7 +7,7 @@ Real-time object recognition, monocular 3D reconstruction, and simulation testbe
 - Python 3.11+
 - `pip` or another Python package manager
 - Optional: `OPENAI_API_KEY` if you want the explanation window to call the LLM
-- Optional for simulation: Unity 6 LTS to open and build the project in `unity`
+- Optional for simulation: Unity 6 LTS `6000.3.11f1` to open and build the project in `unity`
 
 ## Install
 
@@ -133,10 +133,25 @@ The simulation path is now an RGB-only Unity interface:
 - online runtime uses the same monocular perception stack as live input
 - hidden goal, collision truth, and evaluation stay outside the online inference loop
 
-The Unity project lives in `unity`. `Assets/Scenes/LivingRoomMain.unity` is based on ApartmentKit `Scene_02` with obj-recog runtime wiring layered on top. Open it in Unity 6 LTS, then:
+The Unity project lives in `unity`. `Assets/Scenes/LivingRoomMain.unity` is based on ApartmentKit `Scene_02` with obj-recog runtime wiring layered on top.
+
+`Apartment Kit` is treated as a local vendor dependency and is intentionally not tracked in Git. Each teammate must import Asset Store package `Apartment Kit` version `4.2` into the default Unity path so these folders exist:
+
+- `Assets/Brick Project Studio/Apartment Kit`
+- `Assets/Brick Project Studio/_BPS Basic Assets`
+
+Check the local Unity setup before opening the scene or launching sim mode:
+
+```bash
+PYTHONPATH=src python -m obj_recog.unity_vendor_check --unity-project-root unity
+```
+
+Open the project in Unity 6 LTS `6000.3.11f1`, then:
 
 - run Play mode with no special arguments for `manual` keyboard/mouse control
 - build a Windows standalone player and let Python launch it in `agent` mode
+
+Do not edit files under `Assets/Brick Project Studio`. If the environment needs customization, create tracked copies or prefab/material variants in a separate project folder.
 
 Manual mode controls:
 

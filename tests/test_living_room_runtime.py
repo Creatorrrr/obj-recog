@@ -10,7 +10,11 @@ from obj_recog.config import AppConfig
 from obj_recog.frame_source import FramePacket
 from obj_recog.scene_graph import GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import ActionPrimitive, ActionSchedule, ActionStep, EpisodePhase, SensorFrame
-from obj_recog.simulation import LivingRoomEpisodeRunner, LivingRoomSimulationRuntime
+from obj_recog.simulation import (
+    LivingRoomEpisodeRunner,
+    LivingRoomSimulationRuntime,
+    _build_unity_rgb_sensor_backend,
+)
 from obj_recog.types import PanopticSegment
 
 
@@ -744,3 +748,27 @@ def test_simulation_runtime_uses_living_room_scene_and_resets_backend(tmp_path: 
 
     assert runner._scene_spec.scene_id == "living_room_navigation_v1"
     assert backend.reset_calls == ["living_room_navigation_v1"]
+
+
+def test_unity_rgb_sensor_backend_validates_vendor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = dict(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("obj_recog.simulation.validate_unity_vendor_setup", lambda: calls.append("checked"))
+    monkeypatch.setattr("obj_recog.simulation.UnityRgbClient", _FakeClient)
+
+    backend = _build_unity_rgb_sensor_backend(
+        config=_config(unity_player_path="C:/UnityBuild/obj-recog.exe", unity_host="127.0.0.2", unity_port=9001),
+        camera_rig=object(),
+    )
+
+    assert calls == ["checked"]
+    assert backend._client.kwargs["unity_player_path"] == "C:/UnityBuild/obj-recog.exe"
+    assert backend._client.kwargs["host"] == "127.0.0.2"
+    assert backend._client.kwargs["port"] == 9001

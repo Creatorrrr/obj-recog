@@ -29,6 +29,7 @@ from obj_recog.sim_protocol import (
 from obj_recog.types import PanopticSegment
 from obj_recog.sim_scene import build_living_room_scene_spec
 from obj_recog.unity_rgb import UnityRgbClient, command_from_step
+from obj_recog.unity_vendor_check import validate_unity_vendor_setup
 
 
 SCENARIO_SPECS = {
@@ -939,6 +940,7 @@ def _build_unity_rgb_sensor_backend(
     unity_client_factory=None,
 ) -> UnityRgbSensorBackend:
     _ = camera_rig
+    validate_unity_vendor_setup()
     client = (
         unity_client_factory(config=config)
         if unity_client_factory is not None

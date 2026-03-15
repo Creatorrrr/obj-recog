@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "unity_editor_version": "6000.3.11f1",
+  "packages": [
+    {
+      "name": "Apartment Kit",
+      "version": "4.2",
+      "product_id": 124055,
+      "required_paths": [
+        "Assets/Brick Project Studio/Apartment Kit",
+        "Assets/Brick Project Studio/_BPS Basic Assets"
+      ],
+      "asset_origin_sample": {
+        "asset_path": "Assets/Brick Project Studio/Apartment Kit/Scenes/DemoSettings.lighting",
+        "package_name": "Apartment Kit",
+        "package_version": "4.2",
+        "product_id": 124055
+      },
+      "guid_samples": [
+        {
+          "asset_path": "Assets/Brick Project Studio/Apartment Kit/Scenes/DemoSettings.lighting",
+          "guid": "a2f6163588e6e074996614a2b15b04b7"
+        },
+        {
+          "asset_path": "Assets/Brick Project Studio/Apartment Kit/_Prefabs/Apt Build Kit/Interiors/Flooring & Ceilings/Int_apt_01_Floor_01.prefab",
+          "guid": "bee09117d2231334d90a559b1ff7f323"
+        },
+        {
+          "asset_path": "Assets/Brick Project Studio/Apartment Kit/_Prefabs/Apt Build Kit/Interiors/Flooring & Ceilings/Int_apt_02_Floor_01.prefab",
+          "guid": "5aac716a11271124887a33ec1836f27b"
+        },
+        {
+          "asset_path": "Assets/Brick Project Studio/Apartment Kit/_Prefabs/Apt Build Kit/Interiors/Walls Frames & Doors/Apt_02/Int_Apt_02_Wall_01.prefab",
+          "guid": "fb28b01c668360548b1caee1ee42ac7e"
+        },
+        {
+          "asset_path": "Assets/Brick Project Studio/_BPS Basic Assets/_Prefabs/Base Scene/BA_Concrete Plane.prefab",
+          "guid": "0a39e6bc93e859145a2f868ff0277c31"
+        }
+      ]
+    }
+  ]
+}
