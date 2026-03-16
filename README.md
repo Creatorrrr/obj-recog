@@ -204,7 +204,6 @@ PYTHONPATH=src python -m obj_recog.main \
   --width 640 \
   --height 360 \
   --device auto \
-  --opencv-cuda on \
   --depth-profile fast \
   --segmentation-mode panoptic \
   --explanation-mode on
