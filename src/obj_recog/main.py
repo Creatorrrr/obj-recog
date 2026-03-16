@@ -79,6 +79,65 @@ def _default_debug_log(message: str) -> None:
     print(f"[obj-recog] {message}", file=sys.stderr, flush=True)
 
 
+def _format_frame_source_termination_message(frame_source) -> str | None:
+    if frame_source is None:
+        return None
+    termination_status = getattr(frame_source, "termination_status", None)
+    if not callable(termination_status):
+        return None
+    try:
+        status = termination_status()
+    except Exception:
+        return None
+    if not status:
+        return None
+    if isinstance(status, str):
+        return f"run exit: {status}"
+    if not isinstance(status, dict):
+        return f"run exit: frame source ended ({status!r})"
+
+    reason = str(status.get("reason", "")).strip() or "frame_source_ended"
+    if reason == "goal_completed":
+        message = "run exit: goal achieved"
+    elif reason == "window_closed":
+        message = "run exit: object window closed"
+    elif reason == "viewer_inactive":
+        message = "run exit: viewer became inactive"
+    elif reason == "user_requested":
+        message = "run exit: user requested quit"
+    elif reason == "frame_source_exhausted":
+        message = "run exit: frame source ended"
+    elif reason == "closed":
+        message = "run exit: frame source closed"
+    else:
+        message = f"run exit: {reason.replace('_', ' ')}"
+
+    extras: list[str] = []
+    phase = str(status.get("phase", "")).strip()
+    if phase:
+        extras.append(f"phase={phase}")
+    confidence = status.get("confidence", None)
+    if confidence is not None:
+        try:
+            extras.append(f"confidence={float(confidence):.2f}")
+        except (TypeError, ValueError):
+            pass
+    rationale = str(status.get("rationale", "")).strip()
+    if rationale:
+        extras.append(f"rationale={rationale}")
+    return message if not extras else f"{message} ({', '.join(extras)})"
+
+
+def _interactive_run_exit_message(*, key: int, viewer_active: bool, window_closed: bool) -> str | None:
+    if key == ord("q"):
+        return "run exit: user requested quit"
+    if window_closed:
+        return "run exit: object window closed"
+    if not viewer_active:
+        return "run exit: viewer became inactive"
+    return None
+
+
 def _planner_request_context_from_frame_packet(frame_packet: FramePacket | None) -> str:
     if frame_packet is None or getattr(frame_packet, "planner_context", None) is None:
         return ""
@@ -1466,6 +1525,7 @@ def run(
     object_window_has_been_visible = False
     last_artifacts = None
     last_frame_packet = None
+    run_exit_message: str | None = None
 
     try:
         if config.input_source == "sim":
@@ -1731,6 +1791,11 @@ def run(
                     object_window_has_been_visible = object_window_has_been_visible or window_visible
                     window_closed = object_window_has_been_visible and not window_visible
                     if key == ord("q") or not viewer_active or window_closed:
+                        run_exit_message = _interactive_run_exit_message(
+                            key=key,
+                            viewer_active=viewer_active,
+                            window_closed=window_closed,
+                        )
                         break
                     continue
                 restarted_stream = False
@@ -1815,6 +1880,7 @@ def run(
                     )
                 if restarted_stream:
                     continue
+                run_exit_message = _format_frame_source_termination_message(frame_source) or "run exit: frame source ended"
                 break
             latest_planner_request_context = _planner_request_context_from_frame_packet(frame_packet)
             latest_planner_response_text = _planner_response_text_from_frame_packet(frame_packet)
@@ -2219,6 +2285,11 @@ def run(
                 _toggle_explanation_auto_refresh(artifacts, toggled_at=now)
 
             if key == ord("q") or not viewer_active or window_closed:
+                run_exit_message = _interactive_run_exit_message(
+                    key=key,
+                    viewer_active=viewer_active,
+                    window_closed=window_closed,
+                )
                 break
 
             if (
@@ -2234,6 +2305,15 @@ def run(
                 _submit_explanation_request(artifacts, requested_at=now)
 
             frame_index += 1
+        if run_exit_message is None:
+            run_exit_message = "run exit: completed"
+        debug_log(run_exit_message)
+    except KeyboardInterrupt:
+        debug_log("run exit: interrupted by user")
+        raise
+    except Exception as exc:
+        debug_log(f"run exit: error {exc.__class__.__name__}: {exc}")
+        raise
     finally:
         if validation_probe is not None and hasattr(validation_probe, "finish"):
             validation_probe.finish()

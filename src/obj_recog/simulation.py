@@ -1526,6 +1526,27 @@ class LivingRoomEpisodeRunner:
         self._write_planner_turns_artifact()
         self._write_episode_report()
 
+    def termination_status(self) -> dict[str, object] | None:
+        if self._state.mission_succeeded or self._state.phase == EpisodePhase.SUCCEEDED:
+            goal_completion = None if self._latest_planner_schedule is None else self._latest_planner_schedule.goal_completion
+            return {
+                "reason": "goal_completed",
+                "phase": self._state.phase.value,
+                "confidence": None if goal_completion is None else goal_completion.confidence,
+                "rationale": "" if goal_completion is None else goal_completion.rationale,
+            }
+        if self._closed:
+            return {
+                "reason": "closed",
+                "phase": self._state.phase.value,
+            }
+        if self._latest_sensor_frame is None and not self.is_waiting_for_frame():
+            return {
+                "reason": "frame_source_exhausted",
+                "phase": self._state.phase.value,
+            }
+        return None
+
     def _mark_goal_completed(self) -> None:
         self._state.mission_succeeded = True
         self._state.phase = EpisodePhase.SUCCEEDED

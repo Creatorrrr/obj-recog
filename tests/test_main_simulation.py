@@ -106,6 +106,15 @@ class _FakeFrameSource:
         self.closed = True
 
 
+class _TerminatingFrameSource(_FakeFrameSource):
+    def __init__(self, packets: list[FramePacket], status: dict[str, object]) -> None:
+        super().__init__(packets)
+        self._status = dict(status)
+
+    def termination_status(self) -> dict[str, object] | None:
+        return dict(self._status)
+
+
 class _PendingFrameSource(_FakeFrameSource):
     def __init__(self, packets: list[FramePacket]) -> None:
         super().__init__([])
@@ -470,6 +479,97 @@ def test_run_sim_mode_does_not_forward_environment_truth_to_open3d_view(tmp_path
     assert source.closed is True
     assert environment_viewer.states == []
     assert environment_viewer.closed is False
+
+
+def test_run_logs_goal_achievement_when_sim_frame_source_reports_success(tmp_path: Path) -> None:
+    slam_vocabulary, calibration = _write_runtime_files(tmp_path)
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+        camera_calibration=calibration,
+        slam_vocabulary=slam_vocabulary,
+    )
+    source = _TerminatingFrameSource(
+        [_packet(0.0)],
+        {
+            "reason": "goal_completed",
+            "phase": "succeeded",
+            "confidence": 0.93,
+            "rationale": "TV-front evidence is already sufficient.",
+        },
+    )
+    messages: list[str] = []
+
+    run(
+        config,
+        cv2_module=_FakeCV2(),
+        detector_factory=lambda **_kwargs: _CountingDetector(),
+        depth_estimator_factory=lambda **_kwargs: _CountingDepthEstimator(),
+        tracker_factory=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("tracker should not be used")),
+        slam_bridge_factory=_FakeSlamBridgeFactory(),
+        map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+        viewer_factory=lambda: _FakeViewer(),
+        environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+        debug_log=messages.append,
+    )
+
+    assert any("run exit: goal achieved" in message for message in messages)
+    assert any("confidence=0.93" in message for message in messages)
+    assert any("TV-front evidence is already sufficient." in message for message in messages)
+
+
+def test_run_logs_error_before_reraising(tmp_path: Path) -> None:
+    slam_vocabulary, calibration = _write_runtime_files(tmp_path)
+    config = AppConfig(
+        camera_index=0,
+        width=8,
+        height=8,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+        camera_calibration=calibration,
+        slam_vocabulary=slam_vocabulary,
+    )
+    messages: list[str] = []
+
+    try:
+        run(
+            config,
+            cv2_module=_FakeCV2(),
+            detector_factory=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("detector boom")),
+            depth_estimator_factory=lambda **_kwargs: _CountingDepthEstimator(),
+            tracker_factory=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("tracker should not be used")),
+            slam_bridge_factory=_FakeSlamBridgeFactory(),
+            map_builder_factory=lambda **_kwargs: _FakeMapBuilder(),
+            viewer_factory=lambda: _FakeViewer(),
+            environment_viewer_factory=lambda: _FakeEnvironmentViewer(),
+            open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+            frame_source_factory=lambda *_args, **_kwargs: _FakeFrameSource([_packet(0.0)]),
+            overlay_renderer=lambda frame_bgr, *_args, **_kwargs: frame_bgr,
+            debug_log=messages.append,
+        )
+        raise AssertionError("run should have raised RuntimeError")
+    except RuntimeError as exc:
+        assert str(exc) == "detector boom"
+
+    assert any("run exit: error RuntimeError: detector boom" in message for message in messages)
 
 
 def test_run_sim_mode_shows_explanation_panel_from_planner_core_when_enabled(
