@@ -56,16 +56,32 @@ class LiveCameraFrameSource:
         self.camera_session = camera_session
         self._time_source = time_source
         self._frame_reader = frame_reader
+        self._waiting_for_frame = False
+
+    def _capture_process_is_alive(self) -> bool:
+        process = getattr(self.camera_session.capture, "_process", None)
+        poll = getattr(process, "poll", None)
+        if not callable(poll):
+            return False
+        try:
+            return poll() is None
+        except Exception:
+            return False
 
     def next_frame(self, *, timeout_sec: float | None = 1.0) -> FramePacket | None:
         ok, frame_bgr = self._frame_reader(self.camera_session.capture, timeout_sec=timeout_sec)
         if not ok or frame_bgr is None:
+            self._waiting_for_frame = self._capture_process_is_alive()
             return None
+        self._waiting_for_frame = False
         timestamp_sec = self._time_source()
         return FramePacket(
             frame_bgr=np.asarray(frame_bgr, dtype=np.uint8).copy(),
             timestamp_sec=None if timestamp_sec is None else float(timestamp_sec),
         )
+
+    def is_waiting_for_frame(self) -> bool:
+        return bool(self._waiting_for_frame)
 
     def close(self) -> None:
         self.camera_session.capture.release()

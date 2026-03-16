@@ -318,6 +318,8 @@ python -m obj_recog.main `
   --explanation-mode off
 ```
 
+기본 sim 설정은 논리 카메라 `24fps`, 세그멘테이션 갱신 `2프레임` 간격입니다.
+
 ### 자주 쓰는 sim 옵션
 
 - `--sim-headless`: 데스크톱 창 없이 실행

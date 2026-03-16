@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
@@ -31,6 +32,11 @@ _RECONSTRUCTION_GRAPH_UPDATE_INTERVAL_SEC = 0.2
 _RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET = 3000
 _RECONSTRUCTION_INTERACTIVE_POINT_BUDGET = 5000
 _RECONSTRUCTION_MAX_DECIMATION_SOURCE_TRIANGLES = 20000
+_RECONSTRUCTION_DIRECT_TICK_HZ = 30.0
+_RECONSTRUCTION_DIRECT_APPLY_HZ = 12.0
+_RECONSTRUCTION_MAC_INTERACTIVE_TRIANGLE_BUDGET = 1500
+_RECONSTRUCTION_MAC_INTERACTIVE_POINT_BUDGET = 2500
+_RECONSTRUCTION_MAC_MAX_DECIMATION_SOURCE_TRIANGLES = 12000
 
 
 def _display_points_for_view(points_xyz: np.ndarray) -> np.ndarray:
@@ -1518,6 +1524,12 @@ class Open3DMeshViewer:
         o3d_module=None,
         layout_primary_width: int = 640,
         layout_primary_height: int = 360,
+        tick_hz: float = _RECONSTRUCTION_DIRECT_TICK_HZ,
+        apply_hz: float = _RECONSTRUCTION_DIRECT_APPLY_HZ,
+        interactive_triangle_budget: int | None = None,
+        interactive_point_budget: int | None = None,
+        max_decimation_source_triangles: int | None = None,
+        platform_name: str | None = None,
     ) -> None:
         if o3d_module is None:
             try:
@@ -1526,6 +1538,21 @@ class Open3DMeshViewer:
                 raise RuntimeError("open3d is required to render the 3D mesh") from exc
         else:
             o3d = o3d_module
+        current_platform = sys.platform if platform_name is None else str(platform_name)
+        if current_platform == "darwin":
+            if interactive_triangle_budget is None:
+                interactive_triangle_budget = _RECONSTRUCTION_MAC_INTERACTIVE_TRIANGLE_BUDGET
+            if interactive_point_budget is None:
+                interactive_point_budget = _RECONSTRUCTION_MAC_INTERACTIVE_POINT_BUDGET
+            if max_decimation_source_triangles is None:
+                max_decimation_source_triangles = _RECONSTRUCTION_MAC_MAX_DECIMATION_SOURCE_TRIANGLES
+        else:
+            if interactive_triangle_budget is None:
+                interactive_triangle_budget = _RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET
+            if interactive_point_budget is None:
+                interactive_point_budget = _RECONSTRUCTION_INTERACTIVE_POINT_BUDGET
+            if max_decimation_source_triangles is None:
+                max_decimation_source_triangles = _RECONSTRUCTION_MAX_DECIMATION_SOURCE_TRIANGLES
 
         self._o3d = o3d
         self._vis = o3d.visualization.Visualizer()
@@ -1580,6 +1607,15 @@ class Open3DMeshViewer:
         self._interaction_state = _InteractiveViewState(
             timeout_sec=_RECONSTRUCTION_INTERACTION_TIMEOUT_SEC
         )
+        self._interactive_triangle_budget = int(interactive_triangle_budget)
+        self._interactive_point_budget = int(interactive_point_budget)
+        self._max_decimation_source_triangles = int(max_decimation_source_triangles)
+        self._tick_interval_sec = 1.0 / max(1.0, float(tick_hz))
+        self._apply_interval_sec = 1.0 / max(1.0, float(apply_hz))
+        self._latest_submitted_snapshot: RenderSnapshot | None = None
+        self._last_apply_at: float | None = None
+        self._last_tick_at: float | None = None
+        self._last_tick_active = True
         self._vis.add_geometry(self._mesh)
         self._vis.add_geometry(self._interactive_points)
         self._vis.add_geometry(self._graph_nodes)
@@ -1596,6 +1632,24 @@ class Open3DMeshViewer:
                 render_option.point_size = 2.0
             if hasattr(render_option, "mesh_show_back_face"):
                 render_option.mesh_show_back_face = False
+
+    def _resolve_now(self, now: float | None) -> float:
+        return time.perf_counter() if now is None else float(now)
+
+    def submit(self, snapshot: RenderSnapshot) -> None:
+        self._latest_submitted_snapshot = snapshot
+
+    def apply_latest_if_due(self, *, now: float | None = None) -> bool:
+        if self._latest_submitted_snapshot is None:
+            return False
+        current_now = self._resolve_now(now)
+        if self._last_apply_at is not None and (current_now - self._last_apply_at) < self._apply_interval_sec:
+            return False
+        snapshot = self._latest_submitted_snapshot
+        self._latest_submitted_snapshot = None
+        self.apply_render_snapshot(snapshot)
+        self._last_apply_at = current_now
+        return True
 
     def apply_render_snapshot(self, snapshot: RenderSnapshot) -> None:
         geometry_revision = snapshot.mesh_geometry_revision
@@ -1652,19 +1706,28 @@ class Open3DMeshViewer:
                 mesh_color_revision=mesh_color_revision,
             )
         )
-        return self.tick()
+        self._latest_submitted_snapshot = None
+        return self.tick(force=True)
 
-    def tick(self) -> bool:
+    def tick(self, *, now: float | None = None, force: bool = False) -> bool:
+        current_now = self._resolve_now(now)
+        if (
+            not force
+            and self._last_tick_at is not None
+            and (current_now - self._last_tick_at) < self._tick_interval_sec
+        ):
+            return bool(self._last_tick_active)
         is_active = bool(self._vis.poll_events())
-        now = time.perf_counter()
         interactive = self._interaction_state.update(
             _view_control_signature(self._current_view_control()),
-            now=now,
+            now=current_now,
         )
         target_mode = self._target_render_mode(interactive=interactive)
         self._apply_render_mode(target_mode)
-        self._maybe_update_scene_graph(now=now, interactive=interactive)
+        self._maybe_update_scene_graph(now=current_now, interactive=interactive)
         self._vis.update_renderer()
+        self._last_tick_at = current_now
+        self._last_tick_active = is_active
         return is_active
 
     def current_render_mode(self) -> str:
@@ -1677,7 +1740,7 @@ class Open3DMeshViewer:
         self._interactive_mesh_tracks_full_colors = False
         self._interactive_point_indices = _sample_render_indices(
             int(self._full_vertices_display.shape[0]),
-            _RECONSTRUCTION_INTERACTIVE_POINT_BUDGET,
+            self._interactive_point_budget,
         )
         if self._interactive_point_indices.size > 0:
             self._interactive_point_positions = self._full_vertices_display[self._interactive_point_indices]
@@ -1690,14 +1753,14 @@ class Open3DMeshViewer:
         if triangle_count <= 0:
             self._interactive_representation = "point_cloud"
             return
-        if triangle_count <= _RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET:
+        if triangle_count <= self._interactive_triangle_budget:
             self._interactive_mesh_vertices = self._full_vertices_display.copy()
             self._interactive_mesh_triangles = self._full_triangles.copy()
             self._interactive_mesh_colors = self._full_colors.copy()
             self._interactive_mesh_tracks_full_colors = True
             self._interactive_representation = "mesh"
             return
-        if triangle_count <= _RECONSTRUCTION_MAX_DECIMATION_SOURCE_TRIANGLES:
+        if triangle_count <= self._max_decimation_source_triangles:
             try:
                 (
                     self._interactive_mesh_vertices,
@@ -1708,7 +1771,7 @@ class Open3DMeshViewer:
                     self._full_vertices_display,
                     self._full_triangles,
                     self._full_colors,
-                    target_triangle_count=_RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET,
+                    target_triangle_count=self._interactive_triangle_budget,
                 )
                 if self._interactive_mesh_triangles.shape[0] > 0:
                     self._interactive_representation = "mesh"

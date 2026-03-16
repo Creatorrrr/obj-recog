@@ -64,12 +64,16 @@ from obj_recog.types import (
 )
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
+    Open3DMeshViewer,
     draw_detections,
     explanation_button_rect,
     point_in_rect,
     render_explanation_panel,
     runtime_window_position,
 )
+
+_RECONSTRUCTION_DIRECT_FRAME_TIMEOUT_SEC = 1.0 / 30.0
+
 
 def _default_debug_log(message: str) -> None:
     print(f"[obj-recog] {message}", file=sys.stderr, flush=True)
@@ -502,7 +506,12 @@ def _update_viewer(viewer, artifacts: FrameArtifacts) -> bool:
             )
 
 
-def _refresh_reconstruction_viewer(viewer, artifacts: FrameArtifacts | None) -> bool:
+def _refresh_reconstruction_viewer(
+    viewer,
+    artifacts: FrameArtifacts | None,
+    *,
+    now: float | None = None,
+) -> bool:
     if viewer is None:
         return True
     publish = getattr(viewer, "publish", None)
@@ -511,9 +520,47 @@ def _refresh_reconstruction_viewer(viewer, artifacts: FrameArtifacts | None) -> 
             publish(render_snapshot_from_artifacts(artifacts))
         is_active = getattr(viewer, "is_active", None)
         return bool(is_active()) if callable(is_active) else True
+    submit = getattr(viewer, "submit", None)
+    if callable(submit):
+        if artifacts is not None:
+            submit(render_snapshot_from_artifacts(artifacts))
+        return _pump_reconstruction_viewer(viewer, now=now)
     if artifacts is None:
         return True
     return _update_viewer(viewer, artifacts)
+
+
+def _invoke_viewer_method(method, *, now: float | None = None):
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return method() if now is None else method(now=now)
+    parameters = signature.parameters
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    if now is not None and (accepts_kwargs or "now" in parameters):
+        return method(now=now)
+    return method()
+
+
+def _pump_reconstruction_viewer(viewer, *, now: float | None = None) -> bool:
+    if viewer is None:
+        return True
+    apply_latest_if_due = getattr(viewer, "apply_latest_if_due", None)
+    if callable(apply_latest_if_due):
+        _invoke_viewer_method(apply_latest_if_due, now=now)
+    tick = getattr(viewer, "tick", None)
+    if callable(tick):
+        return bool(_invoke_viewer_method(tick, now=now))
+    return True
+
+
+def _frame_source_waiting_for_frame(frame_source) -> bool:
+    if frame_source is None:
+        return False
+    is_waiting_for_frame = getattr(frame_source, "is_waiting_for_frame", None)
+    return bool(is_waiting_for_frame()) if callable(is_waiting_for_frame) else False
 
 
 def process_frame(
@@ -1012,6 +1059,7 @@ def _build_viewer(
     layout_primary_width: int,
     layout_primary_height: int,
     debug_log=None,
+    platform_name: str | None = None,
 ):
     try:
         signature = inspect.signature(viewer_factory)
@@ -1029,6 +1077,8 @@ def _build_viewer(
         kwargs["layout_primary_height"] = int(layout_primary_height)
     if debug_log is not None and (accepts_kwargs or "debug_log" in parameters):
         kwargs["debug_log"] = debug_log
+    if platform_name is not None and (accepts_kwargs or "platform_name" in parameters):
+        kwargs["platform_name"] = str(platform_name)
     if kwargs:
         return viewer_factory(**kwargs)
     return viewer_factory()
@@ -1117,7 +1167,7 @@ def run(
     segmentation_worker_factory=SegmentationWorker,
     situation_explainer_factory=None,
     explanation_worker_factory=SituationExplanationWorker,
-    viewer_factory=ReconstructionRenderWorker,
+    viewer_factory=None,
     environment_viewer_factory=None,
     open_camera_fn=open_camera,
     camera_lister=list_available_cameras,
@@ -1130,6 +1180,7 @@ def run(
     time_source=time.perf_counter,
     debug_log=_default_debug_log,
     validation_probe=None,
+    platform_name: str | None = None,
 ) -> None:
     cv2 = load_cv2(cv2_module, cuda_mode=config.opencv_cuda)
     opencv_status = ensure_opencv_runtime(cv2, cuda_mode=config.opencv_cuda)
@@ -1147,6 +1198,8 @@ def run(
         )
     )
     debug_log(_format_opencv_runtime_message(opencv_status))
+    if viewer_factory is None:
+        viewer_factory = _resolve_reconstruction_viewer_factory(config, platform_name=platform_name)
     camera_session: CameraSession | None = None
     viewer = None
     environment_viewer = None
@@ -1628,8 +1681,11 @@ def run(
             layout_primary_width=int(config.width),
             layout_primary_height=int(config.height),
             debug_log=debug_log,
+            platform_name=platform_name,
         )
         debug_log("viewer init done")
+        if callable(getattr(viewer, "submit", None)):
+            frame_timeout_sec = min(frame_timeout_sec, _RECONSTRUCTION_DIRECT_FRAME_TIMEOUT_SEC)
         if (
             config.input_source == "sim"
             and bool(getattr(config, "sim_open3d_view", True))
@@ -1640,6 +1696,7 @@ def run(
                 environment_viewer_factory,
                 layout_primary_width=int(config.width),
                 layout_primary_height=int(config.height),
+                platform_name=platform_name,
             )
             debug_log("environment viewer init done")
         last_frame_time = time_source()
@@ -1649,23 +1706,24 @@ def run(
         while True:
             frame_packet = None if frame_source is None else frame_source.next_frame(timeout_sec=frame_timeout_sec)
             if frame_packet is None:
-                sim_frame_pending = bool(
-                    config.input_source == "sim"
-                    and frame_source is not None
-                    and callable(getattr(frame_source, "is_waiting_for_frame", None))
-                    and frame_source.is_waiting_for_frame()
-                )
-                if sim_frame_pending:
+                frame_pending = _frame_source_waiting_for_frame(frame_source)
+                if frame_pending:
                     environment_viewer_active = True
                     if environment_viewer is not None and last_frame_packet is not None:
                         scenario_state = getattr(last_frame_packet, "scenario_state", None)
                         if scenario_state is not None:
                             environment_viewer_active = bool(environment_viewer.update(scenario_state))
                     reconstruction_viewer_active = True
-                    if viewer is not None and last_artifacts is not None:
+                    if viewer is not None:
+                        pending_artifacts = (
+                            None
+                            if callable(getattr(viewer, "publish", None)) or callable(getattr(viewer, "submit", None))
+                            else last_artifacts
+                        )
                         reconstruction_viewer_active = _refresh_reconstruction_viewer(
                             viewer,
-                            None if callable(getattr(viewer, "publish", None)) else last_artifacts,
+                            pending_artifacts,
+                            now=time_source(),
                         )
                     viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
                     key = cv2.waitKey(1) & 0xFF
@@ -2086,7 +2144,7 @@ def run(
                 ):
                     cv2.setMouseCallback(explanation_window_name, _handle_explanation_window_mouse)
                     explanation_panel_mouse_callback_registered = True
-            reconstruction_viewer_active = _refresh_reconstruction_viewer(viewer, artifacts)
+            reconstruction_viewer_active = _refresh_reconstruction_viewer(viewer, artifacts, now=now)
             viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
             if validation_probe is not None and hasattr(validation_probe, "record_frame"):
                 validation_probe.record_frame(
@@ -2238,6 +2296,22 @@ def _resolve_main_runtime_factories(config: AppConfig):
         if resolve_orbslam3_bridge_binary_path() is None:
             raise RuntimeError(_tsdf_requires_orbslam3_message())
     return OrbSlam3Bridge, TsdfMeshMapBuilder
+
+
+def _resolve_reconstruction_viewer_factory(config: AppConfig, *, platform_name: str | None = None):
+    current_platform = sys.platform if platform_name is None else platform_name
+    viewer_mode = str(getattr(config, "reconstruction_viewer_mode", "auto"))
+    if viewer_mode == "auto":
+        viewer_mode = "direct" if current_platform == "darwin" else "worker"
+    if viewer_mode == "direct":
+        return Open3DMeshViewer
+    if viewer_mode == "worker":
+        if current_platform == "darwin":
+            raise RuntimeError(
+                "Reconstruction viewer worker mode is unsupported on macOS because Open3D/AppKit must run on the main thread."
+            )
+        return ReconstructionRenderWorker
+    raise RuntimeError(f"unsupported reconstruction viewer mode: {viewer_mode}")
 
 
 def _resolve_main_slam_bridge_factory(config: AppConfig):

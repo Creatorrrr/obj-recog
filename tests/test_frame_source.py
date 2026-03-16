@@ -162,6 +162,38 @@ def test_live_camera_frame_source_wraps_camera_session() -> None:
     assert capture.released is True
 
 
+def test_live_camera_frame_source_marks_process_timeout_as_waiting() -> None:
+    class _TimeoutingCapture:
+        def __init__(self) -> None:
+            self.released = False
+            self._process = type("FakeProcess", (), {"poll": lambda self: None})()
+
+        def read(self, timeout_sec: float | None = None) -> tuple[bool, np.ndarray | None]:
+            _ = timeout_sec
+            return False, None
+
+        def release(self) -> None:
+            self.released = True
+
+    capture = _TimeoutingCapture()
+    session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="Fake Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    source = LiveCameraFrameSource(
+        camera_session=session,
+        time_source=lambda: 12.5,
+    )
+
+    packet = source.next_frame(timeout_sec=0.05)
+
+    assert packet is None
+    assert source.is_waiting_for_frame() is True
+
+
 def test_process_frame_uses_ground_truth_packet_without_runtime_models() -> None:
     config = AppConfig(
         camera_index=0,

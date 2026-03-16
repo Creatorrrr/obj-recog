@@ -52,7 +52,7 @@ class AppConfig:
     max_mesh_triangles: int = 10_000
     segmentation_mode: str = "panoptic"
     segmentation_alpha: float = 0.35
-    segmentation_interval: int = 6
+    segmentation_interval: int = 2
     segmentation_input_size: int = 512
     camera_name: str | None = None
     list_cameras: bool = False
@@ -80,7 +80,7 @@ class AppConfig:
     sim_seed: int = 0
     sim_max_steps: int = 600
     eval_budget_sec: float = 20.0
-    sim_camera_fps: float = 10.0
+    sim_camera_fps: float = 24.0
     sim_camera_fov_deg: float = 72.0
     sim_camera_near: float = 0.2
     sim_camera_far: float = 8.0
@@ -96,6 +96,7 @@ class AppConfig:
     sim_action_batch_size: int = 6
     sim_headless: bool = False
     sim_open3d_view: bool = False
+    reconstruction_viewer_mode: str = "auto"
     sim_interface_mode: str = "rgb_only"
     sim_render_backend: str = "software"
     blender_exec: str | None = None
@@ -188,7 +189,7 @@ DEFAULT_MAX_MAP_POINTS = 200_000
 DEFAULT_MAX_MESH_TRIANGLES = 10_000
 DEFAULT_SEGMENTATION_MODE = "panoptic"
 DEFAULT_SEGMENTATION_ALPHA = 0.35
-DEFAULT_SEGMENTATION_INTERVAL = 6
+DEFAULT_SEGMENTATION_INTERVAL = 2
 DEFAULT_SEGMENTATION_INPUT_SIZE = 512
 DEFAULT_SLAM_WIDTH = 640
 DEFAULT_SLAM_HEIGHT = 360
@@ -205,7 +206,7 @@ DEFAULT_SCENARIO = "living_room_navigation_v1"
 DEFAULT_SIM_SEED = 0
 DEFAULT_SIM_MAX_STEPS = 600
 DEFAULT_EVAL_BUDGET_SEC = 20.0
-DEFAULT_SIM_CAMERA_FPS = 10.0
+DEFAULT_SIM_CAMERA_FPS = 24.0
 DEFAULT_SIM_CAMERA_FOV_DEG = 72.0
 DEFAULT_SIM_CAMERA_NEAR = 0.2
 DEFAULT_SIM_CAMERA_FAR = 8.0
@@ -219,6 +220,7 @@ DEFAULT_SIM_REPLAN_INTERVAL_SEC = 4.0
 DEFAULT_SIM_SELFCAL_MAX_SEC = 6.0
 DEFAULT_SIM_ACTION_BATCH_SIZE = 6
 DEFAULT_SIM_OPEN3D_VIEW = "off"
+DEFAULT_RECONSTRUCTION_VIEWER_MODE = "auto"
 DEFAULT_SIM_INTERFACE_MODE = "rgb_only"
 DEFAULT_UNITY_HOST = "127.0.0.1"
 DEFAULT_UNITY_PORT = 8765
@@ -337,6 +339,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sim-action-batch-size", type=_positive_int, default=DEFAULT_SIM_ACTION_BATCH_SIZE)
     parser.add_argument("--sim-headless", action="store_true")
     parser.add_argument("--sim-open3d-view", choices=("on", "off"), default=DEFAULT_SIM_OPEN3D_VIEW)
+    parser.add_argument(
+        "--reconstruction-viewer-mode",
+        choices=("auto", "worker", "direct"),
+        default=DEFAULT_RECONSTRUCTION_VIEWER_MODE,
+        help=(
+            "Reconstruction viewer mode: auto uses direct on macOS and worker elsewhere; "
+            "worker runs the background render worker; direct runs Open3D on the main thread."
+        ),
+    )
     parser.add_argument("--sim-interface-mode", choices=("rgb_only",), default=DEFAULT_SIM_INTERFACE_MODE)
     parser.add_argument(
         "--sim-render-backend",
@@ -439,6 +450,7 @@ def parse_config(argv: list[str] | None = None) -> AppConfig:
         sim_action_batch_size=args.sim_action_batch_size,
         sim_headless=bool(args.sim_headless),
         sim_open3d_view=(args.sim_open3d_view == "on"),
+        reconstruction_viewer_mode=args.reconstruction_viewer_mode,
         sim_interface_mode=args.sim_interface_mode,
         sim_render_backend=args.sim_render_backend,
         blender_exec=args.blender_exec,

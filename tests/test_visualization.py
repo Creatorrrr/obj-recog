@@ -10,7 +10,14 @@ from obj_recog.blend_scene_loader import BlendSceneManifest, BlendSceneObject
 from obj_recog.scene_graph import GraphEdge, GraphNode, SceneGraphSnapshot
 from obj_recog.sim_protocol import EpisodePhase, OperatorSceneState
 from obj_recog.sim_scene import build_interior_test_tv_scene_spec, build_living_room_scene_spec, build_scene_mesh_components
-from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, PerceptionDiagnostics, TemporalStereoDiagnostics
+from obj_recog.types import (
+    DepthDiagnostics,
+    Detection,
+    PanopticSegment,
+    PerceptionDiagnostics,
+    RenderSnapshot,
+    TemporalStereoDiagnostics,
+)
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
     Open3DMeshViewer,
@@ -202,6 +209,24 @@ class _FakeO3D:
         @staticmethod
         def Vector2iVector(data: np.ndarray) -> _FakeVector3dVector:
             return _FakeVector3dVector(data)
+
+
+def _render_snapshot(
+    *,
+    geometry_revision: int,
+    color_revision: int | None = None,
+    color_value: tuple[float, float, float] = (1.0, 0.0, 0.0),
+) -> RenderSnapshot:
+    return RenderSnapshot(
+        mesh_vertices_xyz=np.array(
+            [[0.0, 0.0, 1.0], [0.2, 0.0, 1.0], [0.0, 0.2, 1.0]],
+            dtype=np.float32,
+        ),
+        mesh_triangles=np.array([[0, 1, 2]], dtype=np.int32),
+        mesh_vertex_colors=np.tile(np.array([color_value], dtype=np.float32), (3, 1)),
+        mesh_geometry_revision=geometry_revision,
+        mesh_color_revision=(geometry_revision if color_revision is None else color_revision),
+    )
 
 
 def test_draw_detections_renders_only_detection_labels() -> None:
@@ -1191,6 +1216,53 @@ def test_open3d_viewer_skips_mesh_upload_when_revision_is_unchanged() -> None:
 
     mesh_updates = [geometry for geometry in viewer._vis.updated_geometries if geometry is viewer._mesh]
     assert len(mesh_updates) == 1
+
+
+def test_open3d_viewer_submit_keeps_only_latest_snapshot_until_apply_due() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D(), tick_hz=30.0, apply_hz=12.0)
+    first = _render_snapshot(geometry_revision=1, color_value=(1.0, 0.0, 0.0))
+    second = _render_snapshot(geometry_revision=2, color_value=(0.0, 1.0, 0.0))
+
+    viewer.submit(first)
+    viewer.submit(second)
+
+    assert viewer.apply_latest_if_due(now=0.0) is True
+    assert viewer.tick(now=0.0) is True
+    assert viewer._last_mesh_geometry_revision == 2
+    assert np.allclose(
+        viewer._mesh.vertex_colors.data,
+        np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float64), (3, 1)),
+    )
+
+
+def test_open3d_viewer_apply_latest_if_due_waits_for_apply_interval() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D(), tick_hz=30.0, apply_hz=12.0)
+
+    viewer.submit(_render_snapshot(geometry_revision=1, color_value=(1.0, 0.0, 0.0)))
+    assert viewer.apply_latest_if_due(now=0.0) is True
+    assert viewer._last_mesh_geometry_revision == 1
+
+    viewer.submit(_render_snapshot(geometry_revision=2, color_value=(0.0, 1.0, 0.0)))
+    assert viewer.apply_latest_if_due(now=0.02) is False
+    assert viewer._last_mesh_geometry_revision == 1
+
+    assert viewer.apply_latest_if_due(now=0.09) is True
+    assert viewer._last_mesh_geometry_revision == 2
+
+
+def test_open3d_viewer_tick_waits_for_tick_interval() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D(), tick_hz=30.0, apply_hz=12.0)
+    initial_poll_count = viewer._vis.poll_count
+
+    assert viewer.tick(now=0.0) is True
+    first_tick_poll_count = viewer._vis.poll_count
+    assert first_tick_poll_count == initial_poll_count + 1
+
+    assert viewer.tick(now=0.01) is True
+    assert viewer._vis.poll_count == first_tick_poll_count
+
+    assert viewer.tick(now=0.04) is True
+    assert viewer._vis.poll_count == first_tick_poll_count + 1
 
 
 def test_runtime_window_position_uses_primary_frame_size_grid() -> None:

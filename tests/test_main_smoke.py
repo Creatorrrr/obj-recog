@@ -18,12 +18,15 @@ from obj_recog.main import (
     _format_runtime_accel_message,
     _load_app_dotenv,
     _resolve_main_runtime_factories,
+    _resolve_reconstruction_viewer_factory,
     _resolve_main_slam_bridge_factory,
     main,
     process_frame,
     run,
 )
 from obj_recog.opencv_runtime import OpenCvRuntimeStatus
+from obj_recog.render_worker import ReconstructionRenderWorker
+from obj_recog.visualization import Open3DMeshViewer
 from obj_recog.types import Detection, PanopticSegment, SegmentationResult
 from obj_recog.runtime_accel import RuntimeCapabilities
 
@@ -480,6 +483,32 @@ class FakeViewer:
         self.last_colors = mesh_vertex_colors.copy()
         if args:
             self.last_scene_graph_snapshot = args[0]
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeSubmittedViewer:
+    def __init__(self) -> None:
+        self.closed = False
+        self.submissions: list[object] = []
+        self.apply_calls: list[float | None] = []
+        self.tick_calls: list[float | None] = []
+        self.last_applied_snapshot = None
+
+    def submit(self, snapshot) -> None:
+        self.submissions.append(snapshot)
+
+    def apply_latest_if_due(self, *, now: float | None = None) -> bool:
+        self.apply_calls.append(now)
+        if not self.submissions:
+            return False
+        self.last_applied_snapshot = self.submissions[-1]
+        return True
+
+    def tick(self, *, now: float | None = None) -> bool:
+        self.tick_calls.append(now)
         return True
 
     def close(self) -> None:
@@ -3978,3 +4007,267 @@ def test_resolve_main_runtime_factories_require_bridge_for_rgb_only_sim(
         ),
     ):
         _resolve_main_slam_bridge_factory(config)
+
+
+def test_resolve_reconstruction_viewer_factory_uses_direct_mode_on_darwin() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+    )
+
+    viewer_factory = _resolve_reconstruction_viewer_factory(config, platform_name="darwin")
+
+    assert viewer_factory is Open3DMeshViewer
+
+
+def test_resolve_reconstruction_viewer_factory_uses_worker_mode_off_darwin() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+    )
+
+    viewer_factory = _resolve_reconstruction_viewer_factory(config, platform_name="win32")
+
+    assert viewer_factory is ReconstructionRenderWorker
+
+
+def test_resolve_reconstruction_viewer_factory_uses_direct_override() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        reconstruction_viewer_mode="direct",
+    )
+
+    viewer_factory = _resolve_reconstruction_viewer_factory(config, platform_name="win32")
+
+    assert viewer_factory is Open3DMeshViewer
+
+
+def test_resolve_reconstruction_viewer_factory_rejects_worker_mode_on_darwin() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        reconstruction_viewer_mode="worker",
+    )
+
+    with pytest.raises(RuntimeError, match="main thread"):
+        _resolve_reconstruction_viewer_factory(config, platform_name="darwin")
+
+
+def test_run_uses_direct_reconstruction_viewer_by_default_on_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+    )
+    fake_cv2 = FakeCV2(window_visible=0.0)
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    direct_viewer = FakeSubmittedViewer()
+
+    monkeypatch.setattr("obj_recog.main.Open3DMeshViewer", lambda **_: direct_viewer)
+    monkeypatch.setattr(
+        "obj_recog.main.ReconstructionRenderWorker",
+        lambda **_: (_ for _ in ()).throw(AssertionError("worker should not start")),
+    )
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        platform_name="darwin",
+    )
+
+    assert direct_viewer.closed is True
+    assert len(direct_viewer.submissions) == 1
+    assert direct_viewer.last_applied_snapshot is direct_viewer.submissions[-1]
+    assert direct_viewer.tick_calls
+
+
+def test_run_prefers_explicit_viewer_factory_on_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        detection_interval=2,
+        inference_width=640,
+    )
+    fake_cv2 = FakeCV2(window_visible=0.0)
+    capture = FakeCapture(width=16, height=16, frames=[np.full((16, 16, 3), 127, dtype=np.uint8)])
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    camera_session = CameraSession(
+        capture=capture,
+        active_index=0,
+        active_name="FaceTime HD Camera",
+        requested_name=None,
+        used_fallback=False,
+    )
+    viewer = FakeViewer()
+
+    monkeypatch.setattr(
+        "obj_recog.main.Open3DMeshViewer",
+        lambda **_: (_ for _ in ()).throw(AssertionError("direct viewer should not start")),
+    )
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        open_camera_fn=lambda cfg, cv2_module=None, preferred_name=None: camera_session,
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        platform_name="darwin",
+    )
+
+    assert viewer.closed is True
+    assert viewer.updates
+
+
+def test_run_keeps_pumping_submitted_viewer_while_waiting_for_sim_frames() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=640,
+        height=360,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=1,
+        max_points=64,
+        input_source="sim",
+        segmentation_mode="off",
+        graph_enabled=False,
+        explanation_enabled=False,
+    )
+    fake_cv2 = FakeCV2(key_sequence=[-1, -1, ord("q")])
+    tracker = FakeTracker()
+    map_builder = FakeMapBuilder()
+    viewer = FakeSubmittedViewer()
+    packet = FramePacket(
+        frame_bgr=np.full((16, 16, 3), 127, dtype=np.uint8),
+        timestamp_sec=0.0,
+        depth_map=np.full((16, 16), 1.0, dtype=np.float32),
+        pose_world_gt=np.eye(4, dtype=np.float32),
+        intrinsics_gt=CameraIntrinsics(fx=8.0, fy=8.0, cx=8.0, cy=8.0),
+        detections=[
+            Detection(
+                xyxy=(1, 1, 8, 8),
+                class_id=0,
+                label="backpack",
+                confidence=0.9,
+                color=(0, 255, 0),
+            )
+        ],
+        tracking_state="TRACKING",
+        keyframe_inserted=True,
+        keyframe_id=1,
+    )
+
+    class _WaitingPacketSource:
+        def __init__(self) -> None:
+            self.closed = False
+            self._packet_emitted = False
+            self._wait_calls = 0
+
+        def next_frame(self, *, timeout_sec: float | None = 1.0):
+            _ = timeout_sec
+            if not self._packet_emitted:
+                self._packet_emitted = True
+                return packet
+            self._wait_calls += 1
+            return None
+
+        def is_waiting_for_frame(self) -> bool:
+            return self._wait_calls < 3
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = _WaitingPacketSource()
+
+    run(
+        config,
+        cv2_module=fake_cv2,
+        detector_factory=lambda **_: FakeDetector(),
+        depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+        tracker_factory=lambda **_: tracker,
+        map_builder_factory=lambda **_: map_builder,
+        viewer_factory=lambda: viewer,
+        frame_source_factory=lambda *_args, **_kwargs: source,
+        open_camera_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("open_camera should not be used")),
+        overlay_renderer=lambda frame_bgr, detections, fps, **kwargs: frame_bgr,
+        time_source=FakeClock([0.0, 0.1, 0.14, 0.18]),
+    )
+
+    assert source.closed is True
+    assert len(viewer.submissions) == 1
+    assert viewer.tick_calls == [0.1, 0.14, 0.18]
+
+
+def test_run_rejects_worker_reconstruction_viewer_mode_on_darwin() -> None:
+    config = AppConfig(
+        camera_index=0,
+        width=1280,
+        height=720,
+        device="cpu",
+        conf_threshold=0.35,
+        point_stride=4,
+        max_points=1000,
+        reconstruction_viewer_mode="worker",
+    )
+
+    with pytest.raises(RuntimeError, match="main thread"):
+        run(
+            config,
+            cv2_module=FakeCV2(),
+            detector_factory=lambda **_: FakeDetector(),
+            depth_estimator_factory=lambda **_: FakeDepthEstimator(),
+            tracker_factory=lambda **_: FakeTracker(),
+            map_builder_factory=lambda **_: FakeMapBuilder(),
+            platform_name="darwin",
+        )

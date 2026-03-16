@@ -29,8 +29,11 @@ def test_parse_config_uses_living_room_defaults(monkeypatch: pytest.MonkeyPatch)
     assert config.sim_replan_interval_sec == pytest.approx(4.0)
     assert config.sim_selfcal_max_sec == pytest.approx(6.0)
     assert config.sim_action_batch_size == 6
+    assert config.sim_camera_fps == pytest.approx(24.0)
     assert config.sim_headless is False
     assert config.sim_open3d_view is False
+    assert config.segmentation_interval == 2
+    assert config.reconstruction_viewer_mode == "auto"
     assert config.sim_interface_mode == "rgb_only"
     assert config.sim_render_backend == "software"
     assert config.blender_exec is None
@@ -73,6 +76,8 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
             "/tmp/camera.yaml",
             "--temporal-stereo",
             "off",
+            "--reconstruction-viewer-mode",
+            "direct",
         ]
     )
 
@@ -85,6 +90,7 @@ def test_parse_config_accepts_living_room_sim_overrides(monkeypatch: pytest.Monk
     assert config.sim_action_batch_size == 4
     assert config.sim_headless is True
     assert config.sim_open3d_view is False
+    assert config.reconstruction_viewer_mode == "direct"
     assert config.sim_interface_mode == "rgb_only"
     assert config.sim_render_backend == "software"
     assert config.unity_player_path == "C:/UnityBuild/obj-recog.exe"
@@ -131,6 +137,14 @@ def test_parse_config_allows_disabling_open3d_view() -> None:
     config = parse_config(["--sim-open3d-view", "off"])
 
     assert config.sim_open3d_view is False
+
+
+def test_parse_config_accepts_reconstruction_viewer_mode_overrides() -> None:
+    worker_config = parse_config(["--reconstruction-viewer-mode", "worker"])
+    direct_config = parse_config(["--reconstruction-viewer-mode", "direct"])
+
+    assert worker_config.reconstruction_viewer_mode == "worker"
+    assert direct_config.reconstruction_viewer_mode == "direct"
 
 
 def test_parse_config_uses_camera_calibration_from_environment(
@@ -211,6 +225,9 @@ def test_parser_rejects_invalid_choices() -> None:
     with pytest.raises(SystemExit):
         parser.parse_args(["--temporal-stereo", "auto"])
 
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--reconstruction-viewer-mode", "foreground"])
+
 
 def test_resolve_device_prefers_available_mps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("obj_recog.config.torch.cuda.is_available", lambda: False)
@@ -256,4 +273,7 @@ def test_app_config_direct_defaults_keep_sim_open3d_enabled() -> None:
     )
 
     assert config.scenario == "living_room_navigation_v1"
+    assert config.sim_camera_fps == pytest.approx(24.0)
     assert config.sim_open3d_view is False
+    assert config.segmentation_interval == 2
+    assert config.reconstruction_viewer_mode == "auto"
