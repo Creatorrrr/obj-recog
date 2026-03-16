@@ -76,6 +76,16 @@ class TemporalStereoDiagnostics:
     fallback_reason: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RenderSnapshot:
+    mesh_vertices_xyz: np.ndarray
+    mesh_triangles: np.ndarray
+    mesh_vertex_colors: np.ndarray
+    scene_graph_snapshot: SceneGraphSnapshot | None = None
+    mesh_geometry_revision: int | None = None
+    mesh_color_revision: int | None = None
+
+
 @dataclass(slots=True)
 class FrameArtifacts:
     frame_bgr: np.ndarray
@@ -108,6 +118,8 @@ class FrameArtifacts:
     scene_graph_snapshot: SceneGraphSnapshot | None = None
     visible_graph_nodes: list[GraphNode] = field(default_factory=list)
     visible_graph_edges: list[GraphEdge] = field(default_factory=list)
+    mesh_geometry_revision: int | None = None
+    mesh_color_revision: int | None = None
     mesh_revision: int | None = None
     raw_depth_map: np.ndarray | None = None
     metric_depth_prepared: bool = False

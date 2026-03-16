@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 
@@ -15,6 +16,7 @@ from obj_recog.types import (
     Detection,
     PanopticSegment,
     PerceptionDiagnostics,
+    RenderSnapshot,
     TemporalStereoDiagnostics,
 )
 
@@ -22,6 +24,13 @@ _RUNTIME_WINDOW_MARGIN_X = 32
 _RUNTIME_WINDOW_MARGIN_Y = 48
 _RUNTIME_WINDOW_GAP = 32
 _WINDOWS_FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+_RECONSTRUCTION_WINDOW_WIDTH = 640
+_RECONSTRUCTION_WINDOW_HEIGHT = 480
+_RECONSTRUCTION_INTERACTION_TIMEOUT_SEC = 0.3
+_RECONSTRUCTION_GRAPH_UPDATE_INTERVAL_SEC = 0.2
+_RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET = 3000
+_RECONSTRUCTION_INTERACTIVE_POINT_BUDGET = 5000
+_RECONSTRUCTION_MAX_DECIMATION_SOURCE_TRIANGLES = 20000
 
 
 def _display_points_for_view(points_xyz: np.ndarray) -> np.ndarray:
@@ -1311,8 +1320,7 @@ class Open3DEnvironmentViewer:
         render_option = self._vis.get_render_option()
         if render_option is not None:
             render_option.background_color = np.array([0.05, 0.05, 0.08], dtype=np.float64)
-            show_back_face = getattr(render_option, "mesh_show_back_face", None)
-            if show_back_face is not None:
+            if hasattr(render_option, "mesh_show_back_face"):
                 render_option.mesh_show_back_face = True
 
     def update(self, scenario_state, *_unused, **_unused_kwargs) -> bool:
@@ -1416,6 +1424,93 @@ class Open3DEnvironmentViewer:
             destroy_window()
 
 
+def _sample_render_indices(point_count: int, max_points: int) -> np.ndarray:
+    if point_count <= 0 or max_points <= 0:
+        return np.empty((0,), dtype=np.int32)
+    if point_count <= max_points:
+        return np.arange(point_count, dtype=np.int32)
+    return np.linspace(0, point_count - 1, max_points, dtype=np.int32)
+
+
+def _simplify_render_mesh(
+    o3d_module,
+    vertices_xyz: np.ndarray,
+    triangles: np.ndarray,
+    vertex_colors: np.ndarray,
+    *,
+    target_triangle_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mesh = o3d_module.geometry.TriangleMesh()
+    mesh.vertices = o3d_module.utility.Vector3dVector(np.asarray(vertices_xyz, dtype=np.float64))
+    mesh.triangles = o3d_module.utility.Vector3iVector(np.asarray(triangles, dtype=np.int32))
+    mesh.vertex_colors = o3d_module.utility.Vector3dVector(np.asarray(vertex_colors, dtype=np.float64))
+    simplify = getattr(mesh, "simplify_quadric_decimation", None)
+    if not callable(simplify):
+        raise RuntimeError("mesh decimation is unavailable")
+    simplified = simplify(int(target_triangle_count))
+    simplified_vertices = np.asarray(simplified.vertices, dtype=np.float64).reshape(-1, 3)
+    simplified_triangles = np.asarray(simplified.triangles, dtype=np.int32).reshape(-1, 3)
+    simplified_colors = np.asarray(simplified.vertex_colors, dtype=np.float64).reshape(-1, 3)
+    if simplified_colors.shape[0] != simplified_vertices.shape[0]:
+        simplified_colors = np.zeros((simplified_vertices.shape[0], 3), dtype=np.float64)
+    return simplified_vertices, simplified_triangles, simplified_colors
+
+
+def _view_control_signature(control) -> tuple[float, ...] | None:
+    if control is None:
+        return None
+    convert = getattr(control, "convert_to_pinhole_camera_parameters", None)
+    if callable(convert):
+        try:
+            parameters = convert()
+            extrinsic = np.asarray(getattr(parameters, "extrinsic", None), dtype=np.float64).reshape(-1)
+            intrinsic = np.asarray(
+                getattr(getattr(parameters, "intrinsic", None), "intrinsic_matrix", None),
+                dtype=np.float64,
+            ).reshape(-1)
+            values = np.concatenate((intrinsic, extrinsic), axis=0)
+            if values.size > 0:
+                return tuple(float(value) for value in np.round(values, 6))
+        except Exception:
+            pass
+    values: list[float] = []
+    for attribute in ("lookat", "front", "up"):
+        raw_value = getattr(control, attribute, None)
+        if raw_value is None:
+            continue
+        values.extend(float(value) for value in np.round(np.asarray(raw_value, dtype=np.float64).reshape(-1), 6))
+    zoom = getattr(control, "zoom", None)
+    if zoom is not None:
+        values.append(float(round(float(zoom), 6)))
+    return tuple(values) if values else None
+
+
+class _InteractiveViewState:
+    def __init__(self, *, timeout_sec: float) -> None:
+        self._timeout_sec = float(timeout_sec)
+        self._last_signature: tuple[float, ...] | None = None
+        self._interactive_until = 0.0
+        self._lod_only_fallback = False
+
+    def update(self, signature: tuple[float, ...] | None, *, now: float) -> bool:
+        if signature is None:
+            if self._last_signature is None:
+                return False
+            self._lod_only_fallback = True
+            return True
+        if self._last_signature is None:
+            self._last_signature = signature
+            return False
+        if signature != self._last_signature:
+            self._last_signature = signature
+            self._interactive_until = float(now) + self._timeout_sec
+        return bool(float(now) < self._interactive_until)
+
+    @property
+    def lod_only_fallback(self) -> bool:
+        return bool(self._lod_only_fallback)
+
+
 class Open3DMeshViewer:
     def __init__(
         self,
@@ -1442,22 +1537,51 @@ class Open3DMeshViewer:
         try:
             window_created = self._vis.create_window(
                 window_name=window_name,
-                width=960,
-                height=720,
+                width=_RECONSTRUCTION_WINDOW_WIDTH,
+                height=_RECONSTRUCTION_WINDOW_HEIGHT,
                 left=window_left,
                 top=window_top,
             )
         except TypeError:
-            window_created = self._vis.create_window(window_name=window_name, width=960, height=720)
+            window_created = self._vis.create_window(
+                window_name=window_name,
+                width=_RECONSTRUCTION_WINDOW_WIDTH,
+                height=_RECONSTRUCTION_WINDOW_HEIGHT,
+            )
         if not window_created:
             raise RuntimeError("failed to create Open3D window")
         self._mesh = o3d.geometry.TriangleMesh()
+        self._interactive_points = o3d.geometry.PointCloud()
         self._graph_nodes = o3d.geometry.PointCloud()
         self._graph_edges = o3d.geometry.LineSet()
         self._ego_lines = o3d.geometry.LineSet()
         self._has_fitted_view = False
-        self._last_mesh_revision: int | None = None
+        self._current_render_mode = "empty"
+        self._last_mesh_geometry_revision: int | None = None
+        self._last_mesh_color_revision: int | None = None
+        self._pending_geometry_refresh = False
+        self._pending_color_refresh = False
+        self._full_vertices_display = np.empty((0, 3), dtype=np.float64)
+        self._full_triangles = np.empty((0, 3), dtype=np.int32)
+        self._full_colors = np.empty((0, 3), dtype=np.float64)
+        self._interactive_mesh_vertices = np.empty((0, 3), dtype=np.float64)
+        self._interactive_mesh_triangles = np.empty((0, 3), dtype=np.int32)
+        self._interactive_mesh_colors = np.empty((0, 3), dtype=np.float64)
+        self._interactive_mesh_tracks_full_colors = False
+        self._interactive_point_indices = np.empty((0,), dtype=np.int32)
+        self._interactive_point_positions = np.empty((0, 3), dtype=np.float64)
+        self._interactive_point_colors = np.empty((0, 3), dtype=np.float64)
+        self._interactive_representation = "point_cloud"
+        self._latest_scene_graph_snapshot: SceneGraphSnapshot | None = None
+        self._scene_graph_dirty = True
+        self._scene_graph_visible = False
+        self._scene_graph_hidden_for_interaction = False
+        self._last_scene_graph_update_at = 0.0
+        self._interaction_state = _InteractiveViewState(
+            timeout_sec=_RECONSTRUCTION_INTERACTION_TIMEOUT_SEC
+        )
         self._vis.add_geometry(self._mesh)
+        self._vis.add_geometry(self._interactive_points)
         self._vis.add_geometry(self._graph_nodes)
         self._vis.add_geometry(self._graph_edges)
         self._vis.add_geometry(self._ego_lines)
@@ -1467,9 +1591,46 @@ class Open3DMeshViewer:
         render_option = self._vis.get_render_option()
         if render_option is not None:
             render_option.background_color = np.array([0.05, 0.05, 0.08], dtype=np.float64)
-            show_back_face = getattr(render_option, "mesh_show_back_face", None)
-            if show_back_face is not None:
-                render_option.mesh_show_back_face = True
+            point_size = getattr(render_option, "point_size", None)
+            if point_size is not None:
+                render_option.point_size = 2.0
+            if hasattr(render_option, "mesh_show_back_face"):
+                render_option.mesh_show_back_face = False
+
+    def apply_render_snapshot(self, snapshot: RenderSnapshot) -> None:
+        geometry_revision = snapshot.mesh_geometry_revision
+        color_revision = (
+            snapshot.mesh_color_revision
+            if snapshot.mesh_color_revision is not None
+            else snapshot.mesh_geometry_revision
+        )
+        geometry_dirty = (
+            geometry_revision is None
+            or geometry_revision != self._last_mesh_geometry_revision
+        )
+        color_dirty = (
+            geometry_dirty
+            or color_revision is None
+            or color_revision != self._last_mesh_color_revision
+        )
+        if geometry_dirty:
+            self._full_vertices_display = _display_points_for_view(snapshot.mesh_vertices_xyz).astype(
+                np.float64,
+                copy=False,
+            )
+            self._full_triangles = np.asarray(snapshot.mesh_triangles, dtype=np.int32).reshape(-1, 3)
+            self._full_colors = np.asarray(snapshot.mesh_vertex_colors, dtype=np.float64).reshape(-1, 3)
+            self._rebuild_interactive_geometry_cache()
+            self._pending_geometry_refresh = True
+            self._pending_color_refresh = True
+            self._last_mesh_geometry_revision = geometry_revision
+        elif color_dirty:
+            self._full_colors = np.asarray(snapshot.mesh_vertex_colors, dtype=np.float64).reshape(-1, 3)
+            self._refresh_interactive_color_cache()
+            self._pending_color_refresh = True
+        self._latest_scene_graph_snapshot = snapshot.scene_graph_snapshot
+        self._scene_graph_dirty = True
+        self._last_mesh_color_revision = color_revision
 
     def update(
         self,
@@ -1478,61 +1639,253 @@ class Open3DMeshViewer:
         mesh_vertex_colors: np.ndarray,
         scene_graph_snapshot: SceneGraphSnapshot | None = None,
         mesh_revision: int | None = None,
+        mesh_color_revision: int | None = None,
         *_unused,
     ) -> bool:
-        display_vertices_xyz = _display_points_for_view(mesh_vertices_xyz)
-        mesh_dirty = mesh_revision is None or mesh_revision != self._last_mesh_revision
-        if mesh_dirty:
-            self._mesh.vertices = self._o3d.utility.Vector3dVector(
-                display_vertices_xyz.astype(np.float64, copy=False)
+        self.apply_render_snapshot(
+            RenderSnapshot(
+                mesh_vertices_xyz=np.asarray(mesh_vertices_xyz, dtype=np.float32),
+                mesh_triangles=np.asarray(mesh_triangles, dtype=np.int32),
+                mesh_vertex_colors=np.asarray(mesh_vertex_colors, dtype=np.float32),
+                scene_graph_snapshot=scene_graph_snapshot,
+                mesh_geometry_revision=mesh_revision,
+                mesh_color_revision=mesh_color_revision,
             )
-            self._mesh.triangles = self._o3d.utility.Vector3iVector(
-                mesh_triangles.astype(np.int32, copy=False)
+        )
+        return self.tick()
+
+    def tick(self) -> bool:
+        is_active = bool(self._vis.poll_events())
+        now = time.perf_counter()
+        interactive = self._interaction_state.update(
+            _view_control_signature(self._current_view_control()),
+            now=now,
+        )
+        target_mode = self._target_render_mode(interactive=interactive)
+        self._apply_render_mode(target_mode)
+        self._maybe_update_scene_graph(now=now, interactive=interactive)
+        self._vis.update_renderer()
+        return is_active
+
+    def current_render_mode(self) -> str:
+        return str(self._current_render_mode)
+
+    def _rebuild_interactive_geometry_cache(self) -> None:
+        self._interactive_mesh_vertices = np.empty((0, 3), dtype=np.float64)
+        self._interactive_mesh_triangles = np.empty((0, 3), dtype=np.int32)
+        self._interactive_mesh_colors = np.empty((0, 3), dtype=np.float64)
+        self._interactive_mesh_tracks_full_colors = False
+        self._interactive_point_indices = _sample_render_indices(
+            int(self._full_vertices_display.shape[0]),
+            _RECONSTRUCTION_INTERACTIVE_POINT_BUDGET,
+        )
+        if self._interactive_point_indices.size > 0:
+            self._interactive_point_positions = self._full_vertices_display[self._interactive_point_indices]
+            self._interactive_point_colors = self._full_colors[self._interactive_point_indices]
+        else:
+            self._interactive_point_positions = np.empty((0, 3), dtype=np.float64)
+            self._interactive_point_colors = np.empty((0, 3), dtype=np.float64)
+
+        triangle_count = int(self._full_triangles.shape[0])
+        if triangle_count <= 0:
+            self._interactive_representation = "point_cloud"
+            return
+        if triangle_count <= _RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET:
+            self._interactive_mesh_vertices = self._full_vertices_display.copy()
+            self._interactive_mesh_triangles = self._full_triangles.copy()
+            self._interactive_mesh_colors = self._full_colors.copy()
+            self._interactive_mesh_tracks_full_colors = True
+            self._interactive_representation = "mesh"
+            return
+        if triangle_count <= _RECONSTRUCTION_MAX_DECIMATION_SOURCE_TRIANGLES:
+            try:
+                (
+                    self._interactive_mesh_vertices,
+                    self._interactive_mesh_triangles,
+                    self._interactive_mesh_colors,
+                ) = _simplify_render_mesh(
+                    self._o3d,
+                    self._full_vertices_display,
+                    self._full_triangles,
+                    self._full_colors,
+                    target_triangle_count=_RECONSTRUCTION_INTERACTIVE_TRIANGLE_BUDGET,
+                )
+                if self._interactive_mesh_triangles.shape[0] > 0:
+                    self._interactive_representation = "mesh"
+                    return
+            except Exception:
+                self._interactive_mesh_vertices = np.empty((0, 3), dtype=np.float64)
+                self._interactive_mesh_triangles = np.empty((0, 3), dtype=np.int32)
+                self._interactive_mesh_colors = np.empty((0, 3), dtype=np.float64)
+        self._interactive_representation = "point_cloud"
+
+    def _refresh_interactive_color_cache(self) -> None:
+        if self._interactive_point_indices.size > 0:
+            self._interactive_point_colors = self._full_colors[self._interactive_point_indices]
+        else:
+            self._interactive_point_colors = np.empty((0, 3), dtype=np.float64)
+        if self._interactive_mesh_tracks_full_colors:
+            self._interactive_mesh_colors = self._full_colors.copy()
+        elif self._interactive_mesh_triangles.shape[0] > 0:
+            self._interactive_representation = "point_cloud"
+
+    def _current_view_control(self):
+        get_view_control = getattr(self._vis, "get_view_control", None)
+        if callable(get_view_control):
+            return get_view_control()
+        return None
+
+    def _target_render_mode(self, *, interactive: bool) -> str:
+        if self._full_vertices_display.size == 0:
+            return "empty"
+        if interactive or self._interaction_state.lod_only_fallback:
+            if self._interactive_representation == "mesh" and self._interactive_mesh_triangles.size > 0:
+                return "lod_mesh"
+            if self._interactive_point_positions.size > 0:
+                return "lod_points"
+        if self._full_triangles.size > 0:
+            return "full_mesh"
+        if self._interactive_point_positions.size > 0:
+            return "lod_points"
+        return "empty"
+
+    def _apply_render_mode(self, target_mode: str) -> None:
+        mode_changed = str(target_mode) != str(self._current_render_mode)
+        if not mode_changed and not self._pending_geometry_refresh and not self._pending_color_refresh:
+            return
+        if target_mode == "full_mesh":
+            self._upload_mesh_geometry(
+                self._full_vertices_display,
+                self._full_triangles,
+                self._full_colors,
+                recompute_normals=(mode_changed or self._pending_geometry_refresh),
             )
-            self._mesh.vertex_colors = self._o3d.utility.Vector3dVector(
-                mesh_vertex_colors.astype(np.float64, copy=False)
+            if mode_changed or self._current_render_mode == "lod_points":
+                self._clear_point_cloud()
+            if not self._has_fitted_view and self._full_vertices_display.size > 0 and self._full_triangles.size > 0:
+                self._fit_initial_view(self._full_vertices_display)
+        elif target_mode == "lod_mesh":
+            self._upload_mesh_geometry(
+                self._interactive_mesh_vertices,
+                self._interactive_mesh_triangles,
+                self._interactive_mesh_colors,
+                recompute_normals=(mode_changed or self._pending_geometry_refresh),
             )
+            if mode_changed or self._current_render_mode == "lod_points":
+                self._clear_point_cloud()
+        elif target_mode == "lod_points":
+            self._upload_point_cloud(
+                self._interactive_point_positions,
+                self._interactive_point_colors,
+            )
+            if mode_changed or self._current_render_mode in {"full_mesh", "lod_mesh"}:
+                self._clear_mesh_geometry()
+        else:
+            self._clear_mesh_geometry()
+            self._clear_point_cloud()
+        self._current_render_mode = str(target_mode)
+        self._pending_geometry_refresh = False
+        self._pending_color_refresh = False
+
+    def _upload_mesh_geometry(
+        self,
+        vertices_xyz: np.ndarray,
+        triangles: np.ndarray,
+        vertex_colors: np.ndarray,
+        *,
+        recompute_normals: bool,
+    ) -> None:
+        self._mesh.vertices = self._o3d.utility.Vector3dVector(
+            np.asarray(vertices_xyz, dtype=np.float64).reshape(-1, 3)
+        )
+        self._mesh.triangles = self._o3d.utility.Vector3iVector(
+            np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+        )
+        self._mesh.vertex_colors = self._o3d.utility.Vector3dVector(
+            np.asarray(vertex_colors, dtype=np.float64).reshape(-1, 3)
+        )
+        if recompute_normals and int(np.asarray(triangles).size) > 0:
             compute_normals = getattr(self._mesh, "compute_vertex_normals", None)
             if callable(compute_normals):
                 compute_normals()
-            self._vis.update_geometry(self._mesh)
-            self._last_mesh_revision = mesh_revision
-        self._update_scene_graph(scene_graph_snapshot)
-        if not self._has_fitted_view and display_vertices_xyz.size > 0 and mesh_triangles.size > 0:
-            self._vis.reset_view_point(True)
-            get_view_control = getattr(self._vis, "get_view_control", None)
-            if callable(get_view_control):
-                control = get_view_control()
-                bounds_min = display_vertices_xyz.min(axis=0)
-                bounds_max = display_vertices_xyz.max(axis=0)
-                mesh_center_display = ((bounds_min + bounds_max) * 0.5).astype(np.float64, copy=False)
-                _apply_open3d_view_control(
-                    control,
-                    lookat=mesh_center_display,
-                    front=np.array([-0.58, 0.48, 0.66], dtype=np.float64),
-                    up=np.array([0.0, 1.0, 0.0], dtype=np.float64),
-                    zoom=0.68,
-                )
-            self._has_fitted_view = True
-        is_active = self._vis.poll_events()
-        self._vis.update_renderer()
-        return bool(is_active)
+        self._vis.update_geometry(self._mesh)
 
-    def _update_scene_graph(self, scene_graph_snapshot: SceneGraphSnapshot | None) -> None:
+    def _upload_point_cloud(self, points_xyz: np.ndarray, point_colors: np.ndarray) -> None:
+        self._interactive_points.points = self._o3d.utility.Vector3dVector(
+            np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+        )
+        self._interactive_points.colors = self._o3d.utility.Vector3dVector(
+            np.asarray(point_colors, dtype=np.float64).reshape(-1, 3)
+        )
+        self._vis.update_geometry(self._interactive_points)
+
+    def _clear_mesh_geometry(self) -> None:
+        empty_points = np.empty((0, 3), dtype=np.float64)
+        empty_triangles = np.empty((0, 3), dtype=np.int32)
+        self._mesh.vertices = self._o3d.utility.Vector3dVector(empty_points)
+        self._mesh.triangles = self._o3d.utility.Vector3iVector(empty_triangles)
+        self._mesh.vertex_colors = self._o3d.utility.Vector3dVector(empty_points)
+        self._vis.update_geometry(self._mesh)
+
+    def _clear_point_cloud(self) -> None:
+        empty_points = np.empty((0, 3), dtype=np.float64)
+        self._interactive_points.points = self._o3d.utility.Vector3dVector(empty_points)
+        self._interactive_points.colors = self._o3d.utility.Vector3dVector(empty_points)
+        self._vis.update_geometry(self._interactive_points)
+
+    def _fit_initial_view(self, display_vertices_xyz: np.ndarray) -> None:
+        self._vis.reset_view_point(True)
+        control = self._current_view_control()
+        if control is not None:
+            bounds_min = display_vertices_xyz.min(axis=0)
+            bounds_max = display_vertices_xyz.max(axis=0)
+            mesh_center_display = ((bounds_min + bounds_max) * 0.5).astype(np.float64, copy=False)
+            _apply_open3d_view_control(
+                control,
+                lookat=mesh_center_display,
+                front=np.array([-0.58, 0.48, 0.66], dtype=np.float64),
+                up=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                zoom=0.68,
+            )
+        self._has_fitted_view = True
+
+    def _maybe_update_scene_graph(self, *, now: float, interactive: bool) -> None:
+        if interactive or self._interaction_state.lod_only_fallback:
+            if self._scene_graph_visible:
+                self._clear_scene_graph_geometry()
+                self._scene_graph_visible = False
+            self._scene_graph_hidden_for_interaction = True
+            return
+        if self._scene_graph_hidden_for_interaction:
+            self._scene_graph_dirty = True
+            self._scene_graph_hidden_for_interaction = False
+        if not self._scene_graph_dirty:
+            return
+        if (float(now) - self._last_scene_graph_update_at) < _RECONSTRUCTION_GRAPH_UPDATE_INTERVAL_SEC:
+            return
+        self._update_scene_graph(self._latest_scene_graph_snapshot)
+        self._scene_graph_visible = self._latest_scene_graph_snapshot is not None
+        self._scene_graph_dirty = False
+        self._last_scene_graph_update_at = float(now)
+
+    def _clear_scene_graph_geometry(self) -> None:
         empty_points = np.empty((0, 3), dtype=np.float64)
         empty_lines = np.empty((0, 2), dtype=np.int32)
+        self._graph_nodes.points = self._o3d.utility.Vector3dVector(empty_points)
+        self._graph_nodes.colors = self._o3d.utility.Vector3dVector(empty_points)
+        self._graph_edges.points = self._o3d.utility.Vector3dVector(empty_points)
+        self._graph_edges.lines = self._o3d.utility.Vector2iVector(empty_lines)
+        self._graph_edges.colors = self._o3d.utility.Vector3dVector(empty_points)
+        self._ego_lines.points = self._o3d.utility.Vector3dVector(empty_points)
+        self._ego_lines.lines = self._o3d.utility.Vector2iVector(empty_lines)
+        self._ego_lines.colors = self._o3d.utility.Vector3dVector(empty_points)
+        self._vis.update_geometry(self._graph_nodes)
+        self._vis.update_geometry(self._graph_edges)
+        self._vis.update_geometry(self._ego_lines)
+
+    def _update_scene_graph(self, scene_graph_snapshot: SceneGraphSnapshot | None) -> None:
         if scene_graph_snapshot is None:
-            self._graph_nodes.points = self._o3d.utility.Vector3dVector(empty_points)
-            self._graph_nodes.colors = self._o3d.utility.Vector3dVector(empty_points)
-            self._graph_edges.points = self._o3d.utility.Vector3dVector(empty_points)
-            self._graph_edges.lines = self._o3d.utility.Vector2iVector(empty_lines)
-            self._graph_edges.colors = self._o3d.utility.Vector3dVector(empty_points)
-            self._ego_lines.points = self._o3d.utility.Vector3dVector(empty_points)
-            self._ego_lines.lines = self._o3d.utility.Vector2iVector(empty_lines)
-            self._ego_lines.colors = self._o3d.utility.Vector3dVector(empty_points)
-            self._vis.update_geometry(self._graph_nodes)
-            self._vis.update_geometry(self._graph_edges)
-            self._vis.update_geometry(self._ego_lines)
+            self._clear_scene_graph_geometry()
             return
 
         nodes = {node.id: node for node in scene_graph_snapshot.visible_nodes}
@@ -1606,7 +1959,9 @@ class Open3DMeshViewer:
         self._vis.update_geometry(self._ego_lines)
 
     def close(self) -> None:
-        self._vis.destroy_window()
+        destroy_window = getattr(self._vis, "destroy_window", None)
+        if callable(destroy_window):
+            destroy_window()
 
 
 Open3DPointCloudViewer = Open3DMeshViewer

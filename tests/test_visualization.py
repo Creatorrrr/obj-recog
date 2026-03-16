@@ -14,6 +14,7 @@ from obj_recog.types import DepthDiagnostics, Detection, PanopticSegment, Percep
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
     Open3DMeshViewer,
+    _InteractiveViewState,
     _display_points_for_environment_view,
     _display_points_for_view,
     draw_detections,
@@ -124,6 +125,7 @@ class _FakeVisualizer:
         self.window_calls: list[dict[str, int | str]] = []
         self.view_control = _FakeViewControl()
         self.updated_geometries: list[object] = []
+        self.render_option = _FakeRenderOption()
 
     def create_window(self, window_name: str, width: int, height: int, **kwargs) -> bool:
         call = {
@@ -140,7 +142,7 @@ class _FakeVisualizer:
         self.geometry.append(geometry)
 
     def get_render_option(self) -> _FakeRenderOption:
-        return _FakeRenderOption()
+        return self.render_option
 
     def update_geometry(self, geometry) -> None:
         self.updated_geometries.append(geometry)
@@ -1158,7 +1160,7 @@ def test_open3d_viewer_resets_view_on_first_non_empty_update_only() -> None:
     viewer.update(vertices, triangles, colors)
 
     assert viewer._vis.reset_calls == [True]
-    assert len(viewer._vis.geometry) == 4
+    assert len(viewer._vis.geometry) == 5
 
 
 def test_open3d_viewer_applies_expected_initial_camera_on_first_mesh() -> None:
@@ -1208,12 +1210,13 @@ def test_open3d_viewer_uses_runtime_window_layout_for_initial_position() -> None
     assert viewer._vis.window_calls == [
         {
             "window_name": "3D Reconstruction",
-            "width": 960,
-            "height": 720,
+            "width": 640,
+            "height": 480,
             "left": 704,
             "top": 440,
         }
     ]
+    assert viewer._vis.render_option.mesh_show_back_face is False
 
 
 def test_environment_viewer_uses_environment_window_layout_for_initial_position() -> None:
@@ -1674,7 +1677,32 @@ def test_open3d_viewer_updates_graph_geometries_with_snapshot() -> None:
 
     viewer.update(vertices, triangles, colors, snapshot)
 
-    assert len(viewer._vis.geometry) == 4
+    assert len(viewer._vis.geometry) == 5
     assert viewer._graph_nodes.points is not None
     assert viewer._graph_edges.lines is not None
     assert viewer._ego_lines.lines is not None
+
+
+def test_open3d_viewer_color_only_update_skips_normal_recompute() -> None:
+    viewer = Open3DMeshViewer(o3d_module=_FakeO3D())
+    vertices = np.array([[0.0, 0.0, 1.0], [0.2, 0.0, 1.0], [0.0, 0.2, 1.0]], dtype=np.float32)
+    triangles = np.array([[0, 1, 2]], dtype=np.int32)
+    colors = np.array([[1.0, 0.0, 0.0]] * 3, dtype=np.float32)
+    recolored = np.array([[0.0, 1.0, 0.0]] * 3, dtype=np.float32)
+
+    viewer.update(vertices, triangles, colors, None, 1, 1)
+    viewer._mesh.normals_computed = False
+
+    viewer.update(vertices, triangles, recolored, None, 1, 2)
+
+    assert viewer._mesh.normals_computed is False
+    assert np.allclose(viewer._mesh.vertex_colors.data, recolored)
+
+
+def test_interactive_view_state_holds_lod_mode_for_timeout_window() -> None:
+    state = _InteractiveViewState(timeout_sec=0.3)
+
+    assert state.update((1.0,), now=0.0) is False
+    assert state.update((2.0,), now=0.1) is True
+    assert state.update((2.0,), now=0.35) is True
+    assert state.update((2.0,), now=0.41) is False

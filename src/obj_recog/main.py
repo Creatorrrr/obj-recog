@@ -33,6 +33,7 @@ from obj_recog.opencv_runtime import (
     resize_image,
 )
 from obj_recog.reconstruct import depth_to_point_cloud, depth_to_point_cloud_torch, intrinsics_for_frame
+from obj_recog.render_worker import ReconstructionRenderWorker, render_snapshot_from_artifacts
 from obj_recog.runtime_accel import detect_runtime_capabilities, device_is_cuda, resolve_precision
 from obj_recog.scene_graph import SceneGraphMemory
 from obj_recog.segmenter import PanopticSegmenter, SegmentationWorker
@@ -63,7 +64,6 @@ from obj_recog.types import (
 )
 from obj_recog.visualization import (
     Open3DEnvironmentViewer,
-    Open3DMeshViewer,
     draw_detections,
     explanation_button_rect,
     point_in_rect,
@@ -483,7 +483,8 @@ def _update_viewer(viewer, artifacts: FrameArtifacts) -> bool:
             artifacts.mesh_triangles,
             artifacts.mesh_vertex_colors,
             artifacts.scene_graph_snapshot,
-            artifacts.mesh_revision,
+            artifacts.mesh_geometry_revision,
+            artifacts.mesh_color_revision,
         )
     except TypeError:
         try:
@@ -499,6 +500,20 @@ def _update_viewer(viewer, artifacts: FrameArtifacts) -> bool:
                 artifacts.mesh_triangles,
                 artifacts.mesh_vertex_colors,
             )
+
+
+def _refresh_reconstruction_viewer(viewer, artifacts: FrameArtifacts | None) -> bool:
+    if viewer is None:
+        return True
+    publish = getattr(viewer, "publish", None)
+    if callable(publish):
+        if artifacts is not None:
+            publish(render_snapshot_from_artifacts(artifacts))
+        is_active = getattr(viewer, "is_active", None)
+        return bool(is_active()) if callable(is_active) else True
+    if artifacts is None:
+        return True
+    return _update_viewer(viewer, artifacts)
 
 
 def process_frame(
@@ -749,7 +764,16 @@ def process_frame(
         getattr(map_update, "dense_map_points_rgb", mesh_vertex_colors),
         dtype=np.float32,
     ).reshape(-1, 3)
-    mesh_revision = getattr(map_update, "mesh_revision", None)
+    mesh_geometry_revision = getattr(
+        map_update,
+        "mesh_geometry_revision",
+        getattr(map_update, "mesh_revision", None),
+    )
+    mesh_color_revision = getattr(
+        map_update,
+        "mesh_color_revision",
+        mesh_geometry_revision,
+    )
     dense_z_span = _camera_space_z_span(dense_map_points_xyz, camera_pose_world)
     mesh_z_span = _camera_space_z_span(mesh_vertices_xyz, camera_pose_world)
 
@@ -867,7 +891,13 @@ def process_frame(
         median_reprojection_error=getattr(slam_result, "median_reprojection_error", None),
         depth_diagnostics=depth_diagnostics,
         perception_diagnostics=perception_diagnostics,
-        mesh_revision=(None if mesh_revision is None else int(mesh_revision)),
+        mesh_geometry_revision=(
+            None if mesh_geometry_revision is None else int(mesh_geometry_revision)
+        ),
+        mesh_color_revision=(
+            None if mesh_color_revision is None else int(mesh_color_revision)
+        ),
+        mesh_revision=(None if mesh_geometry_revision is None else int(mesh_geometry_revision)),
         temporal_stereo_diagnostics=temporal_stereo_diagnostics,
         raw_depth_map=raw_depth_map,
         metric_depth_prepared=False,
@@ -981,6 +1011,7 @@ def _build_viewer(
     *,
     layout_primary_width: int,
     layout_primary_height: int,
+    debug_log=None,
 ):
     try:
         signature = inspect.signature(viewer_factory)
@@ -991,11 +1022,13 @@ def _build_viewer(
     accepts_kwargs = any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
-    kwargs: dict[str, int] = {}
+    kwargs: dict[str, object] = {}
     if accepts_kwargs or "layout_primary_width" in parameters:
         kwargs["layout_primary_width"] = int(layout_primary_width)
     if accepts_kwargs or "layout_primary_height" in parameters:
         kwargs["layout_primary_height"] = int(layout_primary_height)
+    if debug_log is not None and (accepts_kwargs or "debug_log" in parameters):
+        kwargs["debug_log"] = debug_log
     if kwargs:
         return viewer_factory(**kwargs)
     return viewer_factory()
@@ -1084,7 +1117,7 @@ def run(
     segmentation_worker_factory=SegmentationWorker,
     situation_explainer_factory=None,
     explanation_worker_factory=SituationExplanationWorker,
-    viewer_factory=Open3DMeshViewer,
+    viewer_factory=ReconstructionRenderWorker,
     environment_viewer_factory=None,
     open_camera_fn=open_camera,
     camera_lister=list_available_cameras,
@@ -1594,6 +1627,7 @@ def run(
             viewer_factory,
             layout_primary_width=int(config.width),
             layout_primary_height=int(config.height),
+            debug_log=debug_log,
         )
         debug_log("viewer init done")
         if (
@@ -1629,7 +1663,10 @@ def run(
                             environment_viewer_active = bool(environment_viewer.update(scenario_state))
                     reconstruction_viewer_active = True
                     if viewer is not None and last_artifacts is not None:
-                        reconstruction_viewer_active = _update_viewer(viewer, last_artifacts)
+                        reconstruction_viewer_active = _refresh_reconstruction_viewer(
+                            viewer,
+                            None if callable(getattr(viewer, "publish", None)) else last_artifacts,
+                        )
                     viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
                     key = cv2.waitKey(1) & 0xFF
                     window_visible = window_is_visible(cv2, "Object Recognition")
@@ -1813,12 +1850,27 @@ def run(
                             artifacts.mesh_vertices_xyz = np.asarray(mesh_vertices_xyz, dtype=np.float32).reshape(-1, 3)
                             artifacts.mesh_triangles = np.asarray(mesh_triangles, dtype=np.int32).reshape(-1, 3)
                             artifacts.mesh_vertex_colors = np.asarray(mesh_vertex_colors, dtype=np.float32).reshape(-1, 3)
-                            current_mesh_revision_getter = getattr(map_builder, "current_mesh_revision", None)
-                            artifacts.mesh_revision = (
-                                int(current_mesh_revision_getter())
-                                if callable(current_mesh_revision_getter)
+                            current_mesh_geometry_revision_getter = getattr(
+                                map_builder,
+                                "current_mesh_geometry_revision",
+                                getattr(map_builder, "current_mesh_revision", None),
+                            )
+                            current_mesh_color_revision_getter = getattr(
+                                map_builder,
+                                "current_mesh_color_revision",
+                                None,
+                            )
+                            artifacts.mesh_geometry_revision = (
+                                int(current_mesh_geometry_revision_getter())
+                                if callable(current_mesh_geometry_revision_getter)
                                 else None
                             )
+                            artifacts.mesh_color_revision = (
+                                int(current_mesh_color_revision_getter())
+                                if callable(current_mesh_color_revision_getter)
+                                else artifacts.mesh_geometry_revision
+                            )
+                            artifacts.mesh_revision = artifacts.mesh_geometry_revision
                             artifacts.points_xyz = artifacts.mesh_vertices_xyz
                             artifacts.points_rgb = artifacts.mesh_vertex_colors
                             artifacts.dense_map_points_xyz = artifacts.mesh_vertices_xyz
@@ -2034,7 +2086,7 @@ def run(
                 ):
                     cv2.setMouseCallback(explanation_window_name, _handle_explanation_window_mouse)
                     explanation_panel_mouse_callback_registered = True
-            reconstruction_viewer_active = _update_viewer(viewer, artifacts)
+            reconstruction_viewer_active = _refresh_reconstruction_viewer(viewer, artifacts)
             viewer_active = bool(reconstruction_viewer_active and environment_viewer_active)
             if validation_probe is not None and hasattr(validation_probe, "record_frame"):
                 validation_probe.record_frame(
